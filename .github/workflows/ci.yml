@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Only the daemon's real deps. The Raspberry Pi hardware libs (board, adafruit_dht,
+      # gps, astropy, numpy) are intentionally NOT installed — the smoke tests mock them.
+      - name: Install dependencies
+        run: pip install flask waitress pytest flake8
+
+      - name: Lint (flake8)
+        run: flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety
+
+      - name: Tests (daemon units + page/entrypoint smoke, hardware mocked)
+        run: pytest safety/tests -q

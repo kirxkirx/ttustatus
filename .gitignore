@@ -1,0 +1,17 @@
+# Local secrets — NEVER commit. Set TTU_SAFETY_WU_KEY via the environment instead.
+.env
+*.env
+secrets.py
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime state / logs (normally written outside the repo, but just in case)
+safety_state.json
+safety_inputs.json
+safety_latch.json
+safety_events.log
+safety_monitor.log
+statuspage.log

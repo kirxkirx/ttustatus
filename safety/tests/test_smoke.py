@@ -1,0 +1,69 @@
+"""Smoke tests for the two top-level scripts, with Raspberry Pi hardware/heavy libs
+mocked so they run in CI (and on any machine without the Pi).
+
+make_status_page.py imports board / adafruit_dht / gps / astropy / numpy at module load;
+we stub those in sys.modules before importing it, then exercise its pure page-rendering
+functions. safety_monitor.py needs no hardware — importing it verifies the daemon's whole
+import graph wires up.
+"""
+import json
+import sys
+import time
+from unittest.mock import MagicMock
+
+# Simulate the missing hardware / heavy libraries (only used by make_status_page.py).
+for _m in ["numpy", "board", "adafruit_dht", "gps", "astropy", "astropy.units",
+           "astropy.time", "astropy.coordinates", "astropy.utils", "astropy.utils.iers"]:
+    sys.modules.setdefault(_m, MagicMock())
+
+import make_status_page as msp        # noqa: E402  (must follow the sys.modules stubbing)
+import safety_monitor                 # noqa: E402
+
+
+def _safe_state():
+    comp = {"sun": {"value_deg": -7.5, "threshold_deg": 0.0, "safe": True},
+            "humidity": {"value_pct": 42.0, "threshold_pct": 95.0, "safe": True},
+            "rain": {"safe": True, "enabled": True, "latched": False,
+                     "polling_active": True, "stations_live": 7, "stations_total": 10}}
+    return {"ts": time.time(), "is_safe": True, "reasons": [], "components": comp,
+            "alpaca": {"address": "10.0.0.1", "port": 11111, "device_number": 0,
+                       "issafe_path": "/api/v1/safetymonitor/0/issafe"},
+            "events_tail": ["2026-01-01T00:00:00  INIT  (safe)"]}
+
+
+def test_daemon_entrypoint_imports():
+    assert callable(safety_monitor.main)
+
+
+def test_write_safety_inputs_roundtrip(tmp_path):
+    msp.SAFETY_INPUTS_FILE = str(tmp_path / "inputs.json")
+    msp.write_safety_inputs({"sun_altitude_deg": -7.5}, 42.0)
+    d = json.load(open(msp.SAFETY_INPUTS_FILE))
+    assert d["humidity_pct"] == 42.0 and d["sun_altitude_deg"] == -7.5
+
+
+def test_read_safety_state_missing(tmp_path):
+    msp.SAFETY_STATE_FILE = str(tmp_path / "nope.json")
+    assert msp.read_safety_state() is None
+
+
+def test_safety_card_safe_state():
+    html = msp.build_safety_html(_safe_state())
+    assert "Alpaca safety monitor" in html
+    assert "10.0.0.1:11111" in html and "/api/v1/safetymonitor/0/issafe" in html
+    assert "Inputs it is using" in html and "Log (latest events)" in html
+    assert "#1a7f37" in html                     # green SAFE badge
+
+
+def test_safety_card_offline_is_not_green():
+    html = msp.build_safety_html(None)
+    assert "OFFLINE" in html and "#1a7f37" not in html
+
+
+def test_rain_tile_disabled_without_key():
+    comp = {"sun": {"value_deg": -7.0, "threshold_deg": 0.0, "safe": True},
+            "humidity": {"value_pct": 40.0, "threshold_pct": 95.0, "safe": True},
+            "rain": {"safe": True, "enabled": False, "latched": False,
+                     "polling_active": False}}
+    tiles = msp.build_safety_tiles_html(comp)
+    assert "disabled" in tiles and "WU_API_KEY" in tiles
