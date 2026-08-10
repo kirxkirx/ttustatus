@@ -2442,11 +2442,11 @@ def build_safety_tiles_html(comp):
         nws_v = '<div class="v mono" style="font-size:15px">N/A</div>'
         nws_s = safety_dot_html(True) + "forecast unavailable"
     else:
-        nws_v = ('<div class="v mono" style="font-size:15px;line-height:1.45">'
-                 'now&nbsp; %s<br>next %s</div>' % (_cpt(nws.get("now_hour")),
-                                                    _cpt(nws.get("next_hour"))))
+        nws_v = ('<div class="v mono" style="font-size:13px;line-height:1.4">'
+                 'now %s<br>nxt %s</div>' % (_cpt(nws.get("now_hour")),
+                                             _cpt(nws.get("next_hour"))))
         nws_s = (safety_dot_html(bool(nws.get("safe")))
-                 + "C cloud &middot; P precip &middot; T thunder")
+                 + "Cloud &middot; Precip &middot; Thunder")
 
     glm = comp.get("glm") or {}
     glm_tk = glm.get("trigger_km", 50)
@@ -2466,34 +2466,18 @@ def build_safety_tiles_html(comp):
         else:
             glm_s = safety_dot_html(True) + "polling paused (day)"
 
-    return """  <div class="tiles">
-    <div class="tile">
-      <div class="k">Sun altitude</div>
-      %s
-      <div class="s">%s</div>
-    </div>
-    <div class="tile">
-      <div class="k">Humidity</div>
-      %s
-      <div class="s">%s</div>
-    </div>
-    <div class="tile">
-      <div class="k">Rain (WU)</div>
-      %s
-      <div class="s">%s</div>
-    </div>
-    <div class="tile">
-      <div class="k">NWS (this &amp; next hr)</div>
-      %s
-      <div class="s">%s</div>
-    </div>
-    <div class="tile">
-      <div class="k">Lightning (GLM &le;%gkm)</div>
-      %s
-      <div class="s">%s</div>
-    </div>
-  </div>
-""" % (sun_v, sun_s, hum_v, hum_s, rain_v, rain_s, nws_v, nws_s, glm_tk, glm_v, glm_s)
+    tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
+            '      <div class="s">%s</div>\n    </div>\n')
+    tiles = (tile % ("Sun altitude", sun_v, sun_s)
+             + tile % ("Humidity", hum_v, hum_s)
+             + tile % ("Rain (WU)", rain_v, rain_s)
+             + tile % ("NWS (now/next)", nws_v, nws_s)
+             + tile % ("Lightning (GLM)", glm_v, glm_s))
+    # auto-fit: 5-across on the ~1020px desktop wrap, and wraps to 3/2/1 columns on
+    # narrower/phone screens instead of shrinking into an unreadable single row.
+    return ('  <div class="tiles" '
+            'style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">\n'
+            + tiles + '  </div>\n')
 
 
 def _safety_endpoint_html(state):

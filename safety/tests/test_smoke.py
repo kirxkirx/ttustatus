@@ -75,7 +75,7 @@ def test_nws_forecast_section_and_tile_render():
                      "stations_live": 7, "stations_total": 10},
             "nws": nws}
     tiles = msp.build_safety_tiles_html(comp)
-    assert "next hr" in tiles                          # relabelled tile
+    assert "NWS (now/next)" in tiles                   # relabelled tile
     assert "C85%/P20%/T0%" in tiles and "C90%/P30%/T5%" in tiles   # both hours packed
     assert "no&nbsp;rain" in tiles                     # rain wording fixed
     assert "Lightning (GLM" in tiles                   # GLM tile present (off by default here)
