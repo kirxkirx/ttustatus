@@ -2422,7 +2422,7 @@ def build_safety_tiles_html(comp):
                   % (rain.get("seconds_remaining", 0) // 60))
         rain_s = safety_dot_html(False) + "rain latch active"
     else:
-        rain_v = '<div class="v mono">clear</div>'
+        rain_v = '<div class="v mono">no&nbsp;rain</div>'
         if rain.get("polling_active"):
             rain_s = safety_dot_html(True) + ("polling %d/%d stations" % (
                 rain.get("stations_live", 0), rain.get("stations_total", 0)))
@@ -2430,19 +2430,23 @@ def build_safety_tiles_html(comp):
             rain_s = safety_dot_html(True) + "polling paused (day)"
 
     nws = comp.get("nws") or {}
+
+    def _cpt(hour):
+        def g(k):
+            v = (hour or {}).get(k)
+            return "?" if v is None else "%.0f" % v
+        return "C%s%%/P%s%%/T%s%%" % (g("cloud_cover_pct"), g("precip_prob_pct"),
+                                      g("thunder_prob_pct"))
+
     if not nws.get("available"):
-        nws_v = '<div class="v mono">N/A</div>'
+        nws_v = '<div class="v mono" style="font-size:15px">N/A</div>'
         nws_s = safety_dot_html(True) + "forecast unavailable"
     else:
-        nh = nws.get("now_hour") or {}
-        cloud = nh.get("cloud_cover_pct")
-        nws_v = ('<div class="v mono">%s<span class="u">%%</span></div>'
-                 % ("?" if cloud is None else "%.0f" % cloud))
-        if nws.get("safe"):
-            nws_s = safety_dot_html(True) + ("P%s%% T%s%%" % (
-                nh.get("precip_prob_pct"), nh.get("thunder_prob_pct")))
-        else:
-            nws_s = safety_dot_html(False) + "forecast over threshold"
+        nws_v = ('<div class="v mono" style="font-size:15px;line-height:1.45">'
+                 'now&nbsp; %s<br>next %s</div>' % (_cpt(nws.get("now_hour")),
+                                                    _cpt(nws.get("next_hour"))))
+        nws_s = (safety_dot_html(bool(nws.get("safe")))
+                 + "C cloud &middot; P precip &middot; T thunder")
 
     return """  <div class="tiles">
     <div class="tile">
@@ -2461,7 +2465,7 @@ def build_safety_tiles_html(comp):
       <div class="s">%s</div>
     </div>
     <div class="tile">
-      <div class="k">NWS cloud (this hr)</div>
+      <div class="k">NWS (this &amp; next hr)</div>
       %s
       <div class="s">%s</div>
     </div>
@@ -2518,16 +2522,19 @@ def build_safety_html(state):
     stale = (age is None) or (age > SAFETY_STATE_STALE_SEC)
     if is_safe and not stale:
         bg, label, detail = "#1a7f37", "SAFE", "safe to observe"
+        detail_color = "var(--good)"     # green: this line was wrongly amber before
     elif stale:
         bg, label = "#a2620d", "STALE"
         detail = ("safety state has no timestamp — daemon may be down" if age is None
                   else "last update %d min ago — daemon may be down" % int(age / 60))
+        detail_color = "var(--warn)"
     else:
         bg, label = "#b42318", "UNSAFE"
         detail = "%d reason(s)" % len(state.get("reasons") or [])
+        detail_color = "var(--warn)"
 
-    detail_html = ('    <div style="margin:4px 0 10px;font-size:12.5px;color:var(--warn)">'
-                   '%s</div>\n' % html.escape(detail)) if detail else ""
+    detail_html = ('    <div style="margin:4px 0 10px;font-size:12.5px;color:%s">'
+                   '%s</div>\n' % (detail_color, html.escape(detail))) if detail else ""
 
     reasons_html = ""
     if (not is_safe or stale) and state.get("reasons"):
@@ -2562,14 +2569,27 @@ def build_forecast_html(state):
     def pct(v):
         return "?" if v is None else "%.0f%%" % v
 
-    lines = ["%-15s %6s %6s %6s %6s" % ("local", "cloud", "precip", "thndr", "temp")]
+    def cardinal(deg):
+        if deg is None:
+            return ""
+        return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((deg % 360) / 45 + 0.5) % 8]
+
+    def wind(hr):
+        kmh = hr.get("wind_speed_kmh")
+        if kmh is None:
+            return "?"
+        return "%d mph %s" % (round(kmh * 0.621371), cardinal(hr.get("wind_dir_deg")))
+
+    fmt = "%-15s %6s %6s %6s %6s %10s"
+    lines = [fmt % ("local", "cloud", "precip", "thndr", "temp", "wind")]
     for hr in hours:
         temp = hr.get("temp_f")
-        lines.append("%-15s %6s %6s %6s %6s" % (
+        lines.append(fmt % (
             str(hr.get("local", ""))[:15],
             pct(hr.get("cloud_cover_pct")), pct(hr.get("precip_prob_pct")),
             pct(hr.get("thunder_prob_pct")),
-            "?" if temp is None else "%d°F" % temp))
+            "?" if temp is None else "%d°F" % temp,
+            wind(hr)))
     pre = html.escape("\n".join(lines))
     grid = html.escape(str(nws.get("grid") or "?"))
     upd = html.escape(str(nws.get("update_time") or "?"))

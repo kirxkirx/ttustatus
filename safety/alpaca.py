@@ -173,12 +173,14 @@ def _setup_html(monitor, cfg) -> str:
                     "unknown" if hum["value_pct"] is None else f'{hum["value_pct"]:.0f}% '
                     f'(unsafe > {hum["threshold_pct"]:g}%)', hum["safe"]))
     rain = comp["rain"]
-    if rain["latched"]:
-        rv = f'latched, {rain["seconds_remaining"] // 60} min remaining'
+    if not rain.get("enabled", True):
+        rv = "disabled (no WU key)"
+    elif rain["latched"]:
+        rv = f'RAIN — latched, {rain["seconds_remaining"] // 60} min remaining'
     elif rain["polling_active"]:
-        rv = f'clear, polling {rain["stations_live"]}/{rain["stations_total"]} stations'
+        rv = f'no rain, polling {rain["stations_live"]}/{rain["stations_total"]} stations'
     else:
-        rv = "clear, polling paused (daytime)"
+        rv = "no rain, polling paused (daytime)"
     rows.append(row("Rain (WU)", rv, rain["safe"]))
 
     nws = comp.get("nws")

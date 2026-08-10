@@ -67,16 +67,20 @@ def test_nws_forecast_section_and_tile_render():
            "now_hour": {"cloud_cover_pct": 85, "precip_prob_pct": 20, "thunder_prob_pct": 0},
            "next_hour": {"cloud_cover_pct": 90, "precip_prob_pct": 30, "thunder_prob_pct": 5},
            "hours": [{"local": "Mon 00:00", "cloud_cover_pct": 85, "precip_prob_pct": 20,
-                      "thunder_prob_pct": 0, "temp_f": 70}]}
+                      "thunder_prob_pct": 0, "temp_f": 70, "wind_speed_kmh": 16.0,
+                      "wind_dir_deg": 200}]}
     comp = {"sun": {"value_deg": -7.5, "threshold_deg": 0.0, "safe": True},
             "humidity": {"value_pct": 42.0, "threshold_pct": 95.0, "safe": True},
             "rain": {"safe": True, "enabled": True, "latched": False, "polling_active": True,
                      "stations_live": 7, "stations_total": 10},
             "nws": nws}
     tiles = msp.build_safety_tiles_html(comp)
-    assert "NWS cloud" in tiles
+    assert "next hr" in tiles                          # relabelled tile
+    assert "C85%/P20%/T0%" in tiles and "C90%/P30%/T5%" in tiles   # both hours packed
+    assert "no&nbsp;rain" in tiles                     # rain wording fixed
     fc = msp.build_forecast_html({"components": {"nws": nws}})
     assert "12-hour forecast" in fc and "Mon 00:00" in fc and "NWS" in fc
+    assert "mph" in fc                                 # wind column present
     # no forecast data -> section omitted, no crash
     assert msp.build_forecast_html({"components": {"nws": {"hours": []}}}) == ""
 
