@@ -14,11 +14,12 @@ import logging
 import threading
 import time
 
-from . import config, discovery
+from . import config, discovery, glm_lightning
 from .alpaca import create_app
 from .eventlog import EventLog
 from .monitor import RainPoller, SafetyMonitor
 from .nws_forecast import NwsForecastPoller
+from .glm_lightning import GlmLightningPoller
 
 log = logging.getLogger("ttu.safety")
 
@@ -40,7 +41,8 @@ def main(argv=None):
     eventlog = EventLog(cfg.EVENT_LOG)
     poller = RainPoller(cfg, eventlog)
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
-    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws)
+    glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
+    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm)
 
     eventlog.record("STARTUP", detail=f"{cfg.SERVER_NAME} v{cfg.DRIVER_VERSION}",
                     result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}")
@@ -49,6 +51,11 @@ def main(argv=None):
                     "(sun/humidity protection still active). Set it via the environment.")
         eventlog.record("CONFIG", reason="WU_API_KEY not set",
                         result="rain polling disabled")
+    if glm is not None and not glm_lightning.deps_available():
+        log.warning("numpy/netCDF4 not installed — GLM LIGHTNING DISABLED "
+                    "(apt install python3-numpy python3-netcdf4). Other layers unaffected.")
+        eventlog.record("CONFIG", reason="numpy/netCDF4 missing",
+                        result="GLM lightning disabled")
 
     stop = threading.Event()
 
@@ -76,12 +83,25 @@ def main(argv=None):
                 log.exception("nws poll failed")
             stop.wait(60)
 
+    def glm_loop():
+        # Its own thread: the slow S3/netCDF poll never blocks the evaluator or HTTP.
+        while not stop.is_set():
+            try:
+                glm.maybe_poll(_fresh_sun(monitor, cfg), time.time())
+            except Exception:
+                log.exception("glm poll failed")
+            stop.wait(60)
+
     threading.Thread(target=evaluator, name="evaluator", daemon=True).start()
     threading.Thread(target=rain_loop, name="rain-poller", daemon=True).start()
     if nws is not None:
         threading.Thread(target=nws_loop, name="nws-poller", daemon=True).start()
     else:
         log.warning("NWS forecast component disabled (TTU_SAFETY_NWS=0)")
+    if glm is not None:
+        threading.Thread(target=glm_loop, name="glm-poller", daemon=True).start()
+    else:
+        log.warning("GLM lightning component disabled (TTU_SAFETY_GLM=0)")
     discovery.start(cfg.HTTP_PORT)
 
     app = create_app(monitor, cfg)

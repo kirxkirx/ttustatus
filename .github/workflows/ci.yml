@@ -14,8 +14,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Only the daemon's real deps. The Raspberry Pi hardware libs (board, adafruit_dht,
-      # gps, astropy, numpy) are intentionally NOT installed — the smoke tests mock them.
+      # Only the daemon's core deps. Heavy/optional libs — Pi hardware (board, adafruit_dht,
+      # gps, astropy, numpy) and the lightning stack (netCDF4 for GLM, websocket for
+      # Blitzortung) — are intentionally NOT installed; the tests mock/guard them, so this
+      # step is the real CI environment the suite must pass in.
       - name: Install dependencies
         run: pip install flask waitress pytest flake8
 

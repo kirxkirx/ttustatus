@@ -78,11 +78,24 @@ def test_nws_forecast_section_and_tile_render():
     assert "next hr" in tiles                          # relabelled tile
     assert "C85%/P20%/T0%" in tiles and "C90%/P30%/T5%" in tiles   # both hours packed
     assert "no&nbsp;rain" in tiles                     # rain wording fixed
+    assert "Lightning (GLM" in tiles                   # GLM tile present (off by default here)
     fc = msp.build_forecast_html({"components": {"nws": nws}})
     assert "12-hour forecast" in fc and "Mon 00:00" in fc and "NWS" in fc
     assert "mph" in fc                                 # wind column present
     # no forecast data -> section omitted, no crash
     assert msp.build_forecast_html({"components": {"nws": {"hours": []}}}) == ""
+
+
+def test_glm_tile_latched_render():
+    comp = {"sun": {"value_deg": -7.5, "threshold_deg": 0.0, "safe": True},
+            "humidity": {"value_pct": 42.0, "threshold_pct": 95.0, "safe": True},
+            "rain": {"safe": True, "enabled": True, "latched": False, "polling_active": True,
+                     "stations_live": 7, "stations_total": 10},
+            "glm": {"enabled": True, "available": True, "latched": True,
+                    "seconds_remaining": 3600, "trigger_km": 50, "nearest_km": 12.0,
+                    "nearest_bearing": "N", "polling_active": True, "safe": False}}
+    tiles = msp.build_safety_tiles_html(comp)
+    assert "STRIKE" in tiles and "Lightning (GLM" in tiles
 
 
 def test_rain_tile_disabled_without_key():

@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 
-from . import nws_forecast, wu_poll
+from . import glm_lightning, nws_forecast, wu_poll
 
 log = logging.getLogger("ttu.safety.monitor")
 
@@ -195,11 +195,12 @@ class RainPoller:
 class SafetyMonitor:
     """Aggregates the inputs into IsSafe and publishes state for the status page."""
 
-    def __init__(self, cfg, eventlog, poller: RainPoller, nws=None):
+    def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
         self.nws = nws                  # NwsForecastPoller or None (component fails to unknown)
+        self.glm = glm                  # GlmLightningPoller or None
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()   # serialize whole evaluations
         self._connected = False
@@ -264,7 +265,18 @@ class SafetyMonitor:
         if not nws_safe:
             reasons.extend(nws["reasons"])
 
-        is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe and not stale)
+        # GLM lightning latch (independent of page inputs; applies even when stale).
+        if self.glm is not None:
+            glm = self.glm.component(None if stale else sun_alt, now)
+        else:
+            glm = glm_lightning.unavailable_component(self.cfg)
+        glm_safe = glm["safe"]
+        if not glm_safe:
+            reasons.append("lightning within %g km (GLM latch %d min left)"
+                           % (glm["trigger_km"], glm["seconds_remaining"] // 60))
+
+        is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe
+                       and glm_safe and not stale)
 
         state = {
             "ts": now,
@@ -289,6 +301,7 @@ class SafetyMonitor:
                              "age_s": round(age) if age is not None else None},
                 "rain": rain,
                 "nws": nws,
+                "glm": glm,
             },
             "events_tail": [self._fmt_event(e) for e in self.log.recent(12)],
         }

@@ -180,6 +180,46 @@ def test_no_nws_poller_is_safe_and_reports_unavailable(env, write_inputs):
     assert st["components"]["nws"]["available"] is False
 
 
+class _StubGlm:
+    def __init__(self, comp):
+        self._c = comp
+
+    def component(self, sun_alt=None, now=None):
+        return self._c
+
+
+def _glm_comp(safe, latched=False, remaining=0):
+    return {"safe": safe, "enabled": True, "available": True, "latched": latched,
+            "latched_until": None, "seconds_remaining": remaining, "in_ring": latched,
+            "nearest_km": 12.0 if latched else 800.0, "nearest_bearing": "N",
+            "polling_active": True, "last_poll_ts": None, "granules_scanned": 15,
+            "trigger_km": 50.0, "cooloff_hours": 3.0, "source": "GLM"}
+
+
+def test_glm_latch_makes_unsafe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"],
+                      glm=_StubGlm(_glm_comp(False, latched=True, remaining=3600)))
+    st = m.evaluate()
+    assert st["is_safe"] is False
+    assert any("lightning within" in r for r in st["reasons"])
+    assert st["components"]["glm"]["latched"] is True
+
+
+def test_glm_clear_is_safe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"], glm=_StubGlm(_glm_comp(True)))
+    assert m.evaluate()["is_safe"] is True
+
+
+def test_no_glm_poller_is_safe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"])   # glm=None
+    st = m.evaluate()
+    assert st["is_safe"] is True
+    assert st["components"]["glm"]["enabled"] is False
+
+
 def test_env_float_rejects_nonfinite(monkeypatch):
     monkeypatch.setenv("TTU_TEST_FLOAT", "nan")
     assert config._env_float("TTU_TEST_FLOAT", 3.0) == 3.0

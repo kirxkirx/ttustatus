@@ -200,6 +200,22 @@ def _setup_html(monitor, cfg) -> str:
                 th.get("thunder_prob_pct", 10)))
         rows.append(row("NWS forecast (this/next hr)", nv, nws.get("safe", True)))
 
+    glm = comp.get("glm")
+    if glm:
+        tk = glm.get("trigger_km", 50)
+        if not glm.get("enabled"):
+            gv = "disabled (numpy/netCDF4 not installed)"
+        elif glm.get("latched"):
+            gv = "STRIKE ≤%g km — latched, %d min remaining" % (
+                tk, glm.get("seconds_remaining", 0) // 60)
+        else:
+            nk = glm.get("nearest_km")
+            near = "no strikes seen" if nk is None else "nearest %s km %s" % (
+                nk, glm.get("nearest_bearing") or "")
+            state_txt = "polling" if glm.get("polling_active") else "polling paused (daytime)"
+            gv = "%s; %s" % (near, state_txt)
+        rows.append(row("Lightning (GLM ≤%g km)" % tk, gv, glm.get("safe", True)))
+
     reasons = ""
     if st["reasons"]:
         items = "".join(f"<li>{html.escape(r)}</li>" for r in st["reasons"])

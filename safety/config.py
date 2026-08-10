@@ -66,6 +66,22 @@ NWS_THUNDER_PROB_MAX = _env_float("TTU_SAFETY_NWS_THUNDER_MAX", 10.0)  # % ; uns
 NWS_RENDER_HOURS = _env_int("TTU_SAFETY_NWS_RENDER_HOURS", 12)        # 12-h table (display)
 LOCAL_TZ = _env_str("TTU_SAFETY_LOCAL_TZ", "America/Chicago")         # for the render table
 
+# --- GLM lightning component (GOES-19 total lightning via AWS S3) -----------
+# Every GLM_POLL_INTERVAL (night only, sun below the gate) fetches the last GLM_WINDOW_MIN
+# of GLM granules IN RAM (no SD writes) and LATCHES unsafe for GLM_COOLOFF_HOURS if any
+# flash is within GLM_TRIGGER_KM. The slow S3/netCDF work runs in its own thread; evaluate()
+# only reads the cached latch, so it never blocks page/monitor refresh. Needs numpy+netCDF4
+# (apt: python3-numpy python3-netcdf4); if absent, GLM is disabled (other layers unaffected).
+GLM_ENABLED = _env_str("TTU_SAFETY_GLM", "1").strip().lower() not in ("0", "false", "no")
+GLM_BUCKET = _env_str("TTU_SAFETY_GLM_BUCKET", "noaa-goes19")
+GLM_TRIGGER_KM = _env_float("TTU_SAFETY_GLM_TRIGGER_KM", 50.0)
+GLM_COOLOFF_HOURS = _env_float("TTU_SAFETY_GLM_COOLOFF_HOURS", 3.0)   # same as WU rain latch
+GLM_POLL_INTERVAL = _env_int("TTU_SAFETY_GLM_POLL_INTERVAL", 300)     # 5 min
+GLM_WINDOW_MIN = _env_int("TTU_SAFETY_GLM_WINDOW_MIN", 5)             # look-back per poll
+GLM_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_GLM_SUN_BELOW", 5.0)  # night gate (like WU)
+GLM_LATCH_FILE = _env_str("TTU_SAFETY_GLM_LATCH_FILE",
+                          os.path.expanduser("~/safety_glm_latch.json"))
+
 # --- files ------------------------------------------------------------------
 # Transient (fine in /tmp): the page<->daemon exchange.
 INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", "/tmp/safety_inputs.json")

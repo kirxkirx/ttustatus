@@ -143,8 +143,25 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
 | `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min) |
 | `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `70` / `15` / `10` | % thresholds (unsafe when exceeded, this or next hour) |
+| `TTU_SAFETY_GLM` | `1` | enable the GLM lightning component (`0` disables) |
+| `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE |
+| `TTU_SAFETY_GLM_COOLOFF_HOURS` | `3.0` | latch duration after the last nearby flash |
+| `TTU_SAFETY_GLM_POLL_INTERVAL` | `300` | seconds between GLM polls (night only) |
+| `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes fetched per poll |
 
 Thresholds (sun `>0°`, humidity `>95%`, WU sun-gate `<5°`) are in `safety/config.py`.
+
+### GLM lightning component
+
+Every 5 min **while the sun is below 5°** (night, like WU rain) the daemon fetches the last
+5 min of **GOES-19 GLM total-lightning** granules from AWS Open Data (anonymous S3, no key)
+and **latches UNSAFE for 3 h** if any flash is within **50 km**. Parsing is **entirely in
+RAM** (in-memory netCDF, `/dev/shm` fallback) — **no SD-card writes** — and the slow
+S3/netCDF poll runs in its own thread, so it never blocks `evaluate()` or the status page.
+Needs `numpy` + `netCDF4` (`sudo apt install python3-numpy python3-netcdf4`); if absent, GLM
+is disabled and the other layers are unaffected. Both status pages show the trigger state and
+the distance to the nearest strike. Fail-safe: a fetch error never clears an active latch and
+never forces unsafe on its own; "no flashes" is never proof of safety.
 
 ### NWS forecast component
 

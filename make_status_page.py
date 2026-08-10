@@ -2448,6 +2448,24 @@ def build_safety_tiles_html(comp):
         nws_s = (safety_dot_html(bool(nws.get("safe")))
                  + "C cloud &middot; P precip &middot; T thunder")
 
+    glm = comp.get("glm") or {}
+    glm_tk = glm.get("trigger_km", 50)
+    if not glm.get("enabled", False):
+        glm_v = '<div class="v mono">off</div>'
+        glm_s = safety_dot_html(True) + "GLM off (deps)"
+    elif glm.get("latched"):
+        glm_v = ('<div class="v mono">%d<span class="u">min</span></div>'
+                 % (glm.get("seconds_remaining", 0) // 60))
+        glm_s = safety_dot_html(False) + ("STRIKE &le;%g km" % glm_tk)
+    else:
+        nk = glm.get("nearest_km")
+        glm_v = ('<div class="v mono">%s</div>'
+                 % ("&mdash;" if nk is None else '%.0f<span class="u">km</span>' % nk))
+        if glm.get("polling_active"):
+            glm_s = safety_dot_html(True) + ("no strike &le;%g km" % glm_tk)
+        else:
+            glm_s = safety_dot_html(True) + "polling paused (day)"
+
     return """  <div class="tiles">
     <div class="tile">
       <div class="k">Sun altitude</div>
@@ -2469,8 +2487,13 @@ def build_safety_tiles_html(comp):
       %s
       <div class="s">%s</div>
     </div>
+    <div class="tile">
+      <div class="k">Lightning (GLM &le;%gkm)</div>
+      %s
+      <div class="s">%s</div>
+    </div>
   </div>
-""" % (sun_v, sun_s, hum_v, hum_s, rain_v, rain_s, nws_v, nws_s)
+""" % (sun_v, sun_s, hum_v, hum_s, rain_v, rain_s, nws_v, nws_s, glm_tk, glm_v, glm_s)
 
 
 def _safety_endpoint_html(state):
