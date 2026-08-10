@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 
-from . import wu_poll
+from . import nws_forecast, wu_poll
 
 log = logging.getLogger("ttu.safety.monitor")
 
@@ -195,10 +195,11 @@ class RainPoller:
 class SafetyMonitor:
     """Aggregates the inputs into IsSafe and publishes state for the status page."""
 
-    def __init__(self, cfg, eventlog, poller: RainPoller):
+    def __init__(self, cfg, eventlog, poller: RainPoller, nws=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
+        self.nws = nws                  # NwsForecastPoller or None (component fails to unknown)
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()   # serialize whole evaluations
         self._connected = False
@@ -253,7 +254,17 @@ class SafetyMonitor:
         if not rain_safe:
             reasons.append(f"rain latch active ({rain['seconds_remaining'] // 60} min left)")
 
-        is_safe = bool(sun_safe and hum_safe and rain_safe and not stale)
+        # NWS forecast (pre-emptive): unsafe only when it has fresh data that breaches a
+        # threshold; an unavailable/stale forecast does not flip safe->unsafe on its own.
+        if self.nws is not None:
+            nws = self.nws.component(now)
+        else:
+            nws = nws_forecast.unavailable_component(self.cfg)
+        nws_safe = nws["safe"]
+        if not nws_safe:
+            reasons.extend(nws["reasons"])
+
+        is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe and not stale)
 
         state = {
             "ts": now,
@@ -277,6 +288,7 @@ class SafetyMonitor:
                              "safe": hum_safe, "stale": stale,
                              "age_s": round(age) if age is not None else None},
                 "rain": rain,
+                "nws": nws,
             },
             "events_tail": [self._fmt_event(e) for e in self.log.recent(12)],
         }

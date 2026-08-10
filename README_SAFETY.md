@@ -44,7 +44,7 @@ extra components in `safety/monitor.py`.
 
 1. Clone the repo into `~/ttustatus` (everything runs from there):
    ```bash
-   cd ~ && git clone git@github.com:<you>/ttustatus.git
+   cd ~ && git clone https://github.com/kirxkirx/ttustatus.git   # public: no credentials needed
    ```
 2. Install the daemon's only extra dependencies — Flask + waitress (astropy/adafruit etc.
    are only used by the page generator, not the daemon). Current Raspberry Pi OS blocks
@@ -138,8 +138,23 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_WU_KEY` | **(required)** | Weather Underground PWS API key — set via env, never commit (see above) |
 | `TTU_SAFETY_LAT` / `_LON` | TTU | geocode for nearest-station discovery |
 | `TTU_SAFETY_INPUTS_FILE` / `_STATE_FILE` / `_LATCH_FILE` / `_EVENT_LOG` | see `config.py` | file paths |
+| `TTU_SAFETY_NWS` | `1` | enable the NWS forecast component (`0` disables) |
+| `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent NWS asks for (add a contact) |
+| `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
+| `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min) |
+| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `70` / `15` / `10` | % thresholds (unsafe when exceeded, this or next hour) |
 
 Thresholds (sun `>0°`, humidity `>95%`, WU sun-gate `<5°`) are in `safety/config.py`.
+
+### NWS forecast component
+
+A pre-emptive layer: every 15 min the daemon pulls the free **NWS gridpoint forecast**
+(api.weather.gov, no key) and flags **UNSAFE if THIS hour or NEXT hour** exceeds any of:
+cloud cover > 70%, precip probability > 15%, thunder probability > 10%. A fetch error or a
+stale forecast is treated as *unavailable* (does not by itself flip unsafe — it's a
+forecast, not a local sensor); a breach in a fresh forecast does. Both the daemon's
+`/setup` page and the observatory status page show the inputs, the conclusion, and (on the
+observatory page) a 12-hour forecast table with a source note.
 
 ## Test / develop off the Pi
 

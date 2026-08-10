@@ -181,6 +181,23 @@ def _setup_html(monitor, cfg) -> str:
         rv = "clear, polling paused (daytime)"
     rows.append(row("Rain (WU)", rv, rain["safe"]))
 
+    nws = comp.get("nws")
+    if nws:
+        if not nws.get("available"):
+            nv = "unavailable / stale (not gating)"
+        else:
+            th = nws.get("thresholds", {})
+
+            def _fc(h):
+                return ("c%s%% p%s%% t%s%%" % (
+                    h.get("cloud_cover_pct"), h.get("precip_prob_pct"),
+                    h.get("thunder_prob_pct"))) if h else "?"
+            nv = ("now[%s] next[%s]  (limits c>%g%% p>%g%% t>%g%%)" % (
+                _fc(nws.get("now_hour")), _fc(nws.get("next_hour")),
+                th.get("cloud_pct", 70), th.get("precip_prob_pct", 15),
+                th.get("thunder_prob_pct", 10)))
+        rows.append(row("NWS forecast (this/next hr)", nv, nws.get("safe", True)))
+
     reasons = ""
     if st["reasons"]:
         items = "".join(f"<li>{html.escape(r)}</li>" for r in st["reasons"])

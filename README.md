@@ -35,7 +35,7 @@ ttustatus.env.example    template for the secrets file (WU API key)
 sudo apt update && sudo apt install -y python3-flask python3-waitress git
 
 # 2. clone
-cd ~ && git clone git@github.com:<you>/ttustatus.git
+cd ~ && git clone https://github.com/kirxkirx/ttustatus.git   # public repo: no credentials needed
 
 # 3. secrets (WU API key) — kept OUTSIDE the repo, never committed
 cp ~/ttustatus/ttustatus.env.example ~/ttustatus.env

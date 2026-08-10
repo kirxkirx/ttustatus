@@ -4,6 +4,7 @@ Threads:
   * evaluator    — every EVAL_INTERVAL: recompute IsSafe, log transitions, write state.
   * rain-poller  — every ~30 s: if it's night (sun below the gate) and the interval has
                    elapsed, poll Weather Underground and update the 3-hour latch.
+  * nws-poller   — every ~60 s: if the interval elapsed, pull the NWS gridpoint forecast.
   * discovery    — UDP responder so NINA can auto-find us.
   * main thread  — waitress serving the Alpaca HTTP API.
 """
@@ -17,6 +18,7 @@ from . import config, discovery
 from .alpaca import create_app
 from .eventlog import EventLog
 from .monitor import RainPoller, SafetyMonitor
+from .nws_forecast import NwsForecastPoller
 
 log = logging.getLogger("ttu.safety")
 
@@ -37,7 +39,8 @@ def main(argv=None):
 
     eventlog = EventLog(cfg.EVENT_LOG)
     poller = RainPoller(cfg, eventlog)
-    monitor = SafetyMonitor(cfg, eventlog, poller)
+    nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
+    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws)
 
     eventlog.record("STARTUP", detail=f"{cfg.SERVER_NAME} v{cfg.DRIVER_VERSION}",
                     result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}")
@@ -65,8 +68,20 @@ def main(argv=None):
                 log.exception("rain poll failed")
             stop.wait(30)
 
+    def nws_loop():
+        while not stop.is_set():
+            try:
+                nws.maybe_poll(time.time())    # polls immediately, then every NWS_POLL_INTERVAL
+            except Exception:
+                log.exception("nws poll failed")
+            stop.wait(60)
+
     threading.Thread(target=evaluator, name="evaluator", daemon=True).start()
     threading.Thread(target=rain_loop, name="rain-poller", daemon=True).start()
+    if nws is not None:
+        threading.Thread(target=nws_loop, name="nws-poller", daemon=True).start()
+    else:
+        log.warning("NWS forecast component disabled (TTU_SAFETY_NWS=0)")
     discovery.start(cfg.HTTP_PORT)
 
     app = create_app(monitor, cfg)

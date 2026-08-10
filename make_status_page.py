@@ -2429,6 +2429,21 @@ def build_safety_tiles_html(comp):
         else:
             rain_s = safety_dot_html(True) + "polling paused (day)"
 
+    nws = comp.get("nws") or {}
+    if not nws.get("available"):
+        nws_v = '<div class="v mono">N/A</div>'
+        nws_s = safety_dot_html(True) + "forecast unavailable"
+    else:
+        nh = nws.get("now_hour") or {}
+        cloud = nh.get("cloud_cover_pct")
+        nws_v = ('<div class="v mono">%s<span class="u">%%</span></div>'
+                 % ("?" if cloud is None else "%.0f" % cloud))
+        if nws.get("safe"):
+            nws_s = safety_dot_html(True) + ("P%s%% T%s%%" % (
+                nh.get("precip_prob_pct"), nh.get("thunder_prob_pct")))
+        else:
+            nws_s = safety_dot_html(False) + "forecast over threshold"
+
     return """  <div class="tiles">
     <div class="tile">
       <div class="k">Sun altitude</div>
@@ -2445,8 +2460,13 @@ def build_safety_tiles_html(comp):
       %s
       <div class="s">%s</div>
     </div>
+    <div class="tile">
+      <div class="k">NWS cloud (this hr)</div>
+      %s
+      <div class="s">%s</div>
+    </div>
   </div>
-""" % (sun_v, sun_s, hum_v, hum_s, rain_v, rain_s)
+""" % (sun_v, sun_s, hum_v, hum_s, rain_v, rain_s, nws_v, nws_s)
 
 
 def _safety_endpoint_html(state):
@@ -2533,6 +2553,48 @@ def build_safety_html(state):
             + reasons_html + tiles_head + tiles + events_html + card_close)
 
 
+def build_forecast_html(state):
+    nws = ((state or {}).get("components", {}) or {}).get("nws") or {}
+    hours = nws.get("hours") or []
+    if not hours:
+        return ""   # forecast unavailable -> omit the section entirely
+
+    def pct(v):
+        return "?" if v is None else "%.0f%%" % v
+
+    lines = ["%-15s %6s %6s %6s %6s" % ("local", "cloud", "precip", "thndr", "temp")]
+    for hr in hours:
+        temp = hr.get("temp_f")
+        lines.append("%-15s %6s %6s %6s %6s" % (
+            str(hr.get("local", ""))[:15],
+            pct(hr.get("cloud_cover_pct")), pct(hr.get("precip_prob_pct")),
+            pct(hr.get("thunder_prob_pct")),
+            "?" if temp is None else "%d°F" % temp))
+    pre = html.escape("\n".join(lines))
+    grid = html.escape(str(nws.get("grid") or "?"))
+    upd = html.escape(str(nws.get("update_time") or "?"))
+    blurb = (
+        "Source: <b>NWS</b> (US National Weather Service) gridpoint forecast for grid %s "
+        "via api.weather.gov &mdash; free, no key, model-blended (HRRR near-term / GFS), "
+        "updated about hourly (last %s UTC). Cloud cover, precipitation probability and "
+        "thunder probability for <b>this hour and next</b> drive the safety monitor's "
+        "pre-emptive check; the full table here is for reference." % (grid, upd)
+    )
+    return (
+        '  <h2>12-hour forecast (NWS)</h2>\n'
+        '  <div class="grid">\n'
+        '    <div>\n'
+        '      <pre style="background:var(--codebg);border:1px solid var(--line);'
+        'border-radius:8px;padding:10px 12px;overflow-x:auto;font-size:12.5px;margin:0">'
+        '%s</pre>\n'
+        '    </div>\n'
+        '    <div>\n'
+        '      <p class="lede" style="font-size:13.5px;margin-top:0">%s</p>\n'
+        '    </div>\n'
+        '  </div>\n' % (pre, blurb)
+    )
+
+
 def write_html(
     t,
     h,
@@ -2603,12 +2665,20 @@ def write_html(
 
     parts.append(build_masthead_html(night_default))
 
-    # Section 1: the Alpaca safety monitor (its own card).
+    # Section 1: the Alpaca safety monitor (its own card) + the NWS 12-h forecast.
     try:
-        parts.append(build_safety_html(read_safety_state()))
+        _safety_state = read_safety_state()
+    except Exception:
+        _safety_state = None
+    try:
+        parts.append(build_safety_html(_safety_state))
     except Exception:
         parts.append('  <h2>Alpaca safety monitor</h2>\n'
                      '  <p class="lede">Safety section unavailable.</p>\n')
+    try:
+        parts.append(build_forecast_html(_safety_state))
+    except Exception:
+        pass
 
     # Section 2: the observatory clock, sensors, and NTP service.
     parts.append('  <h2 style="margin:0 0 6px">Observatory clock, sensors &amp; NTP</h2>\n')

@@ -140,6 +140,46 @@ def test_state_includes_alpaca_endpoint(env, write_inputs):
     assert a["address"]      # some IP string
 
 
+class _StubNws:
+    def __init__(self, comp):
+        self._c = comp
+
+    def component(self, now=None):
+        return self._c
+
+
+def _nws_comp(safe, reasons=None):
+    return {"safe": safe, "available": True, "stale": False, "reasons": reasons or [],
+            "source": "NWS", "thresholds": {}, "grid": "LUB/46,41", "update_time": None,
+            "age_min": 3, "now_hour": {}, "next_hour": {}, "hours": []}
+
+
+def test_nws_breach_makes_unsafe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"],
+                      nws=_StubNws(_nws_comp(False, ["NWS cloud cover 85% > 70% (next hour)"])))
+    st = m.evaluate()
+    assert st["is_safe"] is False
+    assert any("cloud cover" in r for r in st["reasons"])
+    assert st["components"]["nws"]["safe"] is False
+
+
+def test_nws_unavailable_does_not_block(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    comp = _nws_comp(True)
+    comp["available"] = False
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"], nws=_StubNws(comp))
+    assert m.evaluate()["is_safe"] is True
+
+
+def test_no_nws_poller_is_safe_and_reports_unavailable(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"])   # nws=None
+    st = m.evaluate()
+    assert st["is_safe"] is True
+    assert st["components"]["nws"]["available"] is False
+
+
 def test_env_float_rejects_nonfinite(monkeypatch):
     monkeypatch.setenv("TTU_TEST_FLOAT", "nan")
     assert config._env_float("TTU_TEST_FLOAT", 3.0) == 3.0

@@ -50,6 +50,22 @@ RAIN_LATCH_HOURS = _env_float("TTU_SAFETY_RAIN_LATCH_HOURS", 3.0)
 INPUTS_STALE_SEC = _env_int("TTU_SAFETY_INPUTS_STALE_SEC", 600)  # older => fail safe
 CLOCK_SKEW_TOLERANCE_SEC = 5    # future-dated inputs beyond this => also stale
 
+# --- NWS forecast component (pre-emptive cloud/precip/thunder) --------------
+# Pulls the raw NWS gridpoint forecast every NWS_POLL_INTERVAL and flags UNSAFE if THIS
+# hour or NEXT hour breaches any threshold. Free, no key (NWS asks for a User-Agent). A
+# fetch error or stale forecast is treated as "unavailable" (does not by itself flip unsafe
+# — it's a forecast, not a local sensor); a breach in a fresh forecast DOES flip unsafe.
+NWS_ENABLED = _env_str("TTU_SAFETY_NWS", "1").strip().lower() not in ("0", "false", "no")
+NWS_USER_AGENT = _env_str("TTU_SAFETY_NWS_UA", "ttu-safety-monitor")  # add a contact via env
+NWS_GRID = _env_str("TTU_SAFETY_NWS_GRID", "")   # e.g. "LUB/46,41"; empty => resolve via GEOCODE
+NWS_POLL_INTERVAL = _env_int("TTU_SAFETY_NWS_POLL_INTERVAL", 900)     # 15 min
+NWS_STALE_AFTER_MIN = _env_int("TTU_SAFETY_NWS_STALE_MIN", 150)
+NWS_CLOUD_MAX = _env_float("TTU_SAFETY_NWS_CLOUD_MAX", 70.0)          # % ; unsafe when >
+NWS_PRECIP_PROB_MAX = _env_float("TTU_SAFETY_NWS_PRECIP_MAX", 15.0)   # % ; unsafe when >
+NWS_THUNDER_PROB_MAX = _env_float("TTU_SAFETY_NWS_THUNDER_MAX", 10.0)  # % ; unsafe when >
+NWS_RENDER_HOURS = _env_int("TTU_SAFETY_NWS_RENDER_HOURS", 12)        # 12-h table (display)
+LOCAL_TZ = _env_str("TTU_SAFETY_LOCAL_TZ", "America/Chicago")         # for the render table
+
 # --- files ------------------------------------------------------------------
 # Transient (fine in /tmp): the page<->daemon exchange.
 INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", "/tmp/safety_inputs.json")

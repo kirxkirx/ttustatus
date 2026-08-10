@@ -60,6 +60,27 @@ def test_safety_card_offline_is_not_green():
     assert "OFFLINE" in html and "#1a7f37" not in html
 
 
+def test_nws_forecast_section_and_tile_render():
+    nws = {"safe": False, "available": True, "stale": False,
+           "reasons": ["NWS cloud cover 85% > 70% (next hour)"],
+           "grid": "LUB/46,41", "update_time": "2026-01-01T00:00:00+00:00",
+           "now_hour": {"cloud_cover_pct": 85, "precip_prob_pct": 20, "thunder_prob_pct": 0},
+           "next_hour": {"cloud_cover_pct": 90, "precip_prob_pct": 30, "thunder_prob_pct": 5},
+           "hours": [{"local": "Mon 00:00", "cloud_cover_pct": 85, "precip_prob_pct": 20,
+                      "thunder_prob_pct": 0, "temp_f": 70}]}
+    comp = {"sun": {"value_deg": -7.5, "threshold_deg": 0.0, "safe": True},
+            "humidity": {"value_pct": 42.0, "threshold_pct": 95.0, "safe": True},
+            "rain": {"safe": True, "enabled": True, "latched": False, "polling_active": True,
+                     "stations_live": 7, "stations_total": 10},
+            "nws": nws}
+    tiles = msp.build_safety_tiles_html(comp)
+    assert "NWS cloud" in tiles
+    fc = msp.build_forecast_html({"components": {"nws": nws}})
+    assert "12-hour forecast" in fc and "Mon 00:00" in fc and "NWS" in fc
+    # no forecast data -> section omitted, no crash
+    assert msp.build_forecast_html({"components": {"nws": {"hours": []}}}) == ""
+
+
 def test_rain_tile_disabled_without_key():
     comp = {"sun": {"value_deg": -7.0, "threshold_deg": 0.0, "safe": True},
             "humidity": {"value_pct": 40.0, "threshold_pct": 95.0, "safe": True},
