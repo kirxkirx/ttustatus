@@ -216,6 +216,33 @@ def _setup_html(monitor, cfg) -> str:
             gv = "%s; %s" % (near, state_txt)
         rows.append(row("Lightning (GLM ≤%g km)" % tk, gv, glm.get("safe", True)))
 
+    rad = comp.get("radar")
+    if rad:
+        rk = rad.get("trigger_km", 50)
+        if not rad.get("enabled"):
+            rv = "disabled (Pillow not installed)"
+        elif not rad.get("available"):
+            rv = "no fresh frame (paused/daytime or unreachable)"
+        elif rad.get("in_ring"):
+            near = rad.get("nearest_km")
+            rv = "RAIN within %g km%s" % (rk, "" if near is None else " (nearest %g km)" % near)
+        else:
+            rv = "no rain within %g km" % rk
+        rows.append(row("Radar (MRMS ≤%g km)" % rk, rv, rad.get("safe", True)))
+
+    conn = comp.get("connectivity")
+    if conn:
+        if not conn.get("probed"):
+            cv = "online (not yet probed)"
+        elif conn.get("online"):
+            cv = "online"
+        elif conn.get("safe"):
+            cv = "offline %d min (grace, threshold %d min)" % (
+                conn.get("offline_min", 0), conn.get("threshold_sec", 3600) // 60)
+        else:
+            cv = "OFFLINE %d min — no internet, failing safe" % conn.get("offline_min", 0)
+        rows.append(row("Internet", cv, conn.get("safe", True)))
+
     reasons = ""
     if st["reasons"]:
         items = "".join(f"<li>{html.escape(r)}</li>" for r in st["reasons"])

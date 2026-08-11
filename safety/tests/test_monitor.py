@@ -220,6 +220,85 @@ def test_no_glm_poller_is_safe(env, write_inputs):
     assert st["components"]["glm"]["enabled"] is False
 
 
+class _StubRadar:
+    def __init__(self, comp):
+        self._c = comp
+
+    def component(self, sun_alt=None, now=None):
+        return self._c
+
+
+def _radar_comp(safe, in_ring=False, near=None):
+    return {"safe": safe, "enabled": True, "available": True, "in_ring": in_ring,
+            "nearest_km": near, "pixels": 5 if in_ring else 0, "frame_utc": None,
+            "age_s": 60, "trigger_km": 50.0, "dbz": 20.0, "polling_active": True,
+            "thumb_available": True, "thumb_path": "/x/ttu_radar.png",
+            "attribution": "attr", "source": "MRMS"}
+
+
+def test_radar_rain_makes_unsafe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"],
+                      radar=_StubRadar(_radar_comp(False, in_ring=True, near=18.0)))
+    st = m.evaluate()
+    assert st["is_safe"] is False
+    assert any("rain on radar within" in r for r in st["reasons"])
+    assert st["components"]["radar"]["in_ring"] is True
+
+
+def test_radar_clear_is_safe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"],
+                      radar=_StubRadar(_radar_comp(True)))
+    assert m.evaluate()["is_safe"] is True
+
+
+def test_no_radar_poller_is_safe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"])   # radar=None
+    st = m.evaluate()
+    assert st["is_safe"] is True
+    assert st["components"]["radar"]["enabled"] is False
+
+
+class _StubConn:
+    def __init__(self, comp):
+        self._c = comp
+
+    def component(self, now=None):
+        return self._c
+
+
+def _conn_comp(safe, offline_min=0):
+    return {"safe": safe, "online": safe, "offline_sec": offline_min * 60,
+            "offline_min": offline_min, "threshold_sec": 3600, "probed": True,
+            "source": "probe"}
+
+
+def test_connectivity_offline_makes_unsafe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"],
+                      conn=_StubConn(_conn_comp(False, offline_min=75)))
+    st = m.evaluate()
+    assert st["is_safe"] is False
+    assert any("no internet" in r for r in st["reasons"])
+    assert st["components"]["connectivity"]["online"] is False
+
+
+def test_connectivity_online_is_safe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"], conn=_StubConn(_conn_comp(True)))
+    assert m.evaluate()["is_safe"] is True
+
+
+def test_no_conn_watch_is_safe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = SafetyMonitor(env["cfg"], env["log"], env["poller"])   # conn=None
+    st = m.evaluate()
+    assert st["is_safe"] is True
+    assert st["components"]["connectivity"]["online"] is True
+
+
 def test_env_float_rejects_nonfinite(monkeypatch):
     monkeypatch.setenv("TTU_TEST_FLOAT", "nan")
     assert config._env_float("TTU_TEST_FLOAT", 3.0) == 3.0

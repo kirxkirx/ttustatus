@@ -1,0 +1,428 @@
+"""MRMS radar component for the SafetyMonitor — a simple 50 km "any rain" ring.
+
+Every poll (night only, like WU) it fetches the latest MRMS composite-reflectivity frame
+from the Iowa Environmental Mesonet (free, no key), and:
+  * CHECK: declares unsafe if any echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of the dome.
+    Deliberately simple — no upwind/downwind logic, just a plain radius.
+  * THUMBNAIL: renders a TTU-centered map (dark OSM tiles from Carto, cached to disk so
+    they are NOT re-downloaded every cycle) with the radar overlaid, the 50 km ring, and
+    10 km / 10 mi scale bars, saved where the status page can load it.
+
+Live check: unsafe while rain is within the ring. If the feed goes BLIND right after an
+in-ring detection, the radar holds its own veto for RADAR_LATCH_SEC (a fresh clear frame
+cancels it immediately) — it does NOT rely on the WU latch, which only arms when rain
+reaches a nearby station, not for a ranged echo. Fail-safe: a fetch error or stale frame
+with no recent detection => unavailable (no veto on its own). Needs Pillow; absent =>
+radar disabled.
+"""
+from __future__ import annotations
+
+import hashlib
+import io
+import logging
+import math
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:                       # pragma: no cover - optional dep
+    Image = ImageDraw = ImageFont = None
+
+log = logging.getLogger("ttu.safety.radar")
+
+ARCHIVE = ("https://mesonet.agron.iastate.edu/archive/data/"
+           "%Y/%m/%d/GIS/mrms/lcref_%Y%m%d%H%M.png")
+GRID_W, GRID_H, PX, UL_LON, UL_LAT = 7000, 3500, 0.01, -129.995, 54.995
+UA = {"User-Agent": "ttu-safety-radar (kirx007@gmail.com)"}
+
+
+def deps_available():
+    return Image is not None
+
+
+# ---- HTTP -----------------------------------------------------------------
+def _get(url, timeout=25):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+        return r.read()
+
+
+# ---- geometry -------------------------------------------------------------
+def latlon_to_px(lat, lon):
+    return int(round((lon - UL_LON) / PX)), int(round((UL_LAT - lat) / PX))
+
+
+def dest_point(lat, lon, dist_km, bearing_deg):
+    br, p1, l1, dr = (math.radians(bearing_deg), math.radians(lat),
+                      math.radians(lon), dist_km / 6371.0)
+    p2 = math.asin(math.sin(p1) * math.cos(dr) + math.cos(p1) * math.sin(dr) * math.cos(br))
+    l2 = l1 + math.atan2(math.sin(br) * math.sin(dr) * math.cos(p1),
+                         math.cos(dr) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540) % 360 - 180
+
+
+def _deg2num(lat, lon, z):
+    n = 2 ** z
+    return (lon + 180) / 360 * n, (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n
+
+
+def _num2deg(xt, yt, z):
+    n = 2 ** z
+    return (math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yt / n)))), xt / n * 360 - 180)
+
+
+def _dbz(idx):
+    return None if idx == 255 else -32.0 + idx * 0.5
+
+
+# ---- radar fetch + 50 km check --------------------------------------------
+def latest_frame(max_back=8):
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    if now.minute % 2:
+        now -= timedelta(minutes=1)
+    for i in range(max_back):
+        ts = now - timedelta(minutes=2 * i)
+        try:
+            req = urllib.request.Request(ts.strftime(ARCHIVE), method="HEAD", headers=UA)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                if r.status == 200:
+                    return ts, ts.strftime(ARCHIVE)
+        except Exception:
+            continue
+    return None, None
+
+
+def check_rain(cfg, img):
+    """Scan the radar grid within RADAR_TRIGGER_KM of the dome. Returns (in_ring, nearest_km,
+    count) — nearest_km is the closest echo >= RADAR_DBZ, or None if the ring is clear."""
+    lat0, lon0 = cfg.GEOCODE
+    px = img.load()
+    coslat = math.cos(math.radians(lat0))
+    dlat = cfg.RADAR_TRIGGER_KM / 111.0
+    dlon = cfg.RADAR_TRIGGER_KM / (111.0 * coslat)
+    c0, r0 = latlon_to_px(lat0, lon0)
+    dc = int(dlon / PX) + 1
+    dr = int(dlat / PX) + 1
+    nearest = None
+    count = 0
+    for r in range(max(0, r0 - dr), min(GRID_H, r0 + dr + 1)):
+        lat = UL_LAT - r * PX
+        for c in range(max(0, c0 - dc), min(GRID_W, c0 + dc + 1)):
+            v = px[c, r]
+            v = v if isinstance(v, int) else v[0]
+            d = _dbz(v)
+            if d is None or d < cfg.RADAR_DBZ:
+                continue
+            lon = UL_LON + c * PX
+            dist = math.hypot((lat - lat0) * 111.0, (lon - lon0) * 111.0 * coslat)
+            if dist <= cfg.RADAR_TRIGGER_KM:
+                count += 1
+                if nearest is None or dist < nearest:
+                    nearest = dist
+    return (nearest is not None), (round(nearest, 1) if nearest is not None else None), count
+
+
+# ---- thumbnail (tiles cached to disk) -------------------------------------
+def _dbz_color(d):
+    if d is None or d < 5:
+        return None
+    for thr, c in [(65, (255, 255, 255)), (55, (230, 0, 140)), (50, (190, 0, 0)),
+                   (45, (230, 60, 20)), (40, (240, 170, 0)), (35, (230, 230, 0)),
+                   (30, (0, 210, 0)), (20, (0, 150, 60)), (10, (3, 120, 170)), (5, (4, 63, 120))]:
+        if d >= thr:
+            return c
+    return None
+
+
+def _region(cfg):
+    lat0, lon0 = cfg.GEOCODE
+    h = cfg.RADAR_THUMB_HALF_DEG
+    return lat0 - h, lat0 + h, lon0 - h, lon0 + h
+
+
+def _cache_key(cfg):
+    s = f"{cfg.GEOCODE}|{cfg.RADAR_THUMB_HALF_DEG}|{cfg.RADAR_THUMB_PX}|{cfg.RADAR_TILE_ZOOM}|{cfg.RADAR_TILE_URL}"
+    return hashlib.md5(s.encode()).hexdigest()[:10]
+
+
+def _font(sz):
+    for p in ("/usr/share/fonts/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(p, sz)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+class Thumbnailer:
+    """Builds and caches the dark-tile basemap once, then composites radar each cycle."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._basemap = None        # PIL RGB image at (_ox, _oy)
+        self._tilebox = None        # (gx0, gy0, gx1, gy1, z) for the mercator mapping
+        self._remap = None          # per-thumb-pixel -> radar palette index source (col,row)
+        self._ox = cfg.RADAR_THUMB_PX
+        self._oy = cfg.RADAR_THUMB_PX   # replaced with the true aspect in _build_basemap
+
+    # basemap (static): fetch tiles once, cache the composited image to disk
+    def _build_basemap(self):
+        cfg = self.cfg
+        z = cfg.RADAR_TILE_ZOOM
+        latmin, latmax, lonmin, lonmax = _region(cfg)
+        x0f, y0f = _deg2num(latmax, lonmin, z)
+        x1f, y1f = _deg2num(latmin, lonmax, z)
+        gx0, gy0, gx1, gy1 = int(x0f * 256), int(y0f * 256), int(x1f * 256), int(y1f * 256)
+        self._tilebox = (gx0, gy0, gx1, gy1, z)
+        # Non-square output matching the Mercator canvas aspect, so px/km is equal on both
+        # axes: the 50 km ring draws as a true circle and one scale bar is valid in every
+        # direction (a square would stretch E-W by 1/cos(lat) ~ 1.2x here).
+        cw, ch = gx1 - gx0, gy1 - gy0
+        self._ox = cfg.RADAR_THUMB_PX
+        self._oy = max(1, round(self._ox * ch / cw))
+
+        cache = os.path.join(cfg.RADAR_CACHE_DIR, f"basemap_{_cache_key(cfg)}.png")
+        if os.path.exists(cache):
+            try:
+                self._basemap = Image.open(cache).convert("RGB")
+                log.info("radar basemap loaded from cache %s (tiles not re-fetched)", cache)
+                return
+            except Exception:
+                pass
+        canvas = Image.new("RGB", (cw, ch), (16, 20, 30))
+        n = 0
+        expected = (int(x1f) - int(x0f) + 1) * (int(y1f) - int(y0f) + 1)
+        for tx in range(int(x0f), int(x1f) + 1):
+            for ty in range(int(y0f), int(y1f) + 1):
+                try:
+                    t = Image.open(io.BytesIO(_get(
+                        cfg.RADAR_TILE_URL.format(z=z, x=tx, y=ty)))).convert("RGB")
+                    canvas.paste(t, (tx * 256 - gx0, ty * 256 - gy0))
+                    n += 1
+                except Exception:
+                    log.warning("radar tile fetch failed z%s x%s y%s", z, tx, ty)
+        self._basemap = canvas.resize((self._ox, self._oy), Image.LANCZOS)
+        # Only persist a COMPLETE basemap — never cache a partial/blank one forever.
+        if n == expected and n > 0:
+            try:
+                os.makedirs(cfg.RADAR_CACHE_DIR, exist_ok=True)
+                self._basemap.save(cache)
+                log.info("radar basemap built from %d tiles and cached to %s", n, cache)
+            except Exception:
+                log.exception("could not cache radar basemap")
+        else:
+            log.warning("radar basemap incomplete (%d/%d tiles) — not cached; will retry",
+                        n, expected)
+
+    # reproject lookup (static for a fixed region): thumb pixel -> radar (col,row)
+    def _build_remap(self):
+        ox, oy = self._ox, self._oy
+        gx0, gy0, gx1, gy1, z = self._tilebox
+        remap = []
+        for j in range(oy):
+            gy = gy0 + (j + 0.5) / oy * (gy1 - gy0)
+            row = []
+            for i in range(ox):
+                gx = gx0 + (i + 0.5) / ox * (gx1 - gx0)
+                lat, lon = _num2deg(gx / 256, gy / 256, z)
+                row.append(latlon_to_px(lat, lon))
+            remap.append(row)
+        self._remap = remap
+
+    def _mv(self, lat, lon):
+        gx0, gy0, gx1, gy1, z = self._tilebox
+        xf, yf = _deg2num(lat, lon, z)
+        return ((xf * 256 - gx0) / (gx1 - gx0) * self._ox,
+                (yf * 256 - gy0) / (gy1 - gy0) * self._oy)
+
+    def render(self, img, frame_txt):
+        """Composite radar over the cached basemap, draw ring + scale bars, save the PNG."""
+        cfg = self.cfg
+        if self._basemap is None:
+            self._build_basemap()
+        if self._remap is None:
+            self._build_remap()
+        ox, oy = self._ox, self._oy
+        base = self._basemap.copy().convert("RGBA")
+        ov = Image.new("RGBA", (ox, oy), (0, 0, 0, 0))
+        op = ov.load()
+        rp = img.load()
+        for j in range(oy):
+            rowmap = self._remap[j]
+            for i in range(ox):
+                c, r = rowmap[i]
+                if 0 <= c < GRID_W and 0 <= r < GRID_H:
+                    v = rp[c, r]
+                    v = v if isinstance(v, int) else v[0]
+                    col = _dbz_color(_dbz(v))
+                    if col:
+                        op[i, j] = (col[0], col[1], col[2], 205)
+        im = Image.alpha_composite(base, ov).convert("RGB")
+        d = ImageDraw.Draw(im)
+        lat0, lon0 = cfg.GEOCODE
+
+        # 50 km ring
+        ring = [self._mv(*dest_point(lat0, lon0, cfg.RADAR_TRIGGER_KM, b))
+                for b in range(0, 361, 6)]
+        d.line(ring, fill=(90, 200, 255), width=2)
+        # observatory crosshair
+        cx, cy = self._mv(lat0, lon0)
+        d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], outline=(255, 255, 255), width=2)
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            d.line([cx + dx * 6, cy + dy * 6, cx + dx * 11, cy + dy * 11],
+                   fill=(255, 255, 255), width=2)
+        d.text((cx + 8, cy + 6), "%g km" % cfg.RADAR_TRIGGER_KM, fill=(120, 210, 255),
+               font=_font(13), stroke_width=2, stroke_fill=(0, 0, 0))
+
+        # scale bars (10 km and 10 mi), bottom-left
+        f = _font(12)
+
+        def px_for(km):
+            x2, _ = self._mv(*dest_point(lat0, lon0, km, 90))
+            x1, _ = self._mv(lat0, lon0)
+            return abs(x2 - x1)
+        bx, by = 14, oy - 34
+        for label, km in (("10 km", 10.0), ("10 mi", 16.0934)):
+            L = px_for(km)
+            d.line([bx, by, bx + L, by], fill=(255, 255, 255), width=3)
+            d.line([bx, by - 3, bx, by + 3], fill=(255, 255, 255), width=2)
+            d.line([bx + L, by - 3, bx + L, by + 3], fill=(255, 255, 255), width=2)
+            d.text((bx + L + 5, by - 7), label, fill=(255, 255, 255), font=f,
+                   stroke_width=2, stroke_fill=(0, 0, 0))
+            by += 15
+        # frame time, top-left
+        d.text((8, 6), frame_txt, fill=(200, 215, 235), font=_font(12),
+               stroke_width=2, stroke_fill=(0, 0, 0))
+
+        tmp = cfg.RADAR_THUMB_PATH + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(cfg.RADAR_THUMB_PATH) or ".", exist_ok=True)
+            im.save(tmp, format="PNG")     # .tmp ext -> must state the format
+            os.replace(tmp, cfg.RADAR_THUMB_PATH)
+            return True
+        except Exception:
+            log.exception("could not write radar thumbnail %s", cfg.RADAR_THUMB_PATH)
+            return False
+
+
+# ---- poller ----------------------------------------------------------------
+class RadarPoller:
+    def __init__(self, cfg, eventlog):
+        self.cfg = cfg
+        self.log = eventlog
+        self._lock = threading.Lock()
+        self._thumb = Thumbnailer(cfg) if deps_available() else None
+        self._last_ok_ts = None
+        self._last_poll_ts = None
+        self._in_ring = False
+        self._nearest_km = None
+        self._count = 0
+        self._frame_utc = None
+        self._thumb_ok = False
+        self._last_rain_ts = None
+
+    def poll_now(self, now=None):
+        if now is None:
+            now = time.time()
+        with self._lock:
+            self._last_poll_ts = now
+        if not deps_available():
+            return {"ok": False, "error": "pillow not installed"}
+        ts, url = latest_frame()
+        if not ts:
+            log.warning("no recent MRMS frame")
+            return {"ok": False, "error": "no frame"}
+        try:
+            img = Image.open(io.BytesIO(_get(url)))
+            img.load()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log.warning("radar fetch failed: %s", e)
+            return {"ok": False, "error": str(e)}
+        in_ring, nearest, count = check_rain(self.cfg, img)
+        frame_txt = "MRMS " + ts.strftime("%Y-%m-%d %H:%MZ")
+        thumb_ok = self._thumb.render(img, frame_txt) if self._thumb else False
+        with self._lock:
+            self._last_ok_ts = now
+            self._frame_utc = ts.isoformat()
+            self._in_ring = in_ring
+            self._nearest_km = nearest
+            self._count = count
+            self._thumb_ok = thumb_ok
+            if in_ring:
+                self._last_rain_ts = now
+        if in_ring:
+            self.log.record("RADAR-RAIN", reason=f"echo within {self.cfg.RADAR_TRIGGER_KM:g} km",
+                            source="mrms", result="unsafe",
+                            nearest=f"{nearest}km", pixels=count)
+        return {"ok": True, "in_ring": in_ring, "nearest_km": nearest, "count": count}
+
+    def maybe_poll(self, sun_alt, now=None):
+        if now is None:
+            now = time.time()
+        if not deps_available():
+            return None
+        if sun_alt is None or sun_alt >= self.cfg.RADAR_POLL_SUN_BELOW_DEG:
+            return None                         # daytime / unknown sun -> skip
+        with self._lock:
+            due = (self._last_poll_ts is None
+                   or (now - self._last_poll_ts) >= self.cfg.RADAR_POLL_INTERVAL)
+        if due:
+            return self.poll_now(now)
+        return None
+
+    def component(self, sun_alt, now=None):
+        if now is None:
+            now = time.time()
+        with self._lock:
+            fresh = (self._last_ok_ts is not None
+                     and (now - self._last_ok_ts) <= self.cfg.RADAR_STALE_AFTER_SEC)
+            live_unsafe = fresh and self._in_ring
+            # Persistence across a BLIND gap: after the last in-ring detection, hold the veto
+            # until either a FRESH clear frame cancels it (keeps the live feel) or the bounded
+            # latch window elapses (so a permanent outage self-clears instead of sticking).
+            # This closes the hole where a cell sits at ~40 km (inside the ring, over no WU
+            # station, so WU never latches) and then IEM goes blind, dropping the veto.
+            latched = (self._last_rain_ts is not None
+                       and (now - self._last_rain_ts) < self.cfg.RADAR_LATCH_SEC
+                       and not (fresh and not self._in_ring))
+            # Pillow absent => radar never really ran; never veto from an artificial state.
+            unsafe = deps_available() and (live_unsafe or latched)
+            available = deps_available() and fresh
+            polling_active = (deps_available() and sun_alt is not None
+                              and sun_alt < self.cfg.RADAR_POLL_SUN_BELOW_DEG)
+            return {
+                # Unsafe on a fresh in-ring frame, OR while the blind-gap latch holds. A stale
+                # frame with no recent detection is "unknown" (available False), no veto.
+                "safe": not unsafe,
+                "latched": bool(latched and not live_unsafe),
+                "enabled": deps_available(),
+                "available": available,
+                "in_ring": self._in_ring,
+                "nearest_km": self._nearest_km,
+                "pixels": self._count,
+                "frame_utc": self._frame_utc,
+                "age_s": round(now - self._last_ok_ts) if self._last_ok_ts else None,
+                "trigger_km": self.cfg.RADAR_TRIGGER_KM,
+                "dbz": self.cfg.RADAR_DBZ,
+                "polling_active": polling_active,
+                "thumb_available": self._thumb_ok,
+                "thumb_path": self.cfg.RADAR_THUMB_PATH,
+                "attribution": self.cfg.RADAR_ATTRIBUTION,
+                "source": "NOAA/NSSL MRMS composite reflectivity via IEM",
+            }
+
+
+def unavailable_component(cfg):
+    return {
+        "safe": True, "enabled": False, "available": False, "in_ring": False,
+        "nearest_km": None, "pixels": 0, "frame_utc": None, "age_s": None,
+        "trigger_km": cfg.RADAR_TRIGGER_KM, "dbz": cfg.RADAR_DBZ, "polling_active": False,
+        "thumb_available": False, "thumb_path": cfg.RADAR_THUMB_PATH,
+        "attribution": cfg.RADAR_ATTRIBUTION,
+        "source": "NOAA/NSSL MRMS composite reflectivity via IEM (disabled)",
+    }

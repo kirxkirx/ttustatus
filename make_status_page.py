@@ -2466,13 +2466,32 @@ def build_safety_tiles_html(comp):
         else:
             glm_s = safety_dot_html(True) + "polling paused (day)"
 
+    conn = comp.get("connectivity") or {}
+    if not conn:
+        conn_v, conn_s = '<div class="v mono">&mdash;</div>', ""
+    elif not conn.get("probed"):
+        conn_v = '<div class="v mono">online</div>'
+        conn_s = safety_dot_html(True) + "not yet probed"
+    elif conn.get("online"):
+        conn_v = '<div class="v mono">online</div>'
+        conn_s = safety_dot_html(True) + "internet reachable"
+    elif conn.get("safe"):
+        conn_v = ('<div class="v mono">%d<span class="u">min</span></div>'
+                  % conn.get("offline_min", 0))
+        conn_s = safety_dot_html(True) + "offline (grace)"
+    else:
+        conn_v = ('<div class="v mono">%d<span class="u">min</span></div>'
+                  % conn.get("offline_min", 0))
+        conn_s = safety_dot_html(False) + "no internet"
+
     tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>\n    </div>\n')
     tiles = (tile % ("Sun altitude", sun_v, sun_s)
              + tile % ("Humidity", hum_v, hum_s)
              + tile % ("Rain (WU)", rain_v, rain_s)
              + tile % ("NWS (now/next)", nws_v, nws_s)
-             + tile % ("Lightning (GLM)", glm_v, glm_s))
+             + tile % ("Lightning (GLM)", glm_v, glm_s)
+             + (tile % ("Internet", conn_v, conn_s) if conn else ""))
     # auto-fit: 5-across on the ~1020px desktop wrap, and wraps to 3/2/1 columns on
     # narrower/phone screens instead of shrinking into an unreadable single row.
     return ('  <div class="tiles" '
@@ -2565,6 +2584,80 @@ def build_safety_html(state):
 
     return (card_open + head(label, bg) + detail_html + _safety_endpoint_html(state)
             + reasons_html + tiles_head + tiles + events_html + card_close)
+
+
+def build_radar_html(state):
+    rad = ((state or {}).get("components", {}) or {}).get("radar")
+    if not rad or not rad.get("enabled"):
+        return ""   # radar off / Pillow missing -> omit the section
+    rk = rad.get("trigger_km", 50)
+
+    # Fail-safe display: if the whole safety state is stale (daemon hung/crashed), do NOT
+    # show a reassuring green "no rain" over a frozen thumbnail — the radar verdict is only
+    # as fresh as the daemon writing it.
+    age = None
+    if state.get("ts") is not None:
+        age = time.time() - state.get("ts")
+    state_stale = (age is None) or (age > SAFETY_STATE_STALE_SEC)
+
+    if state_stale:
+        verdict = safety_dot_html(False) + "safety state stale &mdash; radar reading unknown"
+    elif rad.get("in_ring"):
+        near = rad.get("nearest_km")
+        verdict = safety_dot_html(False) + ("<b>RAIN within %g km</b>%s" % (
+            rk, "" if near is None else " &mdash; nearest %g km" % near))
+    elif rad.get("latched"):
+        verdict = safety_dot_html(False) + ("recent rain (feed blind &mdash; holding %g km "
+                                            "veto)" % rk)
+    elif rad.get("available"):
+        verdict = safety_dot_html(True) + ("no rain within %g km" % rk)
+    else:
+        verdict = safety_dot_html(True) + "no fresh frame (paused in daylight, or unreachable)"
+
+    # The <img> uses a relative basename, which only resolves if the thumbnail lives in the
+    # same web directory as status.html. Verify co-location; otherwise fall back gracefully.
+    thumb_path = rad.get("thumb_path") or ""
+    web_dir = os.path.dirname(os.path.abspath(HTML_FILE))
+    colocated = (thumb_path
+                 and os.path.dirname(os.path.abspath(thumb_path)) == web_dir)
+    if rad.get("thumb_available") and colocated and not state_stale:
+        src = os.path.basename(thumb_path)
+        try:
+            bust = int(os.path.getmtime(thumb_path))
+        except Exception:
+            bust = int(time.time())
+        img = ('<img src="%s?t=%d" alt="MRMS radar with a %g km ring around the observatory" '
+               'style="width:100%%;max-width:440px;height:auto;border:1px solid var(--line);'
+               'border-radius:10px;display:block">' % (html.escape(src), bust, rk))
+    elif rad.get("thumb_available") and not colocated:
+        img = ('<div class="lede" style="color:var(--warn)">Radar image is at %s (not in the '
+               'web directory) &mdash; set TTU_SAFETY_RADAR_THUMB beside status.html.</div>'
+               % html.escape(thumb_path))
+    else:
+        img = ('<div class="lede" style="color:var(--muted)">Radar image not available '
+               'yet (generated on the first night-time poll).</div>')
+
+    frame = html.escape(str(rad.get("frame_utc") or "?"))
+    attribution = html.escape(str(rad.get("attribution") or ""))
+    source = (
+        "Map: NOAA/NSSL <b>MRMS</b> composite radar reflectivity (every US weather radar "
+        "fused, ~1&nbsp;km, updated every 2&nbsp;min), fetched from the Iowa Environmental "
+        "Mesonet. The cyan ring is the <b>%g&nbsp;km</b> rain trigger: any echo inside it "
+        "marks the monitor UNSAFE. Colours run green (light) &rarr; red/magenta "
+        "(downpour). Polled every 5&nbsp;min at night." % rk)
+
+    return (
+        '  <h2>Radar (MRMS, %g km ring)</h2>\n'
+        '  <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;'
+        'margin:0 0 24px">\n'
+        '    <div style="flex:0 0 auto">%s</div>\n'
+        '    <div style="flex:1 1 260px;min-width:240px">\n'
+        '      <p class="lede" style="margin:0 0 8px">%s</p>\n'
+        '      <p style="font-size:13px;color:var(--muted);margin:0 0 8px">%s</p>\n'
+        '      <p style="font-size:11px;color:var(--faint,#8b959c);margin:0">%s · frame %s</p>\n'
+        '    </div>\n'
+        '  </div>\n' % (rk, img, verdict, source, attribution, frame)
+    )
 
 
 def build_forecast_html(state):
@@ -2702,6 +2795,10 @@ def write_html(
     except Exception:
         parts.append('  <h2>Alpaca safety monitor</h2>\n'
                      '  <p class="lede">Safety section unavailable.</p>\n')
+    try:
+        parts.append(build_radar_html(_safety_state))
+    except Exception:
+        pass
     try:
         parts.append(build_forecast_html(_safety_state))
     except Exception:

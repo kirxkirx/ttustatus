@@ -7,6 +7,7 @@ functions. safety_monitor.py needs no hardware — importing it verifies the dae
 import graph wires up.
 """
 import json
+import os
 import sys
 import time
 from unittest.mock import MagicMock
@@ -74,16 +75,40 @@ def test_nws_forecast_section_and_tile_render():
             "rain": {"safe": True, "enabled": True, "latched": False, "polling_active": True,
                      "stations_live": 7, "stations_total": 10},
             "nws": nws}
+    comp["connectivity"] = {"probed": True, "online": False, "safe": False, "offline_min": 75}
     tiles = msp.build_safety_tiles_html(comp)
     assert "NWS (now/next)" in tiles                   # relabelled tile
     assert "C85%/P20%/T0%" in tiles and "C90%/P30%/T5%" in tiles   # both hours packed
     assert "no&nbsp;rain" in tiles                     # rain wording fixed
     assert "Lightning (GLM" in tiles                   # GLM tile present (off by default here)
+    assert "Internet" in tiles and "no internet" in tiles          # connectivity tile
     fc = msp.build_forecast_html({"components": {"nws": nws}})
     assert "12-hour forecast" in fc and "Mon 00:00" in fc and "NWS" in fc
     assert "mph" in fc                                 # wind column present
     # no forecast data -> section omitted, no crash
     assert msp.build_forecast_html({"components": {"nws": {"hours": []}}}) == ""
+
+
+def test_radar_section_renders():
+    now = time.time()
+    # thumb_path must be co-located with make_status_page.HTML_FILE for the <img> to show
+    thumb = os.path.join(os.path.dirname(msp.HTML_FILE), "ttu_radar.png")
+    base = {"trigger_km": 50, "enabled": True, "available": True,
+            "thumb_available": True, "thumb_path": thumb,
+            "attribution": "© OpenStreetMap contributors, © CARTO", "frame_utc": "2026-01-01"}
+    # fresh state + rain in ring -> unsafe wording + image + attribution + source
+    st = {"ts": now, "components": {"radar": {**base, "in_ring": True, "nearest_km": 18.0}}}
+    h = msp.build_radar_html(st)
+    assert "Radar (MRMS" in h and "RAIN within 50" in h and "ttu_radar.png" in h
+    assert "CARTO" in h and "MRMS" in h and "Iowa Environmental" in h   # source + attribution
+    # clear ring (fresh)
+    st2 = {"ts": now, "components": {"radar": {**base, "in_ring": False}}}
+    assert "no rain within 50" in msp.build_radar_html(st2)
+    # stale state -> never a green "no rain"; shows stale
+    st3 = {"ts": now - 99999, "components": {"radar": {**base, "in_ring": False}}}
+    assert "stale" in msp.build_radar_html(st3) and "no rain within 50" not in msp.build_radar_html(st3)
+    # disabled -> section omitted
+    assert msp.build_radar_html({"components": {"radar": {"enabled": False}}}) == ""
 
 
 def test_glm_tile_latched_render():

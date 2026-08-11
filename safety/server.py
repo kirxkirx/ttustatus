@@ -14,12 +14,14 @@ import logging
 import threading
 import time
 
-from . import config, discovery, glm_lightning
+from . import config, discovery, glm_lightning, radar as radar_mod
 from .alpaca import create_app
+from .connectivity import ConnectivityWatch
 from .eventlog import EventLog
 from .monitor import RainPoller, SafetyMonitor
 from .nws_forecast import NwsForecastPoller
 from .glm_lightning import GlmLightningPoller
+from .radar import RadarPoller
 
 log = logging.getLogger("ttu.safety")
 
@@ -42,7 +44,9 @@ def main(argv=None):
     poller = RainPoller(cfg, eventlog)
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
     glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
-    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm)
+    radar = RadarPoller(cfg, eventlog) if cfg.RADAR_ENABLED else None
+    conn = ConnectivityWatch(cfg, start_ts=time.time()) if cfg.CONN_ENABLED else None
+    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn)
 
     eventlog.record("STARTUP", detail=f"{cfg.SERVER_NAME} v{cfg.DRIVER_VERSION}",
                     result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}")
@@ -56,6 +60,10 @@ def main(argv=None):
                     "(apt install python3-numpy python3-netcdf4). Other layers unaffected.")
         eventlog.record("CONFIG", reason="numpy/netCDF4 missing",
                         result="GLM lightning disabled")
+    if radar is not None and not radar_mod.deps_available():
+        log.warning("Pillow not installed — MRMS RADAR DISABLED "
+                    "(apt install python3-pil). Other layers unaffected.")
+        eventlog.record("CONFIG", reason="Pillow missing", result="radar disabled")
 
     stop = threading.Event()
 
@@ -92,6 +100,24 @@ def main(argv=None):
                 log.exception("glm poll failed")
             stop.wait(60)
 
+    def radar_loop():
+        # Own thread: the slow tile/radar fetch + thumbnail render never blocks refresh.
+        while not stop.is_set():
+            try:
+                radar.maybe_poll(_fresh_sun(monitor, cfg), time.time())
+            except Exception:
+                log.exception("radar poll failed")
+            stop.wait(60)
+
+    def conn_loop():
+        # Probe internet reachability day and night so the "offline > 1 h" clock is accurate.
+        while not stop.is_set():
+            try:
+                conn.probe_once(time.time())
+            except Exception:
+                log.exception("connectivity probe failed")
+            stop.wait(cfg.CONN_PROBE_INTERVAL)
+
     threading.Thread(target=evaluator, name="evaluator", daemon=True).start()
     threading.Thread(target=rain_loop, name="rain-poller", daemon=True).start()
     if nws is not None:
@@ -102,6 +128,14 @@ def main(argv=None):
         threading.Thread(target=glm_loop, name="glm-poller", daemon=True).start()
     else:
         log.warning("GLM lightning component disabled (TTU_SAFETY_GLM=0)")
+    if radar is not None:
+        threading.Thread(target=radar_loop, name="radar-poller", daemon=True).start()
+    else:
+        log.warning("MRMS radar component disabled (TTU_SAFETY_RADAR=0)")
+    if conn is not None:
+        threading.Thread(target=conn_loop, name="conn-probe", daemon=True).start()
+    else:
+        log.warning("connectivity watchdog disabled (TTU_SAFETY_CONN=0)")
     discovery.start(cfg.HTTP_PORT)
 
     app = create_app(monitor, cfg)

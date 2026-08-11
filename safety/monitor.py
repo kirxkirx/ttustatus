@@ -18,7 +18,8 @@ import tempfile
 import threading
 import time
 
-from . import glm_lightning, nws_forecast, wu_poll
+from . import (connectivity as conn_mod, glm_lightning, nws_forecast,
+               radar as radar_mod, wu_poll)
 
 log = logging.getLogger("ttu.safety.monitor")
 
@@ -195,12 +196,15 @@ class RainPoller:
 class SafetyMonitor:
     """Aggregates the inputs into IsSafe and publishes state for the status page."""
 
-    def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None):
+    def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None, radar=None,
+                 conn=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
         self.nws = nws                  # NwsForecastPoller or None (component fails to unknown)
         self.glm = glm                  # GlmLightningPoller or None
+        self.radar = radar              # RadarPoller or None
+        self.conn = conn                # ConnectivityWatch or None
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()   # serialize whole evaluations
         self._connected = False
@@ -275,8 +279,30 @@ class SafetyMonitor:
             reasons.append("lightning within %g km (GLM latch %d min left)"
                            % (glm["trigger_km"], glm["seconds_remaining"] // 60))
 
+        # MRMS radar (simple 50 km any-rain ring). Live check; unavailable => no veto.
+        if self.radar is not None:
+            radar = self.radar.component(None if stale else sun_alt, now)
+        else:
+            radar = radar_mod.unavailable_component(self.cfg)
+        radar_safe = radar["safe"]
+        if not radar_safe:
+            near = radar.get("nearest_km")
+            reasons.append("rain on radar within %g km%s"
+                           % (radar["trigger_km"],
+                              "" if near is None else " (nearest %g km)" % near))
+
+        # Connectivity watchdog (loss of internet). HARD veto after the offline threshold.
+        if self.conn is not None:
+            conn = self.conn.component(now)
+        else:
+            conn = conn_mod.unavailable_component(self.cfg)
+        conn_safe = conn["safe"]
+        if not conn_safe:
+            reasons.append("no internet — online services unreachable for %d min "
+                           "(failing safe)" % conn.get("offline_min", 0))
+
         is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe
-                       and glm_safe and not stale)
+                       and glm_safe and radar_safe and conn_safe and not stale)
 
         state = {
             "ts": now,
@@ -302,6 +328,8 @@ class SafetyMonitor:
                 "rain": rain,
                 "nws": nws,
                 "glm": glm,
+                "radar": radar,
+                "connectivity": conn,
             },
             "events_tail": [self._fmt_event(e) for e in self.log.recent(12)],
         }

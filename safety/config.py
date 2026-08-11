@@ -82,6 +82,55 @@ GLM_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_GLM_SUN_BELOW", 5.0)  # night ga
 GLM_LATCH_FILE = _env_str("TTU_SAFETY_GLM_LATCH_FILE",
                           os.path.expanduser("~/safety_glm_latch.json"))
 
+# --- MRMS radar (rain within a radius) --------------------------------------
+# Every RADAR_POLL_INTERVAL (night only, like WU) fetch the latest MRMS composite
+# reflectivity and declare UNSAFE if ANY echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of
+# the observatory. Deliberately simple — a plain 50 km "any rain" ring, no upwind logic.
+# Also renders a TTU-centered radar thumbnail (dark OSM tiles, cached to disk) with the
+# 50 km ring + scale bars for the status page. Needs Pillow (apt: python3-pil); absent =>
+# radar disabled (other layers unaffected). A fetch error/stale frame => unavailable (does
+# not by itself force unsafe); WU's 3 h latch carries "recently rained" persistence.
+RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "false", "no")
+RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 50.0)
+RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
+RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
+RADAR_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_RADAR_SUN_BELOW", 5.0)  # night gate
+RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older => unavailable
+# Hold the veto this long after the last in-ring detection if the feed goes blind, so a
+# ranged echo (inside 50 km but over no WU station) can't reopen the dome when IEM drops.
+# A fresh clear frame cancels it immediately (keeps the live feel).
+RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 1800)  # 30 min blind-gap latch
+# thumbnail: written where the status page can load it (beside status.html on the Pi)
+RADAR_THUMB_PATH = _env_str("TTU_SAFETY_RADAR_THUMB", "/var/www/html/ttu_radar.png")
+RADAR_THUMB_HALF_DEG = _env_float("TTU_SAFETY_RADAR_THUMB_HALF", 1.0)  # region half-size
+RADAR_THUMB_PX = _env_int("TTU_SAFETY_RADAR_THUMB_PX", 440)
+RADAR_TILE_ZOOM = _env_int("TTU_SAFETY_RADAR_TILE_ZOOM", 8)
+RADAR_TILE_URL = _env_str(
+    "TTU_SAFETY_RADAR_TILE_URL",
+    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png")   # OSM data, dark theme
+RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
+RADAR_ATTRIBUTION = "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS via IEM"
+# (Persistence note: the radar keeps its OWN blind-gap latch above — it does NOT rely on the
+# WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
+
+# --- connectivity watchdog (loss of internet) -------------------------------
+# A lightweight probe (day and night) checks whether ANY online service host is reachable.
+# If NONE are reachable for CONN_OFFLINE_UNSAFE_SEC (1 h), declare UNSAFE — we've been blind
+# to rain/lightning/forecast that long and can't trust "safe". Auto-resolves the moment a
+# probe succeeds again. This is a HARD veto (unlike the per-service components, which fail to
+# "unknown"): it exists precisely to catch the case where every online layer is silently
+# unavailable. A response of ANY kind (even an HTTP error) counts as "reachable" — only a
+# connection/DNS/timeout failure is "offline".
+CONN_ENABLED = _env_str("TTU_SAFETY_CONN", "1").strip().lower() not in ("0", "false", "no")
+CONN_OFFLINE_UNSAFE_SEC = _env_int("TTU_SAFETY_OFFLINE_UNSAFE_SEC", 3600)   # 1 hour
+CONN_PROBE_INTERVAL = _env_int("TTU_SAFETY_CONN_PROBE_INTERVAL", 300)       # 5 min
+CONN_PROBE_TIMEOUT = _env_int("TTU_SAFETY_CONN_PROBE_TIMEOUT", 10)
+CONN_PROBE_URLS = [
+    "https://api.weather.gov/",
+    "https://api.open-meteo.com/",
+    "https://mesonet.agron.iastate.edu/",
+]
+
 # --- files ------------------------------------------------------------------
 # Transient (fine in /tmp): the page<->daemon exchange.
 INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", "/tmp/safety_inputs.json")
