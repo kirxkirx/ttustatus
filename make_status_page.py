@@ -1597,7 +1597,9 @@ PAGE_CSS = """  body { margin: 0; }
   .tile .k { font-size: 11.5px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 7px; }
   .tile .v { font-size: 29px; font-weight: 600; line-height: 1.05; }
   .tile .v.dual { font-size: 23px; }
-  /* radar map: show the dark version in night style, the light version in day style */
+  /* radar map: exactly one image visible, matching the page style */
+  .radar-img { width: 100%; max-width: 440px; height: auto; display: block;
+               border: 1px solid var(--line); border-radius: 10px; }
   #page:not(.night) .radar-img.radar-night { display: none; }
   #page.night .radar-img.radar-day { display: none; }
   .tile .v .u { font-size: 16px; font-weight: 400; color: var(--muted); margin-left: 2px; }
@@ -2606,8 +2608,8 @@ def build_radar_html(state):
     web_dir = os.path.dirname(os.path.abspath(HTML_FILE))
     night_path = rad.get("thumb_path") or ""
     day_path = rad.get("thumb_path_day")
-    img_style = ('style="width:100%%;max-width:440px;height:auto;border:1px solid '
-                 'var(--line);border-radius:10px;display:block"')
+    # NOTE: no inline style here — an inline display:block would override the stylesheet's
+    # day/night display:none switch, making BOTH maps show. All styling lives in .radar-img.
 
     def _usable(p):
         return bool(p) and os.path.dirname(os.path.abspath(p)) == web_dir
@@ -2618,8 +2620,8 @@ def build_radar_html(state):
         except Exception:
             bust = int(time.time())
         return ('<img class="radar-img %s" src="%s?t=%d" '
-                'alt="MRMS radar with a %g km ring around the observatory" %s>'
-                % (cls, html.escape(os.path.basename(p)), bust, rk, img_style))
+                'alt="MRMS radar with a %g km ring around the observatory">'
+                % (cls, html.escape(os.path.basename(p)), bust, rk))
 
     if rad.get("thumb_available") and not state_stale and _usable(night_path):
         if day_path and _usable(day_path):
