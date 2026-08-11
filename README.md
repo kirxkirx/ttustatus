@@ -50,7 +50,7 @@ DNG/TIFF intermediates (GBs per cycle) are created in `/dev/shm`, converted and
 averaged in batches with deletion as it goes, and ImageMagick's pixel-cache spill is
 pointed there too — if the RAM disk is too small for the RAW pipeline, capture
 degrades cleanly to JPEG-only stacking. The remaining regular SD writes are the page
-itself, the final snapshot, and the night radar thumbnails. Consider `logrotate` (or a
+itself, the final snapshot, and the radar thumbnails (two ~80 KB PNGs per 5 min). Consider `logrotate` (or a
 size cap) for `~/statuspage.log` and `~/safety_monitor.log` if you use the shell
 launchers.
 

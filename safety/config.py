@@ -118,18 +118,19 @@ GLM_LATCH_FILE = _env_str("TTU_SAFETY_GLM_LATCH_FILE",
                           os.path.expanduser("~/safety_glm_latch.json"))
 
 # --- MRMS radar (rain within a radius) --------------------------------------
-# Every RADAR_POLL_INTERVAL (night only, like WU) fetch the latest MRMS composite
+# Every RADAR_POLL_INTERVAL (DAY AND NIGHT — free data) fetch the latest MRMS composite
 # reflectivity and declare UNSAFE if ANY echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of
 # the observatory. Deliberately simple — a plain 50 km "any rain" ring, no upwind logic.
 # Also renders a TTU-centered radar thumbnail (dark OSM tiles, cached to disk) with the
 # 50 km ring + scale bars for the status page. Needs Pillow (apt: python3-pil); absent =>
 # radar disabled (other layers unaffected). A fetch error/stale frame => unavailable (does
-# not by itself force unsafe); WU's 3 h latch carries "recently rained" persistence.
+# not by itself force unsafe); the radar keeps its own blind-gap latch (RADAR_LATCH_SEC).
 RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "false", "no")
 RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 50.0)
 RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
 RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
-RADAR_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_RADAR_SUN_BELOW", 5.0)  # night gate
+# NOTE: radar polls day AND night (free data, daytime rain matters, live map) — unlike
+# the WU/GLM night gates.
 RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older => unavailable
 # Hold the veto this long after the last in-ring detection if the feed goes blind, so a
 # ranged echo (inside 50 km but over no WU station) can't reopen the dome when IEM drops.

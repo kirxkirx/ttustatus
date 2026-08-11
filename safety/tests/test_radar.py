@@ -93,14 +93,23 @@ def test_deps_absent_disables(monkeypatch):
     assert p.maybe_poll(-10.0) is None
 
 
-def test_maybe_poll_gated_by_sun(monkeypatch):
+def test_maybe_poll_runs_day_and_night(monkeypatch):
+    # radar is NOT night-gated (free data, daytime rain matters, live map)
     p = _poller(monkeypatch)
     calls = []
-    monkeypatch.setattr(p, "poll_now", lambda now=None: calls.append(1))
-    assert p.maybe_poll(sun_alt=10.0, now=1.0) is None      # daytime -> skip
-    assert not calls
-    p.maybe_poll(sun_alt=-5.0, now=2.0)                     # night -> polls
+
+    def fake_poll(now=None):
+        calls.append(now)
+        p._last_poll_ts = now          # the real poll_now records this too
+        return {}
+
+    monkeypatch.setattr(p, "poll_now", fake_poll)
+    p.maybe_poll(sun_alt=45.0, now=1.0)                     # broad daylight -> polls
     assert calls
+    p.maybe_poll(sun_alt=None, now=2.0)                     # unknown sun -> still polls
+    assert len(calls) == 1                                  # ...but respects the interval
+    p.maybe_poll(sun_alt=None, now=1.0 + config.RADAR_POLL_INTERVAL + 1)
+    assert len(calls) == 2
 
 
 def test_poll_now_sets_state(monkeypatch):

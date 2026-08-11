@@ -135,7 +135,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
 | `TTU_SAFETY_RADAR_KM` | `50` | any echo within this radius → UNSAFE |
 | `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
-| `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (night only) |
+| `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (day and night) |
 | `TTU_SAFETY_RADAR_THUMB` | `/var/www/html/ttu_radar.png` | thumbnail path (beside status.html) |
 | `TTU_SAFETY_RADAR_TILE_URL` | Carto dark | night basemap tile template (OSM data) |
 | `TTU_SAFETY_RADAR_TILE_URL_DAY` | Carto light | day basemap tile template (`TTU_SAFETY_RADAR_DAY=0` to skip) |
@@ -170,7 +170,7 @@ silently unavailable (no internet). A response of any kind (even an HTTP error) 
 
 ### MRMS radar component
 
-Every 5 min **at night** the daemon pulls the latest **MRMS composite reflectivity** (NOAA
+Every 5 min — **day and night** (the data is free) — the daemon pulls the latest **MRMS composite reflectivity** (NOAA
 via the Iowa Environmental Mesonet, free/no key) and declares **UNSAFE if any echo ≥ 20 dBZ
 is within 50 km** of the dome — a deliberately simple radius, no upwind logic. It also
 renders a **TTU-centered radar thumbnail** (dark OSM/Carto tiles, **cached to disk so they

@@ -2733,7 +2733,7 @@ def build_radar_html(state):
     elif rad.get("available"):
         verdict = safety_dot_html(True) + ("no rain within %g km" % rk)
     else:
-        verdict = safety_dot_html(True) + "no fresh frame (paused in daylight, or unreachable)"
+        verdict = safety_dot_html(True) + "no fresh frame (radar unreachable?)"
 
     # The <img> uses a relative basename, which only resolves if the thumbnail lives in the
     # same web directory as status.html. There are up to two maps — a dark (night) and a
@@ -2776,7 +2776,7 @@ def build_radar_html(state):
         "fused, ~1&nbsp;km, updated every 2&nbsp;min), fetched from the Iowa Environmental "
         "Mesonet. The cyan ring is the <b>%g&nbsp;km</b> rain trigger: any echo inside it "
         "marks the monitor UNSAFE. Colours run green (light) &rarr; red/magenta "
-        "(downpour). Polled every 5&nbsp;min at night." % rk)
+        "(downpour). Polled every 5&nbsp;min, day and night." % rk)
 
     return (
         '  <h2>Radar (MRMS, %g km ring)</h2>\n'

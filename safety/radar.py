@@ -431,12 +431,13 @@ class RadarPoller:
         return {"ok": True, "in_ring": in_ring, "nearest_km": nearest, "count": count}
 
     def maybe_poll(self, sun_alt, now=None):
+        # Radar polls DAY AND NIGHT (unlike WU/GLM): the data is free, daytime rain
+        # matters too, and the page's radar map stays live around the clock. The
+        # sun_alt argument is kept for interface symmetry but not used.
         if now is None:
             now = time.time()
         if not deps_available():
             return None
-        if sun_alt is None or sun_alt >= self.cfg.RADAR_POLL_SUN_BELOW_DEG:
-            return None                         # daytime / unknown sun -> skip
         with self._lock:
             due = (self._last_poll_ts is None
                    or (now - self._last_poll_ts) >= self.cfg.RADAR_POLL_INTERVAL)
@@ -462,8 +463,7 @@ class RadarPoller:
             # Pillow absent => radar never really ran; never veto from an artificial state.
             unsafe = deps_available() and (live_unsafe or latched)
             available = deps_available() and fresh
-            polling_active = (deps_available() and sun_alt is not None
-                              and sun_alt < self.cfg.RADAR_POLL_SUN_BELOW_DEG)
+            polling_active = deps_available()      # radar polls day and night
             return {
                 # Unsafe on a fresh in-ring frame, OR while the blind-gap latch holds. A stale
                 # frame with no recent detection is "unknown" (available False), no veto.

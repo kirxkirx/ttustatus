@@ -222,7 +222,7 @@ def _setup_html(monitor, cfg) -> str:
         if not rad.get("enabled"):
             rv = "disabled (Pillow not installed)"
         elif not rad.get("available"):
-            rv = "no fresh frame (paused/daytime or unreachable)"
+            rv = "no fresh frame (radar unreachable?)"
         elif rad.get("in_ring"):
             near = rad.get("nearest_km")
             rv = "RAIN within %g km%s" % (rk, "" if near is None else " (nearest %g km)" % near)
