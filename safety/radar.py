@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -33,12 +34,22 @@ try:
 except Exception:                       # pragma: no cover - optional dep
     Image = ImageDraw = ImageFont = None
 
+from . import config as _config
+
 log = logging.getLogger("ttu.safety.radar")
 
 ARCHIVE = ("https://mesonet.agron.iastate.edu/archive/data/"
            "%Y/%m/%d/GIS/mrms/lcref_%Y%m%d%H%M.png")
 GRID_W, GRID_H, PX, UL_LON, UL_LAT = 7000, 3500, 0.01, -129.995, 54.995
-UA = {"User-Agent": "ttu-safety-radar (kirx007@gmail.com)"}
+UA = {"User-Agent": _config.NWS_USER_AGENT}   # one configurable contact UA for all fetches
+
+
+def site_in_coverage(lat, lon, margin_deg=0.5):
+    """MRMS is a CONUS product (lon -130..-60, lat 20..55). Outside it every pixel read
+    is out of bounds and the ring scan would report an eternally 'clear' frame — so the
+    component must refuse to run there, loudly, instead of being silently safe."""
+    return (UL_LAT - GRID_H * PX + margin_deg < lat < UL_LAT - margin_deg
+            and UL_LON + margin_deg < lon < UL_LON + GRID_W * PX - margin_deg)
 
 
 def deps_available():
@@ -348,7 +359,30 @@ class RadarPoller:
         self._count = 0
         self._frame_utc = None
         self._thumb_ok = False
+        self._coverage_warned = False
+        # The blind-gap latch must survive a daemon restart (systemd Restart=always would
+        # otherwise silently drop the veto mid-outage) — persist last_rain_ts like the
+        # WU/GLM latches.
         self._last_rain_ts = None
+        try:
+            with open(cfg.RADAR_LATCH_FILE, encoding="utf-8") as f:
+                lr = json.load(f).get("last_rain_ts")
+            if isinstance(lr, (int, float)) and math.isfinite(lr):
+                self._last_rain_ts = lr
+                if (time.time() - lr) < cfg.RADAR_LATCH_SEC:
+                    log.info("restored radar blind-gap latch (%d min old)",
+                             int((time.time() - lr) / 60))
+        except Exception:
+            pass
+
+    def _save_rain_ts(self):
+        try:
+            tmp = self.cfg.RADAR_LATCH_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"last_rain_ts": self._last_rain_ts}, f)
+            os.replace(tmp, self.cfg.RADAR_LATCH_FILE)
+        except Exception:
+            log.exception("cannot persist radar latch")
 
     def poll_now(self, now=None):
         if now is None:
@@ -357,6 +391,14 @@ class RadarPoller:
             self._last_poll_ts = now
         if not deps_available():
             return {"ok": False, "error": "pillow not installed"}
+        if not site_in_coverage(*self.cfg.GEOCODE):
+            if not self._coverage_warned:
+                self._coverage_warned = True
+                log.error("site %s is OUTSIDE the MRMS CONUS grid — radar layer disabled "
+                          "(it would otherwise report a false 'clear')", self.cfg.GEOCODE)
+                self.log.record("CONFIG", reason="site outside MRMS coverage",
+                                result="radar layer disabled")
+            return {"ok": False, "error": "site outside MRMS coverage"}
         ts, url = latest_frame()
         if not ts:
             log.warning("no recent MRMS frame")
@@ -381,6 +423,7 @@ class RadarPoller:
             self._thumb_ok = thumb_ok
             if in_ring:
                 self._last_rain_ts = now
+                self._save_rain_ts()
         if in_ring:
             self.log.record("RADAR-RAIN", reason=f"echo within {self.cfg.RADAR_TRIGGER_KM:g} km",
                             source="mrms", result="unsafe",

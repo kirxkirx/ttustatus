@@ -48,8 +48,15 @@ def main(argv=None):
     conn = ConnectivityWatch(cfg, start_ts=time.time()) if cfg.CONN_ENABLED else None
     monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn)
 
+    for w in cfg.CONFIG_WARNINGS:
+        log.warning("CONFIG: %s", w)
+        eventlog.record("CONFIG", reason=w, result="using default")
     eventlog.record("STARTUP", detail=f"{cfg.SERVER_NAME} v{cfg.DRIVER_VERSION}",
-                    result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}")
+                    result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}",
+                    site=f"{cfg.GEOCODE[0]},{cfg.GEOCODE[1]} ({cfg.GEOCODE_SOURCE})")
+    if not cfg.GEOCODE_FROM_ENV:
+        log.warning("site coordinates not set via TTU_SAFETY_LAT/LON — will adopt the "
+                    "GPS fix from the status page (current default: %s)", cfg.GEOCODE)
     if not cfg.WU_API_KEY:
         log.warning("TTU_SAFETY_WU_KEY is not set — RAIN POLLING DISABLED "
                     "(sun/humidity protection still active). Set it via the environment.")

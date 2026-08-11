@@ -14,6 +14,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "INPUTS_FILE", str(tmp_path / "inputs.json"))
     monkeypatch.setattr(config, "STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setattr(config, "LATCH_FILE", str(tmp_path / "latch.json"))
+    monkeypatch.setattr(config, "GLM_LATCH_FILE", str(tmp_path / "glm_latch.json"))
+    monkeypatch.setattr(config, "RADAR_LATCH_FILE", str(tmp_path / "radar_latch.json"))
     monkeypatch.setattr(config, "EVENT_LOG", str(tmp_path / "events.log"))
     monkeypatch.setattr(config, "WU_API_KEY", "testkey")   # enable rain polling in tests
     monkeypatch.setattr(wu_poll, "discover_stations",

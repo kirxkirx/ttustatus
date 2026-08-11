@@ -6,15 +6,53 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    ~90 s from the Pi's sensors: GPS, GPS-disciplined NTP/chrony, enclosure temp/humidity
    (DHT11), sun altitude/twilight (astropy), and an enclosure camera snapshot.
 2. **Alpaca SafetyMonitor** (`safety_monitor.py` + `safety/`) — a small always-on daemon
-   that aggregates **sun altitude**, **humidity**, and **Weather Underground rain** into a
-   single `IsSafe` boolean, served as an ASCOM **Alpaca SafetyMonitor** so NINA can react
-   (park/close on unsafe). The status page shows the monitor's state, endpoint, inputs, and
-   log as its own section.
+   that aggregates **sun altitude**, **humidity**, **Weather Underground rain**, the
+   **NWS forecast**, **GOES GLM lightning**, **MRMS radar** and an **internet-loss
+   watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca SafetyMonitor**
+   so NINA can react (park/close on unsafe). The status page shows the monitor's state,
+   endpoint, inputs, radar map, and log.
 
-Safety logic (fail-safe: anything unknown/stale ⇒ unsafe): unsafe when the sun is above the
-horizon (>0°), humidity >95%, or **any** nearby WU station reports rain (which then latches
-unsafe for 3 h after the last rain). WU is polled only when the sun is below 5° to save API
-calls. See **[README_SAFETY.md](README_SAFETY.md)** for the full design and reference.
+Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
+**[README_SAFETY.md](README_SAFETY.md)** for the full design and reference.
+
+## Hardware (TTU Skyview deployment)
+
+A **Raspberry Pi** single-board computer running Raspberry Pi OS, on an SD card, with:
+
+- a **GPS receiver** read via `gpsd` — it serves two roles: the site position (measured
+  once; the station is static) and a PPS pulse that disciplines `chrony` into a
+  stratum-1 NTP server;
+- a **DHT11 temperature/humidity sensor** on GPIO 17 (enclosure conditions, and the
+  humidity input of the safety monitor).
+
+Everything here is plain Python on stock Raspberry Pi OS packages — no special HATs or
+drivers are assumed beyond the above. The same code should run on any Pi-class Linux
+board with those two peripherals attached.
+
+## Site coordinates (deploying at another observatory)
+
+The measured GPS position propagates automatically: the status page writes its GPS fix
+into the shared inputs file, and the safety daemon — unless `TTU_SAFETY_LAT/LON` are set —
+**adopts it once at startup**, rounded to ~100 m so GPS jitter never re-derives anything.
+All derived values (NWS forecast grid, WU station set, radar/GLM rings, cached basemap
+tiles) follow the adopted coordinates. If the configured and measured positions ever
+disagree by more than ~100 m, a loud warning appears on the status page and `/setup` —
+but it never vetoes observing by itself. Components that don't cover the site (MRMS is
+CONUS-only, GLM is GOES-East) disable themselves loudly instead of reporting a false
+"clear".
+
+## SD-card wear
+
+High-frequency transient files (safety inputs/state, page sensor cache) live in
+`/dev/shm` (RAM); the daemon writes its state file only on a decision change or a slow
+heartbeat. **Camera processing also runs on the RAM disk**: the night pipeline's
+DNG/TIFF intermediates (GBs per cycle) are created in `/dev/shm`, converted and
+averaged in batches with deletion as it goes, and ImageMagick's pixel-cache spill is
+pointed there too — if the RAM disk is too small for the RAW pipeline, capture
+degrades cleanly to JPEG-only stacking. The remaining regular SD writes are the page
+itself, the final snapshot, and the night radar thumbnails. Consider `logrotate` (or a
+size cap) for `~/statuspage.log` and `~/safety_monitor.log` if you use the shell
+launchers.
 
 ## Layout
 

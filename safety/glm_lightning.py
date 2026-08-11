@@ -40,6 +40,21 @@ def deps_available():
     return np is not None and netCDF4 is not None
 
 
+GOES_EAST_SUBLON = -75.2
+
+
+def site_in_fov(lat, lon, max_arc_deg=70.0):
+    """GOES-East sees roughly a 75-80 deg arc from the sub-satellite point (0, -75.2);
+    detection quality collapses near the limb, so use a conservative 70 deg. Outside it
+    the lightning layer would be silently 'clear' forever — refuse loudly instead."""
+    p1, p2 = math.radians(0.0), math.radians(lat)
+    dl = math.radians(lon - GOES_EAST_SUBLON)
+    arc = math.degrees(math.acos(
+        max(-1.0, min(1.0, math.sin(p1) * math.sin(p2)
+                      + math.cos(p1) * math.cos(p2) * math.cos(dl)))))
+    return arc < max_arc_deg
+
+
 # ----- low-level fetch/parse (all in RAM) -----------------------------------
 def _get(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "ttu-safety-glm/1.0"})
@@ -162,6 +177,7 @@ class GlmLightningPoller:
         self.cfg = cfg
         self.log = eventlog
         self._lock = threading.Lock()
+        self._fov_warned = False
         self._latch_until = None
         self._last_flash_ts = None
         self._latch_dirty = False
@@ -236,6 +252,15 @@ class GlmLightningPoller:
             now = time.time()
         self._retry_persist(now)
         if not deps_available():
+            return None
+        if not site_in_fov(*self.cfg.GEOCODE):
+            if not self._fov_warned:
+                self._fov_warned = True
+                log.error("site %s is outside the usable GOES-East field of view — "
+                          "GLM lightning layer disabled (would be silently 'clear')",
+                          self.cfg.GEOCODE)
+                self.log.record("CONFIG", reason="site outside GOES-East FOV",
+                                result="GLM layer disabled")
             return None
         if sun_alt is None or sun_alt >= self.cfg.GLM_POLL_SUN_BELOW_DEG:
             return None                        # daytime / unknown sun -> don't poll

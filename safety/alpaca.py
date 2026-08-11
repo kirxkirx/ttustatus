@@ -247,6 +247,13 @@ def _setup_html(monitor, cfg) -> str:
     if st["reasons"]:
         items = "".join(f"<li>{html.escape(r)}</li>" for r in st["reasons"])
         reasons = f"<p><b>Why unsafe:</b></p><ul>{items}</ul>"
+    if st.get("warnings"):
+        items = "".join(f"<li>&#9888; {html.escape(w)}</li>" for w in st["warnings"])
+        reasons += f"<p><b>Warnings:</b></p><ul>{items}</ul>"
+    geo = st.get("geocode") or {}
+    if geo:
+        reasons += ('<p style="color:#666;font-size:.85em">Site: %s, %s (%s)</p>'
+                    % (geo.get("lat"), geo.get("lon"), html.escape(str(geo.get("source")))))
     events = "".join(f"<li>{html.escape(e)}</li>" for e in st.get("events_tail", []))
 
     return f"""<!doctype html><html><head><meta charset="utf-8">

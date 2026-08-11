@@ -11,8 +11,13 @@ class _Log:
         return {}
 
 
-def _poller(monkeypatch, deps=True):
+def _poller(monkeypatch, deps=True, tmp_path=None):
     monkeypatch.setattr(rd, "deps_available", lambda: deps)
+    if tmp_path is not None:
+        monkeypatch.setattr(config, "RADAR_LATCH_FILE", str(tmp_path / "radar_latch.json"))
+    else:
+        # never let a unit test read/write the real home-dir latch file
+        monkeypatch.setattr(config, "RADAR_LATCH_FILE", "/nonexistent-dir/radar_latch.json")
     p = rd.RadarPoller(config, _Log())
     p._thumbs = []           # no rendering in logic tests
     return p

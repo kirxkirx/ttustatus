@@ -8,23 +8,40 @@ from __future__ import annotations
 import math
 import os
 
+# Problems found while parsing the environment. Config is imported before logging is set
+# up, so we collect messages here and server.main() logs them LOUDLY after basicConfig —
+# a typo in an env var must never silently fall back to a default.
+CONFIG_WARNINGS: list[str] = []
+
 
 def _env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
+    if name not in os.environ:
+        return default
     try:
         v = float(os.environ[name])
-    except (KeyError, ValueError):
+    except ValueError:
+        CONFIG_WARNINGS.append(f"{name}={os.environ[name]!r} is not a number — "
+                               f"using default {default}")
         return default
-    return v if math.isfinite(v) else default   # reject nan/inf -> safe default
+    if not math.isfinite(v):
+        CONFIG_WARNINGS.append(f"{name}={os.environ[name]!r} is not finite — "
+                               f"using default {default}")
+        return default
+    return v
 
 
 def _env_int(name: str, default: int) -> int:
+    if name not in os.environ:
+        return default
     try:
         return int(os.environ[name])
-    except (KeyError, ValueError):
+    except ValueError:
+        CONFIG_WARNINGS.append(f"{name}={os.environ[name]!r} is not an integer — "
+                               f"using default {default}")
         return default
 
 
@@ -33,8 +50,26 @@ def _env_int(name: str, default: int) -> int:
 # Set the TTU_SAFETY_WU_KEY environment variable instead (see README_SAFETY.md). If it's
 # empty, the daemon still runs (sun/humidity protection) but rain polling is disabled.
 WU_API_KEY = _env_str("TTU_SAFETY_WU_KEY", "")
-GEOCODE = (_env_float("TTU_SAFETY_LAT", 33.7483333),
-           _env_float("TTU_SAFETY_LON", -101.9584001))   # TTU observatory
+
+# --- site coordinates -------------------------------------------------------
+# Priority: TTU_SAFETY_LAT/LON env vars > GPS fix adopted from make_status_page.py's
+# inputs file (once, at first fresh reading) > this built-in TTU default. Coordinates are
+# ROUNDED to 0.001 deg (~100 m) so GPS jitter never changes the value — the derived NWS
+# grid, WU station set, and cached radar basemap therefore stay stable across restarts;
+# only a genuine site move (>~100 m) re-derives them. The station is assumed static.
+GEOCODE_ROUND_DECIMALS = 3
+
+
+def round_coords(lat: float, lon: float) -> tuple:
+    return (round(lat, GEOCODE_ROUND_DECIMALS), round(lon, GEOCODE_ROUND_DECIMALS))
+
+
+GEOCODE_FROM_ENV = "TTU_SAFETY_LAT" in os.environ or "TTU_SAFETY_LON" in os.environ
+GEOCODE = round_coords(_env_float("TTU_SAFETY_LAT", 33.7483333),
+                       _env_float("TTU_SAFETY_LON", -101.9584001))   # TTU observatory
+GEOCODE_SOURCE = "env" if GEOCODE_FROM_ENV else "built-in default (TTU)"
+GEOCODE_MISMATCH_KM = _env_float("TTU_SAFETY_GEO_MISMATCH_KM", 0.1)  # warn beyond ~100 m
+WU_MAX_STATION_KM = _env_float("TTU_SAFETY_WU_MAX_KM", 60.0)  # drop 'nearest' beyond this
 WU_POLL_INTERVAL = _env_int("TTU_SAFETY_POLL_INTERVAL", 600)  # s between WU polls
 WU_DAILY_BUDGET = 1500          # PWS-owner cap (calls/day); informational only
 MAX_OBS_AGE_MIN = 30            # ignore a station reading older than this
@@ -100,6 +135,8 @@ RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older =>
 # ranged echo (inside 50 km but over no WU station) can't reopen the dome when IEM drops.
 # A fresh clear frame cancels it immediately (keeps the live feel).
 RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 1800)  # 30 min blind-gap latch
+RADAR_LATCH_FILE = _env_str("TTU_SAFETY_RADAR_LATCH_FILE",
+                            os.path.expanduser("~/safety_radar_latch.json"))
 # thumbnail: written where the status page can load it (beside status.html on the Pi)
 RADAR_THUMB_PATH = _env_str("TTU_SAFETY_RADAR_THUMB", "/var/www/html/ttu_radar.png")
 
@@ -138,16 +175,27 @@ CONN_ENABLED = _env_str("TTU_SAFETY_CONN", "1").strip().lower() not in ("0", "fa
 CONN_OFFLINE_UNSAFE_SEC = _env_int("TTU_SAFETY_OFFLINE_UNSAFE_SEC", 3600)   # 1 hour
 CONN_PROBE_INTERVAL = _env_int("TTU_SAFETY_CONN_PROBE_INTERVAL", 300)       # 5 min
 CONN_PROBE_TIMEOUT = _env_int("TTU_SAFETY_CONN_PROBE_TIMEOUT", 10)
+# One host per service family the daemon actually depends on (NWS, WU, radar/IEM, GLM/S3);
+# ANY response marks the internet up, so the list just needs breadth, not depth.
 CONN_PROBE_URLS = [
     "https://api.weather.gov/",
-    "https://api.open-meteo.com/",
+    "https://api.weather.com/",
     "https://mesonet.agron.iastate.edu/",
+    "https://noaa-goes19.s3.amazonaws.com/",
 ]
 
 # --- files ------------------------------------------------------------------
 # Transient (fine in /tmp): the page<->daemon exchange.
-INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", "/tmp/safety_inputs.json")
-STATE_FILE = _env_str("TTU_SAFETY_STATE_FILE", "/tmp/safety_state.json")
+# /dev/shm is a RAM tmpfs on Raspberry Pi OS: these high-frequency transient files never
+# touch the SD card, and (unlike SD-backed /tmp) are guaranteed gone after a reboot, so a
+# pre-reboot state can never be mistaken for fresh. make_status_page.py uses the same
+# paths — update both sides together when deploying this change.
+_SHM = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", _SHM + "/safety_inputs.json")
+STATE_FILE = _env_str("TTU_SAFETY_STATE_FILE", _SHM + "/safety_state.json")
+# Heartbeat for the throttled state-file write (see monitor._write_state): unchanged state
+# is rewritten at most this often so the page's staleness gate still sees a live daemon.
+STATE_WRITE_HEARTBEAT_SEC = _env_int("TTU_SAFETY_STATE_HEARTBEAT_SEC", 60)
 # Durable (survive reboot): the rain latch and the audit log.
 LATCH_FILE = _env_str("TTU_SAFETY_LATCH_FILE", os.path.expanduser("~/safety_latch.json"))
 EVENT_LOG = _env_str("TTU_SAFETY_EVENT_LOG", os.path.expanduser("~/safety_events.log"))

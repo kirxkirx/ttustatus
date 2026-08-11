@@ -136,7 +136,11 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RAIN_LATCH_HOURS` | `3.0` | how long UNSAFE persists after rain |
 | `TTU_SAFETY_INPUTS_STALE_SEC` | `600` | older inputs → fail-safe UNSAFE |
 | `TTU_SAFETY_WU_KEY` | **(required)** | Weather Underground PWS API key — set via env, never commit (see above) |
-| `TTU_SAFETY_LAT` / `_LON` | TTU | geocode for nearest-station discovery |
+| `TTU_SAFETY_LAT` / `_LON` | (adopted from GPS) | site coordinates; unset ⇒ the daemon adopts the status page's GPS fix once at startup (rounded to ~100 m). All derived values (NWS grid, WU stations, radar/GLM rings, cached tiles) follow them |
+| `TTU_SAFETY_GEO_MISMATCH_KM` | `0.1` | warn (page + /setup) when GPS and configured coords differ by more |
+| `TTU_SAFETY_WU_MAX_KM` | `60` | drop "nearest" WU stations farther than this (sparse regions) |
+| `TTU_SAFETY_LOCAL_TZ` | `America/Chicago` | timezone of the forecast table (invalid ⇒ loud UTC fallback) |
+| `TTU_SAFETY_STATE_HEARTBEAT_SEC` | `60` | max interval between unchanged state-file writes (SD-wear throttle) |
 | `TTU_SAFETY_INPUTS_FILE` / `_STATE_FILE` / `_LATCH_FILE` / `_EVENT_LOG` | see `config.py` | file paths |
 | `TTU_SAFETY_NWS` | `1` | enable the NWS forecast component (`0` disables) |
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent NWS asks for (add a contact) |
@@ -161,6 +165,17 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes |
 
 Thresholds (sun `>0°`, humidity `>95%`, WU sun-gate `<5°`) are in `safety/config.py`.
+
+**Coverage scope:** NWS and MRMS are US products and GLM is GOES-East; at a site outside
+their coverage each component **disables itself with a loud log/event** rather than
+reporting a false "clear". The WU rain and Open-Meteo-style layers work globally.
+
+**Shared files:** the page↔daemon exchange (`safety_inputs.json`, `safety_state.json`)
+lives in `/dev/shm` (RAM — no SD wear, cleared on reboot). Both sides hardcode matching
+defaults; when deploying this change, update the page and the daemon together (a mixed
+pair fails safe: the daemon just sees missing inputs and reports UNSAFE until both match).
+Make sure the user running the page loop can write `/var/www/html` (e.g.
+`sudo chown kirx /var/www/html`), and consider logrotate for the shell-launcher logs.
 
 ### Connectivity watchdog
 

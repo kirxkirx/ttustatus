@@ -71,12 +71,19 @@ def _get(url, ua):
         return json.load(r)
 
 
+_tz_warned = False
+
+
 def _local(dt, tzname):
+    global _tz_warned
     if ZoneInfo:
         try:
             return dt.astimezone(ZoneInfo(tzname))
         except Exception:
-            pass
+            if not _tz_warned:
+                _tz_warned = True
+                log.warning("TTU_SAFETY_LOCAL_TZ=%r is not a valid timezone — "
+                            "forecast table will show UTC", tzname)
     return dt
 
 

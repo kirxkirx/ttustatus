@@ -112,25 +112,41 @@ class RainPoller:
 
     # -- polling -------------------------------------------------------------
     def _ensure_stations(self, now):
-        if self._stations and (now - self._stations_ts) < 86400:
+        # NOTE: does network I/O — must be called OUTSIDE self._lock, or every IsSafe
+        # response stalls behind a slow discovery request.
+        with self._lock:
+            fresh = self._stations and (now - self._stations_ts) < 86400
+        if fresh:
             return
         try:
             found = wu_poll.discover_stations(*self.cfg.GEOCODE)
         except Exception:
             log.exception("station discovery failed")
             return
-        if found:
-            self._stations = found
+        # The WU API returns the ~10 NEAREST stations with no distance cap: in a sparse
+        # region that can mean gauges 100s of km away that say nothing about rain here.
+        near = [(s, d) for s, d in found if d <= self.cfg.WU_MAX_STATION_KM]
+        dropped = len(found) - len(near)
+        if dropped:
+            log.warning("WU discovery: dropped %d station(s) beyond %g km", dropped,
+                        self.cfg.WU_MAX_STATION_KM)
+        if not near:
+            log.warning("WU discovery found NO stations within %g km of %s — "
+                        "the rain layer has nothing to poll here",
+                        self.cfg.WU_MAX_STATION_KM, self.cfg.GEOCODE)
+            return
+        with self._lock:
+            self._stations = near
             self._stations_ts = now
-            names = ", ".join(f"{s} ({d:.1f}km)" for s, d in found)
-            self.log.record("WU-STATIONS", detail=f"{len(found)} nearest: {names}")
+        names = ", ".join(f"{s} ({d:.1f}km)" for s, d in near)
+        self.log.record("WU-STATIONS", detail=f"{len(near)} nearest: {names}")
 
     def poll_now(self, now=None) -> dict:
         """Poll WU once and update the latch. Returns the poll-result dict."""
         if now is None:
             now = time.time()
+        self._ensure_stations(now)          # network I/O, outside the lock
         with self._lock:
-            self._ensure_stations(now)
             stations = list(self._stations)
         result = wu_poll.poll_stations(stations)
         with self._lock:
@@ -214,6 +230,12 @@ class SafetyMonitor:
         self._humidity_unsafe = True
         self._last_is_safe = None       # for transition logging
         self._state: dict = {}
+        # Site coordinates: adopt the page's GPS fix once (rounded to ~1 km) when no env
+        # override was given. The station is static, so this locks after first adoption.
+        self._geocode_locked = cfg.GEOCODE_FROM_ENV
+        # state-write throttle bookkeeping
+        self._last_state_write = 0.0
+        self._last_state_sig = None
 
     # -- inputs from make_status_page.py -------------------------------------
     def read_inputs(self):
@@ -225,7 +247,41 @@ class SafetyMonitor:
         ts = _finite(d.get("ts"))
         age = (time.time() - ts) if ts is not None else None
         return {"sun_alt": _finite(d.get("sun_altitude_deg")),
-                "humidity": _finite(d.get("humidity_pct")), "ts": ts, "age": age}
+                "humidity": _finite(d.get("humidity_pct")),
+                "humidity_age_s": _finite(d.get("humidity_age_s")),
+                "lat": _finite(d.get("lat")), "lon": _finite(d.get("lon")),
+                "ts": ts, "age": age}
+
+    # -- site coordinates -----------------------------------------------------
+    def _update_geocode(self, inp, warnings):
+        """Adopt the GPS fix once when env vars are unset; warn loudly on mismatch."""
+        lat = inp.get("lat") if inp else None
+        lon = inp.get("lon") if inp else None
+        if lat is None or lon is None:
+            return
+        if not self._geocode_locked:
+            adopted = self.cfg.round_coords(lat, lon)
+            if adopted != self.cfg.GEOCODE:
+                self.cfg.GEOCODE = adopted
+                self.cfg.GEOCODE_SOURCE = "GPS (adopted from status page)"
+                log.warning("adopted site coordinates from GPS: %s (rounded to ~1 km; "
+                            "set TTU_SAFETY_LAT/LON to override)", adopted)
+                self.log.record("CONFIG", reason="coordinates adopted from GPS",
+                                result=f"{adopted[0]},{adopted[1]}")
+            else:
+                self.cfg.GEOCODE_SOURCE = "GPS (matches default)"
+            self._geocode_locked = True
+            return
+        # Locked (env-set or already adopted): a big separation means a misconfigured or
+        # moved site — make it loudly visible, but do not veto (a GPS glitch must not
+        # close the dome).
+        dlat = (lat - self.cfg.GEOCODE[0]) * 111.0
+        dlon = (lon - self.cfg.GEOCODE[1]) * 111.0 * math.cos(math.radians(lat))
+        if math.hypot(dlat, dlon) > self.cfg.GEOCODE_MISMATCH_KM:
+            warnings.append(
+                "GPS position (%.4f, %.4f) is %.2f km from the configured site "
+                "coordinates %s — weather layers may be watching the wrong place!"
+                % (lat, lon, math.hypot(dlat, dlon), self.cfg.GEOCODE))
 
     # -- evaluation ----------------------------------------------------------
     def evaluate(self) -> dict:
@@ -245,6 +301,16 @@ class SafetyMonitor:
                  or (age < -self.cfg.CLOCK_SKEW_TOLERANCE_SEC))
 
         reasons: list[str] = []
+        warnings: list[str] = []
+        self._update_geocode(inp, warnings)
+
+        # The page may serve humidity from its sensor cache: honor the measurement's real
+        # age (file ts alone would launder a stale reading as fresh).
+        hum_age = inp.get("humidity_age_s") if inp else None
+        if (humidity is not None and hum_age is not None
+                and (age or 0) + hum_age > self.cfg.INPUTS_STALE_SEC):
+            humidity = None                 # too old -> unknown -> fails safe below
+
         if stale:
             reasons.append("sensor inputs stale or missing — failing safe")
             sun_safe = False
@@ -316,6 +382,9 @@ class SafetyMonitor:
                 "issafe_path": f"/api/v1/safetymonitor/{self.cfg.DEVICE_NUMBER}/issafe",
             },
             "reasons": [] if is_safe else reasons,
+            "warnings": warnings,       # visible but non-vetoing (e.g. GPS/config mismatch)
+            "geocode": {"lat": self.cfg.GEOCODE[0], "lon": self.cfg.GEOCODE[1],
+                        "source": self.cfg.GEOCODE_SOURCE},
             "components": {
                 "sun": {"value_deg": sun_alt,
                         "threshold_deg": self.cfg.SUN_UNSAFE_ABOVE_DEG,
@@ -337,8 +406,25 @@ class SafetyMonitor:
         self._log_transition(is_safe, reasons)
         with self._lock:
             self._state = state
-        self._write_state(state)
+        self._maybe_write_state(state, now)
         return state
+
+    def _maybe_write_state(self, state, now):
+        """SD-wear throttle: evaluate() runs on every Alpaca poll, but the state file only
+        needs writing when the DECISION changed, or as a slow heartbeat so the status
+        page's staleness gate still sees a live daemon."""
+        sig = json.dumps({
+            "is_safe": state["is_safe"], "reasons": state["reasons"],
+            "warnings": state["warnings"], "connected": state["connected"],
+            "comp": {k: (c.get("safe"), c.get("latched"), c.get("available"),
+                         c.get("enabled")) for k, c in state["components"].items()},
+        }, sort_keys=True)
+        if (sig == self._last_state_sig
+                and (now - self._last_state_write) < self.cfg.STATE_WRITE_HEARTBEAT_SEC):
+            return
+        self._last_state_sig = sig
+        self._last_state_write = now
+        self._write_state(state)
 
     def _eval_sun(self, sun_alt, reasons) -> bool:
         if sun_alt is None or not math.isfinite(sun_alt):

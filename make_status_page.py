@@ -1,4 +1,5 @@
 import time
+import signal
 import subprocess
 import html
 import os
@@ -26,13 +27,27 @@ from astropy.utils import iers
 
 IMAGE_FILE = "/var/www/html/snapshot.jpg"
 HTML_FILE = "/var/www/html/status.html"
-CACHE_FILE = "/tmp/status_page_cache.json"
-STACK_DIR = "/tmp/status_stack"
+
+# /dev/shm is a RAM tmpfs on Raspberry Pi OS — these transient files are rewritten every
+# cycle and must not wear the SD card (and must not survive a reboot looking "fresh").
+_SHM = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+CACHE_FILE = _SHM + "/status_page_cache.json"
+
+# Camera processing runs on the RAM disk: the night pipeline writes GBs of DNG/TIFF
+# intermediates per cycle, which on SD-backed /tmp would wear the card out in months.
+# ImageMagick's pixel-cache spill is pointed there too. Because /dev/shm is RAM-sized,
+# the DNGs are converted and stacked IN BATCHES (deleting as we go), and if there isn't
+# enough free RAM for the RAW pipeline at all, capture degrades to JPEG-only stacking.
+STACK_DIR = _SHM + "/status_stack"
+os.environ.setdefault("MAGICK_TMPDIR", STACK_DIR)
+NIGHT_STACK_RAW_MIN_FREE = 3 * 1024 ** 3   # need ~3 GB free in RAM for the RAW pipeline
+NIGHT_STACK_BATCH = 10                     # DNGs converted+averaged per batch
 
 # Shared with the Alpaca SafetyMonitor daemon (safety_monitor.py). We WRITE the sun
-# altitude + humidity it consumes, and READ back its aggregated state to display.
-SAFETY_INPUTS_FILE = "/tmp/safety_inputs.json"
-SAFETY_STATE_FILE = "/tmp/safety_state.json"
+# altitude + humidity + GPS position it consumes, and READ back its state to display.
+# Paths must match safety/config.py — update both sides together when deploying.
+SAFETY_INPUTS_FILE = _SHM + "/safety_inputs.json"
+SAFETY_STATE_FILE = _SHM + "/safety_state.json"
 SAFETY_STATE_STALE_SEC = 300
 
 GPIO_PIN = board.D17
@@ -79,9 +94,10 @@ NIGHT_STACK_SHUTTER_US = 1200000
 NIGHT_STACK_GAIN = 16
 NIGHT_STACK_AWBGAINS = "1,1"
 
-NIGHT_STACK_DCRAW_CMD_STR = "dcraw -T -6 -w -q 0 /tmp/status_stack/*.dng"
+NIGHT_STACK_DCRAW_CMD_STR = ("dcraw -T -6 -w -q 0 " + STACK_DIR
+                             + "/*.dng (batched, DNGs deleted as converted)")
 NIGHT_STACK_PROCESS_CMD_STR = (
-    "magick /tmp/status_stack/*.tiff -evaluate-sequence mean "
+    "magick " + STACK_DIR + "/mean*.tiff -evaluate-sequence mean "
     "-contrast-stretch 1%x0.05% -gamma 1.5 -quality 95 "
     "/var/www/html/snapshot.jpg"
 )
@@ -164,7 +180,7 @@ def get_dht(cache):
 
             if t is not None and h is not None:
                 update_cache_section(cache, "dht", {"temperature": t, "humidity": h})
-                return t, h
+                return t, h, 0.0                       # live reading, age 0
         except RuntimeError:
             pass
         except Exception:
@@ -180,9 +196,12 @@ def get_dht(cache):
 
     cached = get_cached_section(cache, "dht", CACHE_MAX_AGE_DHT)
     if cached is not None:
-        return cached.get("temperature"), cached.get("humidity")
+        # Report the measurement's REAL age so the safety daemon can judge staleness —
+        # the inputs-file timestamp alone would launder a cached reading as fresh.
+        age = time.time() - cached.get("timestamp", time.time())
+        return cached.get("temperature"), cached.get("humidity"), age
 
-    return None, None
+    return None, None, None
 
 
 def get_time_string():
@@ -241,40 +260,58 @@ def get_gps(cache):
     alt = None
     cached = None
 
+    # HARD wall around the whole gpsd exchange: the deadline below is only checked
+    # BETWEEN session.next() calls, but next() itself blocks on the socket with no
+    # timeout — a silent gpsd would freeze page generation forever (and with it the
+    # safety inputs). SIGALRM breaks out of a stuck read; we then fall back to cache.
+    def _gps_alarm(signum, frame):
+        raise TimeoutError("gpsd read timed out")
+
+    old_handler = signal.signal(signal.SIGALRM, _gps_alarm)
+    signal.alarm(int(GPS_TIMEOUT) + 3)
+
     try:
-        session = gps.gps(mode=gps.WATCH_ENABLE)
-    except Exception:
-        session = None
+        try:
+            session = gps.gps(mode=gps.WATCH_ENABLE)
+        except TimeoutError:
+            session = None
+        except Exception:
+            session = None
 
-    if session is not None:
-        while time.time() < deadline:
-            try:
-                report = session.next()
-            except StopIteration:
-                break
-            except Exception:
-                continue
+        if session is not None:
+            while time.time() < deadline:
+                try:
+                    report = session.next()
+                except StopIteration:
+                    break
+                except TimeoutError:
+                    break                      # alarm fired inside a stuck read
+                except Exception:
+                    continue
 
-            if report.get("class") != "TPV":
-                continue
+                if report.get("class") != "TPV":
+                    continue
 
-            lat = report.get("lat")
-            lon = report.get("lon")
-            alt = report.get("altMSL")
-            if alt is None:
-                alt = report.get("alt")
+                lat = report.get("lat")
+                lon = report.get("lon")
+                alt = report.get("altMSL")
+                if alt is None:
+                    alt = report.get("alt")
 
-            if lat is not None and lon is not None:
-                update_cache_section(
-                    cache,
-                    "gps",
-                    {
-                        "lat": lat,
-                        "lon": lon,
-                        "alt": alt
-                    }
-                )
-                return (lat, lon, alt), "live"
+                if lat is not None and lon is not None:
+                    update_cache_section(
+                        cache,
+                        "gps",
+                        {
+                            "lat": lat,
+                            "lon": lon,
+                            "alt": alt
+                        }
+                    )
+                    return (lat, lon, alt), "live"
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
     cached = get_cached_section(cache, "gps", CACHE_MAX_AGE_GPS)
     if cached is not None:
@@ -809,7 +846,62 @@ def run_dcraw_on_dngs(dng_files):
         if not run_subprocess(cmd, CMD_TIMEOUT_DCRAW):
             ok = False
 
+        # The stack dir lives on the RAM disk: free each DNG as soon as it is
+        # converted so the pipeline fits in memory.
+        try:
+            os.remove(dng_file)
+        except Exception:
+            pass
+
     return ok
+
+
+def stack_tiff_batch(tiff_files, out_path):
+    """Average one batch of TIFFs into a single TIFF (no post-processing — the
+    contrast stretch/gamma is applied once, on the final mean of means)."""
+    imagemagick_cmd = get_imagemagick_cmd()
+    if imagemagick_cmd is None:
+        return False
+    cmd = [imagemagick_cmd]
+    cmd.extend(tiff_files)
+    cmd.extend(["-evaluate-sequence", "mean", out_path])
+    return run_subprocess(cmd, CMD_TIMEOUT_STACK)
+
+
+def process_dngs_in_batches(dng_files):
+    """Convert + average DNGs in batches so the multi-GB TIFF set never exists at once
+    (the RAM disk cannot hold it). Each batch: dcraw -> batch-mean TIFF -> delete the
+    batch TIFFs (DNGs are deleted by run_dcraw_on_dngs). Returns (mean_files, raw_ok);
+    mean of equal batches = true mean (a smaller final batch weighs its frames slightly
+    higher — visually irrelevant)."""
+    raw_ok = True
+    mean_files = []
+
+    for i in range(0, len(dng_files), NIGHT_STACK_BATCH):
+        batch = dng_files[i:i + NIGHT_STACK_BATCH]
+        if not run_dcraw_on_dngs(batch):
+            raw_ok = False
+
+        tiffs = []
+        for dng in batch:
+            tiff = os.path.splitext(dng)[0] + ".tiff"
+            if os.path.exists(tiff):
+                tiffs.append(tiff)
+
+        if tiffs:
+            mean_path = os.path.join(
+                STACK_DIR, "mean%04d.tiff" % (i // NIGHT_STACK_BATCH))
+            if stack_tiff_batch(tiffs, mean_path) and os.path.exists(mean_path):
+                mean_files.append(mean_path)
+            else:
+                raw_ok = False
+            for tiff in tiffs:
+                try:
+                    os.remove(tiff)
+                except Exception:
+                    pass
+
+    return mean_files, raw_ok
 
 
 def stack_tiffs_to_image(tiff_files):
@@ -898,6 +990,16 @@ def take_night_stack_snapshot(camera_info):
         camera_info["error"] = "could not create stack directory"
         return False
 
+    # The stack dir is on the RAM disk. The RAW pipeline needs ~2 GB for the captured
+    # DNGs plus batch headroom; if this Pi's /dev/shm can't hold that, capture JPEGs
+    # only and stack those — a clean degradation instead of ENOSPC mid-pipeline.
+    use_raw = True
+    try:
+        if shutil.disk_usage(STACK_DIR).free < NIGHT_STACK_RAW_MIN_FREE:
+            use_raw = False
+    except Exception:
+        pass
+
     output_pattern = os.path.join(STACK_DIR, "frame%04d.jpg")
 
     cmd = [
@@ -908,7 +1010,6 @@ def take_night_stack_snapshot(camera_info):
         str(NIGHT_STACK_TIMELAPSE_MS),
         "-o",
         output_pattern,
-        "--raw",
         "--shutter",
         str(NIGHT_STACK_SHUTTER_US),
         "--gain",
@@ -918,8 +1019,11 @@ def take_night_stack_snapshot(camera_info):
         "--immediate",
         "--nopreview"
     ]
+    if use_raw:
+        cmd.insert(cmd.index("--shutter"), "--raw")
 
-    camera_info["mode"] = "night, raw stack"
+    camera_info["mode"] = ("night, raw stack" if use_raw
+                           else "night, JPEG stack (RAM disk too small for RAW)")
     camera_info["capture_command"] = command_to_string(cmd)
     camera_info["processing_command"] = (
         NIGHT_STACK_DCRAW_CMD_STR + " ; " + NIGHT_STACK_PROCESS_CMD_STR
@@ -932,33 +1036,46 @@ def take_night_stack_snapshot(camera_info):
     dng_files = sorted(glob.glob(os.path.join(STACK_DIR, "*.dng")))
     jpeg_files = sorted(glob.glob(os.path.join(STACK_DIR, "*.jpg")))
 
+    if not use_raw:
+        # low-RAM path: plain JPEG stack, no RAW intermediates at all
+        if jpeg_files and stack_jpegs_to_image(jpeg_files):
+            camera_info["processing_command"] = (
+                "magick " + STACK_DIR + "/*.jpg -evaluate-sequence mean "
+                "-contrast-stretch 1%x0.05% -gamma 1.5 -quality 95 " + IMAGE_FILE)
+            return True
+        camera_info["error"] = "JPEG stack failed"
+        return False
+
     if len(dng_files) == 0:
         camera_info["error"] = "no DNG files produced"
         if len(jpeg_files) > 0:
             stacked_ok = stack_jpegs_to_image(jpeg_files)
             if stacked_ok:
+                camera_info["error"] = None    # fallback succeeded - not an error state
                 camera_info["mode"] = "night, JPEG stack fallback"
                 camera_info["processing_command"] = (
-                    "magick /tmp/status_stack/*.jpg -evaluate-sequence mean "
+                    "magick " + STACK_DIR + "/*.jpg -evaluate-sequence mean "
                     "-contrast-stretch 1%x0.05% -gamma 1.5 -quality 95 "
-                    "/var/www/html/snapshot.jpg"
+                    + IMAGE_FILE
                 )
                 return True
         return False
 
-    raw_ok = run_dcraw_on_dngs(dng_files)
+    # batched: DNG -> TIFF -> batch mean, deleting intermediates as we go, so the
+    # multi-GB TIFF set never exists at once on the RAM disk
+    tiff_files, raw_ok = process_dngs_in_batches(dng_files)
 
-    tiff_files = sorted(glob.glob(os.path.join(STACK_DIR, "*.tiff")))
     if len(tiff_files) == 0:
         camera_info["error"] = "dcraw produced no TIFF files"
         if len(jpeg_files) > 0:
             stacked_ok = stack_jpegs_to_image(jpeg_files)
             if stacked_ok:
+                camera_info["error"] = None    # fallback succeeded - not an error state
                 camera_info["mode"] = "night, JPEG stack fallback"
                 camera_info["processing_command"] = (
-                    "magick /tmp/status_stack/*.jpg -evaluate-sequence mean "
+                    "magick " + STACK_DIR + "/*.jpg -evaluate-sequence mean "
                     "-contrast-stretch 1%x0.05% -gamma 1.5 -quality 95 "
-                    "/var/www/html/snapshot.jpg"
+                    + IMAGE_FILE
                 )
                 return True
         return False
@@ -970,11 +1087,12 @@ def take_night_stack_snapshot(camera_info):
         if len(jpeg_files) > 0:
             stacked_ok = stack_jpegs_to_image(jpeg_files)
             if stacked_ok:
+                camera_info["error"] = None    # fallback succeeded - not an error state
                 camera_info["mode"] = "night, JPEG stack fallback"
                 camera_info["processing_command"] = (
-                    "magick /tmp/status_stack/*.jpg -evaluate-sequence mean "
+                    "magick " + STACK_DIR + "/*.jpg -evaluate-sequence mean "
                     "-contrast-stretch 1%x0.05% -gamma 1.5 -quality 95 "
-                    "/var/www/html/snapshot.jpg"
+                    + IMAGE_FILE
                 )
                 return True
         return False
@@ -1711,7 +1829,7 @@ def build_masthead_html(night_default):
         pressed = "false"
 
     return """  <div class="mast">
-    <h1>Observatory Clock Status</h1>
+    <h1>Observatory Clock and Safety Monitor</h1>
     <div class="mastright">
       <button class="modebtn" id="modebtn" type="button" aria-pressed="%s">%s</button>
       <div class="when">
@@ -2365,7 +2483,8 @@ def build_details_html(chrony_raw, ntp_info, camera_info):
     return "".join(parts)
 
 
-def write_safety_inputs(sun_info, humidity):
+def write_safety_inputs(sun_info, humidity, humidity_age_s=None, gps_data=None,
+                        gps_source=None):
     alt = None
     if sun_info is not None:
         alt = sun_info.get("sun_altitude_deg")
@@ -2373,7 +2492,15 @@ def write_safety_inputs(sun_info, humidity):
         "ts": time.time(),
         "sun_altitude_deg": alt,
         "humidity_pct": humidity,
+        # real age of the humidity measurement (cache fallback), so the daemon's
+        # staleness fail-safe judges the reading, not just this file's timestamp
+        "humidity_age_s": humidity_age_s,
     }
+    # the daemon adopts these once at startup when TTU_SAFETY_LAT/LON are unset
+    # (rounded to ~1 km there, so GPS jitter never re-derives grids/tiles/stations)
+    if gps_data is not None:
+        data["lat"], data["lon"] = gps_data[0], gps_data[1]
+        data["gps_source"] = gps_source
     tmp_file = SAFETY_INPUTS_FILE + ".tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f)
@@ -2556,6 +2683,12 @@ def build_safety_html(state):
                         for r in state.get("reasons"))
         reasons_html = ('    <ul style="margin:0 0 14px;padding-left:20px;'
                         'color:var(--warn)">\n' + items + "    </ul>\n")
+    # Non-vetoing warnings (e.g. GPS vs configured-coordinates mismatch) — always shown.
+    if state.get("warnings"):
+        items = "".join("        <li>&#9888; %s</li>\n" % html.escape(w)
+                        for w in state.get("warnings"))
+        reasons_html += ('    <ul style="margin:0 0 14px;padding-left:20px;'
+                         'color:var(--warn);font-weight:600">\n' + items + "    </ul>\n")
 
     tiles_head = ('    <h3 style="margin:14px 0 8px;font-size:14px">'
                   'Inputs it is using</h3>\n')
@@ -2776,7 +2909,7 @@ def write_html(
     parts.append('<meta charset="utf-8">\n')
     parts.append('<meta name="viewport" content="width=device-width, initial-scale=1">\n')
     parts.append('<meta http-equiv="refresh" content="%d">\n' % refresh_seconds)
-    parts.append('<title>Observatory Clock Status</title>\n')
+    parts.append('<title>Observatory Clock and Safety Monitor</title>\n')
     parts.append('<style>\n')
     parts.append(PAGE_CSS)
     parts.append('</style>\n</head>\n<body>\n')
@@ -2835,8 +2968,12 @@ def write_html(
 
     page = "".join(parts)
 
-    with open(HTML_FILE, "w", encoding="utf-8") as f:
+    # Atomic replace: a crash/power cut mid-write must never leave a half page behind
+    # (matches every other writer in this file).
+    tmp_file = HTML_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         f.write(page)
+    os.replace(tmp_file, HTML_FILE)
 
 
 def main():
@@ -2858,10 +2995,19 @@ def main():
 
     gps_data, gps_source = get_gps(cache)
     sun_info = get_sun_info(gps_data)
+    t, h, h_age = get_dht(cache)
+
+    # Write the safety inputs BEFORE the camera work: the night stack can take many
+    # minutes, and the daemon fails safe (UNSAFE) when these go older than 10 min —
+    # exactly during observing hours. Fresh inputs must never wait for the camera.
+    try:
+        write_safety_inputs(sun_info, h, humidity_age_s=h_age,
+                            gps_data=gps_data, gps_source=gps_source)
+    except Exception:
+        pass
 
     have_image, camera_info = take_snapshot(sun_info)
 
-    t, h = get_dht(cache)
     now_str = get_time_string()
     chrony = get_chrony()
     ntp_info = get_ntp_info()
@@ -2869,11 +3015,6 @@ def main():
     ethernet_data = get_ethernet_status()
 
     save_cache(cache)
-
-    try:
-        write_safety_inputs(sun_info, h)
-    except Exception:
-        pass
 
     write_html(
         t,

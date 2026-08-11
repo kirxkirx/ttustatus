@@ -129,6 +129,33 @@ def test_glm_tile_latched_render():
     assert "STRIKE" in tiles and "Lightning (GLM" in tiles
 
 
+def test_dng_batch_processing_deletes_as_it_goes(tmp_path, monkeypatch):
+    # simulate the RAM-disk batch pipeline: 23 DNGs -> 3 batch means (10+10+3),
+    # with every DNG and per-batch TIFF deleted along the way
+    monkeypatch.setattr(msp, "STACK_DIR", str(tmp_path))
+    dngs = []
+    for i in range(23):
+        p = tmp_path / ("frame%04d.dng" % i)
+        p.write_bytes(b"x")
+        dngs.append(str(p))
+
+    def fake_run(cmd, timeout):
+        if cmd[0] == "dcraw":                      # "convert": create the .tiff
+            open(os.path.splitext(cmd[-1])[0] + ".tiff", "wb").write(b"t")
+        else:                                       # "magick": create the output file
+            open(cmd[-1], "wb").write(b"m")
+        return True
+
+    monkeypatch.setattr(msp, "run_subprocess", fake_run)
+    monkeypatch.setattr(msp, "get_imagemagick_cmd", lambda: "magick")
+    means, ok = msp.process_dngs_in_batches(dngs)
+    assert ok is True and len(means) == 3
+    leftovers = [f for f in os.listdir(tmp_path)
+                 if f.endswith(".dng") or (f.endswith(".tiff")
+                                           and not f.startswith("mean"))]
+    assert leftovers == []                          # everything transient was deleted
+
+
 def test_rain_tile_disabled_without_key():
     comp = {"sun": {"value_deg": -7.0, "threshold_deg": 0.0, "safe": True},
             "humidity": {"value_pct": 40.0, "threshold_pct": 95.0, "safe": True},
