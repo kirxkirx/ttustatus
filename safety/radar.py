@@ -144,9 +144,19 @@ def _region(cfg):
     return lat0 - h, lat0 + h, lon0 - h, lon0 + h
 
 
-def _cache_key(cfg):
-    s = f"{cfg.GEOCODE}|{cfg.RADAR_THUMB_HALF_DEG}|{cfg.RADAR_THUMB_PX}|{cfg.RADAR_TILE_ZOOM}|{cfg.RADAR_TILE_URL}"
+def _cache_key(cfg, tile_url):
+    s = (f"{cfg.GEOCODE}|{cfg.RADAR_THUMB_HALF_DEG}|{cfg.RADAR_THUMB_PX}|"
+         f"{cfg.RADAR_TILE_ZOOM}|{tile_url}")
     return hashlib.md5(s.encode()).hexdigest()[:10]
+
+
+# overlay colours per basemap theme (dark labels/lines are invisible on a light basemap)
+_THEME = {
+    "dark":  {"ink": (255, 255, 255), "stroke": (0, 0, 0), "ring": (90, 200, 255),
+              "label": (120, 210, 255), "text": (200, 215, 235)},
+    "light": {"ink": (25, 30, 40), "stroke": (255, 255, 255), "ring": (10, 90, 200),
+              "label": (10, 90, 200), "text": (40, 55, 75)},
+}
 
 
 def _font(sz):
@@ -160,10 +170,17 @@ def _font(sz):
 
 
 class Thumbnailer:
-    """Builds and caches the dark-tile basemap once, then composites radar each cycle."""
+    """Builds and caches a tile basemap once, then composites radar each cycle.
 
-    def __init__(self, cfg):
+    Parametrized by tile URL / output path / theme so the same machinery makes both the
+    night (dark) and day (light) maps.
+    """
+
+    def __init__(self, cfg, tile_url, thumb_path, theme):
         self.cfg = cfg
+        self.tile_url = tile_url
+        self.thumb_path = thumb_path
+        self.colors = _THEME.get(theme, _THEME["dark"])
         self._basemap = None        # PIL RGB image at (_ox, _oy)
         self._tilebox = None        # (gx0, gy0, gx1, gy1, z) for the mercator mapping
         self._remap = None          # per-thumb-pixel -> radar palette index source (col,row)
@@ -186,7 +203,7 @@ class Thumbnailer:
         self._ox = cfg.RADAR_THUMB_PX
         self._oy = max(1, round(self._ox * ch / cw))
 
-        cache = os.path.join(cfg.RADAR_CACHE_DIR, f"basemap_{_cache_key(cfg)}.png")
+        cache = os.path.join(cfg.RADAR_CACHE_DIR, f"basemap_{_cache_key(cfg, self.tile_url)}.png")
         if os.path.exists(cache):
             try:
                 self._basemap = Image.open(cache).convert("RGB")
@@ -201,7 +218,7 @@ class Thumbnailer:
             for ty in range(int(y0f), int(y1f) + 1):
                 try:
                     t = Image.open(io.BytesIO(_get(
-                        cfg.RADAR_TILE_URL.format(z=z, x=tx, y=ty)))).convert("RGB")
+                        self.tile_url.format(z=z, x=tx, y=ty)))).convert("RGB")
                     canvas.paste(t, (tx * 256 - gx0, ty * 256 - gy0))
                     n += 1
                 except Exception:
@@ -265,19 +282,19 @@ class Thumbnailer:
         im = Image.alpha_composite(base, ov).convert("RGB")
         d = ImageDraw.Draw(im)
         lat0, lon0 = cfg.GEOCODE
+        ink, stroke = self.colors["ink"], self.colors["stroke"]
 
         # 50 km ring
         ring = [self._mv(*dest_point(lat0, lon0, cfg.RADAR_TRIGGER_KM, b))
                 for b in range(0, 361, 6)]
-        d.line(ring, fill=(90, 200, 255), width=2)
+        d.line(ring, fill=self.colors["ring"], width=2)
         # observatory crosshair
         cx, cy = self._mv(lat0, lon0)
-        d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], outline=(255, 255, 255), width=2)
+        d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], outline=ink, width=2)
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            d.line([cx + dx * 6, cy + dy * 6, cx + dx * 11, cy + dy * 11],
-                   fill=(255, 255, 255), width=2)
-        d.text((cx + 8, cy + 6), "%g km" % cfg.RADAR_TRIGGER_KM, fill=(120, 210, 255),
-               font=_font(13), stroke_width=2, stroke_fill=(0, 0, 0))
+            d.line([cx + dx * 6, cy + dy * 6, cx + dx * 11, cy + dy * 11], fill=ink, width=2)
+        d.text((cx + 8, cy + 6), "%g km" % cfg.RADAR_TRIGGER_KM, fill=self.colors["label"],
+               font=_font(13), stroke_width=2, stroke_fill=stroke)
 
         # scale bars (10 km and 10 mi), bottom-left
         f = _font(12)
@@ -289,24 +306,24 @@ class Thumbnailer:
         bx, by = 14, oy - 34
         for label, km in (("10 km", 10.0), ("10 mi", 16.0934)):
             L = px_for(km)
-            d.line([bx, by, bx + L, by], fill=(255, 255, 255), width=3)
-            d.line([bx, by - 3, bx, by + 3], fill=(255, 255, 255), width=2)
-            d.line([bx + L, by - 3, bx + L, by + 3], fill=(255, 255, 255), width=2)
-            d.text((bx + L + 5, by - 7), label, fill=(255, 255, 255), font=f,
-                   stroke_width=2, stroke_fill=(0, 0, 0))
+            d.line([bx, by, bx + L, by], fill=ink, width=3)
+            d.line([bx, by - 3, bx, by + 3], fill=ink, width=2)
+            d.line([bx + L, by - 3, bx + L, by + 3], fill=ink, width=2)
+            d.text((bx + L + 5, by - 7), label, fill=ink, font=f,
+                   stroke_width=2, stroke_fill=stroke)
             by += 15
         # frame time, top-left
-        d.text((8, 6), frame_txt, fill=(200, 215, 235), font=_font(12),
-               stroke_width=2, stroke_fill=(0, 0, 0))
+        d.text((8, 6), frame_txt, fill=self.colors["text"], font=_font(12),
+               stroke_width=2, stroke_fill=stroke)
 
-        tmp = cfg.RADAR_THUMB_PATH + ".tmp"
+        tmp = self.thumb_path + ".tmp"
         try:
-            os.makedirs(os.path.dirname(cfg.RADAR_THUMB_PATH) or ".", exist_ok=True)
+            os.makedirs(os.path.dirname(self.thumb_path) or ".", exist_ok=True)
             im.save(tmp, format="PNG")     # .tmp ext -> must state the format
-            os.replace(tmp, cfg.RADAR_THUMB_PATH)
+            os.replace(tmp, self.thumb_path)
             return True
         except Exception:
-            log.exception("could not write radar thumbnail %s", cfg.RADAR_THUMB_PATH)
+            log.exception("could not write radar thumbnail %s", self.thumb_path)
             return False
 
 
@@ -316,7 +333,14 @@ class RadarPoller:
         self.cfg = cfg
         self.log = eventlog
         self._lock = threading.Lock()
-        self._thumb = Thumbnailer(cfg) if deps_available() else None
+        # night (dark) map, plus an optional day (light) map for the daytime page style
+        self._thumbs = []
+        if deps_available():
+            self._thumbs.append(Thumbnailer(cfg, cfg.RADAR_TILE_URL,
+                                            cfg.RADAR_THUMB_PATH, "dark"))
+            if cfg.RADAR_DAY_ENABLED:
+                self._thumbs.append(Thumbnailer(cfg, cfg.RADAR_TILE_URL_DAY,
+                                                cfg.RADAR_THUMB_PATH_DAY, "light"))
         self._last_ok_ts = None
         self._last_poll_ts = None
         self._in_ring = False
@@ -345,7 +369,9 @@ class RadarPoller:
             return {"ok": False, "error": str(e)}
         in_ring, nearest, count = check_rain(self.cfg, img)
         frame_txt = "MRMS " + ts.strftime("%Y-%m-%d %H:%MZ")
-        thumb_ok = self._thumb.render(img, frame_txt) if self._thumb else False
+        # render every configured map (dark + optional light); primary = the first (dark)
+        results = [t.render(img, frame_txt) for t in self._thumbs]
+        thumb_ok = bool(results and results[0])
         with self._lock:
             self._last_ok_ts = now
             self._frame_utc = ts.isoformat()
@@ -412,6 +438,8 @@ class RadarPoller:
                 "polling_active": polling_active,
                 "thumb_available": self._thumb_ok,
                 "thumb_path": self.cfg.RADAR_THUMB_PATH,
+                "thumb_path_day": (self.cfg.RADAR_THUMB_PATH_DAY
+                                   if self.cfg.RADAR_DAY_ENABLED else None),
                 "attribution": self.cfg.RADAR_ATTRIBUTION,
                 "source": "NOAA/NSSL MRMS composite reflectivity via IEM",
             }
@@ -422,7 +450,7 @@ def unavailable_component(cfg):
         "safe": True, "enabled": False, "available": False, "in_ring": False,
         "nearest_km": None, "pixels": 0, "frame_utc": None, "age_s": None,
         "trigger_km": cfg.RADAR_TRIGGER_KM, "dbz": cfg.RADAR_DBZ, "polling_active": False,
-        "thumb_available": False, "thumb_path": cfg.RADAR_THUMB_PATH,
+        "thumb_available": False, "thumb_path": cfg.RADAR_THUMB_PATH, "thumb_path_day": None,
         "attribution": cfg.RADAR_ATTRIBUTION,
         "source": "NOAA/NSSL MRMS composite reflectivity via IEM (disabled)",
     }

@@ -1597,6 +1597,9 @@ PAGE_CSS = """  body { margin: 0; }
   .tile .k { font-size: 11.5px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 7px; }
   .tile .v { font-size: 29px; font-weight: 600; line-height: 1.05; }
   .tile .v.dual { font-size: 23px; }
+  /* radar map: show the dark version in night style, the light version in day style */
+  #page:not(.night) .radar-img.radar-night { display: none; }
+  #page.night .radar-img.radar-day { display: none; }
   .tile .v .u { font-size: 16px; font-weight: 400; color: var(--muted); margin-left: 2px; }
   .tile .s { font-size: 12.5px; color: var(--faint); margin-top: 6px; }
   .tile.hot .v { color: var(--accent); }
@@ -2466,32 +2469,15 @@ def build_safety_tiles_html(comp):
         else:
             glm_s = safety_dot_html(True) + "polling paused (day)"
 
-    conn = comp.get("connectivity") or {}
-    if not conn:
-        conn_v, conn_s = '<div class="v mono">&mdash;</div>', ""
-    elif not conn.get("probed"):
-        conn_v = '<div class="v mono">online</div>'
-        conn_s = safety_dot_html(True) + "not yet probed"
-    elif conn.get("online"):
-        conn_v = '<div class="v mono">online</div>'
-        conn_s = safety_dot_html(True) + "internet reachable"
-    elif conn.get("safe"):
-        conn_v = ('<div class="v mono">%d<span class="u">min</span></div>'
-                  % conn.get("offline_min", 0))
-        conn_s = safety_dot_html(True) + "offline (grace)"
-    else:
-        conn_v = ('<div class="v mono">%d<span class="u">min</span></div>'
-                  % conn.get("offline_min", 0))
-        conn_s = safety_dot_html(False) + "no internet"
-
+    # Connectivity has no tile — it's a quiet watchdog; when the internet is down long
+    # enough it forces UNSAFE and shows up as a reason, so no always-on "online" blob here.
     tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>\n    </div>\n')
     tiles = (tile % ("Sun altitude", sun_v, sun_s)
              + tile % ("Humidity", hum_v, hum_s)
              + tile % ("Rain (WU)", rain_v, rain_s)
              + tile % ("NWS (now/next)", nws_v, nws_s)
-             + tile % ("Lightning (GLM)", glm_v, glm_s)
-             + (tile % ("Internet", conn_v, conn_s) if conn else ""))
+             + tile % ("Lightning (GLM)", glm_v, glm_s))
     # auto-fit: 5-across on the ~1020px desktop wrap, and wraps to 3/2/1 columns on
     # narrower/phone screens instead of shrinking into an unreadable single row.
     return ('  <div class="tiles" '
@@ -2615,24 +2601,35 @@ def build_radar_html(state):
         verdict = safety_dot_html(True) + "no fresh frame (paused in daylight, or unreachable)"
 
     # The <img> uses a relative basename, which only resolves if the thumbnail lives in the
-    # same web directory as status.html. Verify co-location; otherwise fall back gracefully.
-    thumb_path = rad.get("thumb_path") or ""
+    # same web directory as status.html. There are up to two maps — a dark (night) and a
+    # light (day) version — and CSS shows whichever matches the page's day/night style.
     web_dir = os.path.dirname(os.path.abspath(HTML_FILE))
-    colocated = (thumb_path
-                 and os.path.dirname(os.path.abspath(thumb_path)) == web_dir)
-    if rad.get("thumb_available") and colocated and not state_stale:
-        src = os.path.basename(thumb_path)
+    night_path = rad.get("thumb_path") or ""
+    day_path = rad.get("thumb_path_day")
+    img_style = ('style="width:100%%;max-width:440px;height:auto;border:1px solid '
+                 'var(--line);border-radius:10px;display:block"')
+
+    def _usable(p):
+        return bool(p) and os.path.dirname(os.path.abspath(p)) == web_dir
+
+    def _img(p, cls):
         try:
-            bust = int(os.path.getmtime(thumb_path))
+            bust = int(os.path.getmtime(p))
         except Exception:
             bust = int(time.time())
-        img = ('<img src="%s?t=%d" alt="MRMS radar with a %g km ring around the observatory" '
-               'style="width:100%%;max-width:440px;height:auto;border:1px solid var(--line);'
-               'border-radius:10px;display:block">' % (html.escape(src), bust, rk))
-    elif rad.get("thumb_available") and not colocated:
+        return ('<img class="radar-img %s" src="%s?t=%d" '
+                'alt="MRMS radar with a %g km ring around the observatory" %s>'
+                % (cls, html.escape(os.path.basename(p)), bust, rk, img_style))
+
+    if rad.get("thumb_available") and not state_stale and _usable(night_path):
+        if day_path and _usable(day_path):
+            img = _img(night_path, "radar-night") + _img(day_path, "radar-day")
+        else:
+            img = _img(night_path, "")   # single map, always shown
+    elif rad.get("thumb_available") and night_path and not _usable(night_path):
         img = ('<div class="lede" style="color:var(--warn)">Radar image is at %s (not in the '
                'web directory) &mdash; set TTU_SAFETY_RADAR_THUMB beside status.html.</div>'
-               % html.escape(thumb_path))
+               % html.escape(night_path))
     else:
         img = ('<div class="lede" style="color:var(--muted)">Radar image not available '
                'yet (generated on the first night-time poll).</div>')

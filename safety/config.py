@@ -102,12 +102,25 @@ RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older =>
 RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 1800)  # 30 min blind-gap latch
 # thumbnail: written where the status page can load it (beside status.html on the Pi)
 RADAR_THUMB_PATH = _env_str("TTU_SAFETY_RADAR_THUMB", "/var/www/html/ttu_radar.png")
+
+
+def _day_variant(path):
+    base, ext = os.path.splitext(path)
+    return base + "_day" + ext
+
+
+RADAR_THUMB_PATH_DAY = _env_str("TTU_SAFETY_RADAR_THUMB_DAY", _day_variant(RADAR_THUMB_PATH))
 RADAR_THUMB_HALF_DEG = _env_float("TTU_SAFETY_RADAR_THUMB_HALF", 1.0)  # region half-size
 RADAR_THUMB_PX = _env_int("TTU_SAFETY_RADAR_THUMB_PX", 440)
 RADAR_TILE_ZOOM = _env_int("TTU_SAFETY_RADAR_TILE_ZOOM", 8)
 RADAR_TILE_URL = _env_str(
     "TTU_SAFETY_RADAR_TILE_URL",
     "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png")   # OSM data, dark theme
+# Daytime (light) version of the map, shown when the status page is in day style.
+RADAR_DAY_ENABLED = _env_str("TTU_SAFETY_RADAR_DAY", "1").strip().lower() not in ("0", "false", "no")
+RADAR_TILE_URL_DAY = _env_str(
+    "TTU_SAFETY_RADAR_TILE_URL_DAY",
+    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png")  # OSM data, light theme
 RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
 RADAR_ATTRIBUTION = "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS via IEM"
 # (Persistence note: the radar keeps its OWN blind-gap latch above — it does NOT rely on the

@@ -81,7 +81,7 @@ def test_nws_forecast_section_and_tile_render():
     assert "C85%/P20%/T0%" in tiles and "C90%/P30%/T5%" in tiles   # both hours packed
     assert "no&nbsp;rain" in tiles                     # rain wording fixed
     assert "Lightning (GLM" in tiles                   # GLM tile present (off by default here)
-    assert "Internet" in tiles and "no internet" in tiles          # connectivity tile
+    assert "Internet" not in tiles                     # connectivity has no always-on tile
     fc = msp.build_forecast_html({"components": {"nws": nws}})
     assert "12-hour forecast" in fc and "Mon 00:00" in fc and "NWS" in fc
     assert "mph" in fc                                 # wind column present
@@ -104,6 +104,12 @@ def test_radar_section_renders():
     # clear ring (fresh)
     st2 = {"ts": now, "components": {"radar": {**base, "in_ring": False}}}
     assert "no rain within 50" in msp.build_radar_html(st2)
+    # day + night maps -> both <img> emitted with switch classes
+    day = os.path.join(os.path.dirname(msp.HTML_FILE), "ttu_radar_day.png")
+    st_both = {"ts": now, "components": {"radar": {**base, "in_ring": False,
+                                                   "thumb_path_day": day}}}
+    hb = msp.build_radar_html(st_both)
+    assert "radar-night" in hb and "radar-day" in hb and "ttu_radar_day.png" in hb
     # stale state -> never a green "no rain"; shows stale
     st3 = {"ts": now - 99999, "components": {"radar": {**base, "in_ring": False}}}
     assert "stale" in msp.build_radar_html(st3) and "no rain within 50" not in msp.build_radar_html(st3)

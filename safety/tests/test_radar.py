@@ -14,7 +14,7 @@ class _Log:
 def _poller(monkeypatch, deps=True):
     monkeypatch.setattr(rd, "deps_available", lambda: deps)
     p = rd.RadarPoller(config, _Log())
-    p._thumb = None          # no rendering in logic tests
+    p._thumbs = []           # no rendering in logic tests
     return p
 
 
@@ -141,7 +141,7 @@ def test_check_rain_on_synthetic_image(monkeypatch):
 
 def test_thumbnailer_geometry():
     pytest.importorskip("PIL")
-    t = rd.Thumbnailer(config)
+    t = rd.Thumbnailer(config, config.RADAR_TILE_URL, config.RADAR_THUMB_PATH, "dark")
     t._tilebox = None
     # _region returns a box centered on the observatory
     latmin, latmax, lonmin, lonmax = rd._region(config)

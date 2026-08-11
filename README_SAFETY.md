@@ -153,8 +153,9 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
 | `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (night only) |
 | `TTU_SAFETY_RADAR_THUMB` | `/var/www/html/ttu_radar.png` | thumbnail path (beside status.html) |
-| `TTU_SAFETY_RADAR_TILE_URL` | Carto dark | basemap tile template (OSM data) |
-| `TTU_SAFETY_RADAR_CACHE` | `~/.cache/ttu-radar` | cached basemap (tiles fetched once) |
+| `TTU_SAFETY_RADAR_TILE_URL` | Carto dark | night basemap tile template (OSM data) |
+| `TTU_SAFETY_RADAR_TILE_URL_DAY` | Carto light | day basemap tile template (`TTU_SAFETY_RADAR_DAY=0` to skip) |
+| `TTU_SAFETY_RADAR_CACHE` | `~/.cache/ttu-radar` | cached basemaps (tiles fetched once each) |
 | `TTU_SAFETY_CONN` | `1` | enable the connectivity watchdog (`0` disables) |
 | `TTU_SAFETY_OFFLINE_UNSAFE_SEC` | `3600` | UNSAFE after this long with no internet |
 | `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes |
@@ -180,8 +181,10 @@ is within 50 km** of the dome — a deliberately simple radius, no upwind logic.
 renders a **TTU-centered radar thumbnail** (dark OSM/Carto tiles, **cached to disk so they
 aren't re-downloaded each cycle**) with the **50 km ring** and **10 km / 10 mi scale bars**,
 written beside `status.html`; the observatory page shows it with attribution and a source
-note. Live check (unsafe while rain is in the ring; WU's 3 h latch carries "recently
-rained"); a fetch error or stale frame → *unavailable*, which does not veto on its own. The
+note. **Two versions are rendered — a dark map for the night page style and a light
+(`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches the page's
+day/night toggle.** Live check (unsafe while rain is in the ring; a fresh clear frame or a
+30-min blind-gap latch handle "recently rained"); a fetch error or stale frame → *unavailable*, which does not veto on its own. The
 slow tile/radar fetch + render runs in its own thread, so it never delays page/monitor
 refresh. Needs Pillow (`sudo apt install python3-pil`); absent → radar disabled.
 
