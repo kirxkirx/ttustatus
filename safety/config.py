@@ -163,6 +163,18 @@ RADAR_ATTRIBUTION = "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL
 # (Persistence note: the radar keeps its OWN blind-gap latch above — it does NOT rely on the
 # WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
 
+# --- status-page runner ------------------------------------------------------
+# The daemon periodically runs make_status_page.py as a SUBPROCESS (one systemd service
+# for everything; the page's heavy deps and any crash stay isolated from the safety
+# logic). A run that hangs is killed with its whole process tree after PAGE_TIMEOUT.
+PAGE_ENABLED = _env_str("TTU_SAFETY_PAGE", "1").strip().lower() not in ("0", "false", "no")
+PAGE_SCRIPT = _env_str("TTU_SAFETY_PAGE_SCRIPT",
+                       os.path.join(os.path.dirname(os.path.dirname(
+                           os.path.abspath(__file__))), "make_status_page.py"))
+# same env var the page itself uses for its meta-refresh, so the two always agree
+PAGE_INTERVAL = _env_int("STATUS_PAGE_INTERVAL", 90)
+PAGE_TIMEOUT = _env_int("TTU_SAFETY_PAGE_TIMEOUT", 1800)   # kill a stuck run after 30 min
+
 # --- connectivity watchdog (loss of internet) -------------------------------
 # A lightweight probe (day and night) checks whether ANY online service host is reachable.
 # If NONE are reachable for CONN_OFFLINE_UNSAFE_SEC (1 h), declare UNSAFE — we've been blind

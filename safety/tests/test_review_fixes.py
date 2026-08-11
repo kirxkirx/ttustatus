@@ -104,6 +104,29 @@ def test_wu_discovery_all_far_leaves_empty(env, monkeypatch):
     assert p._stations == []
 
 
+# ---- single-service page runner ----------------------------------------------
+def test_run_page_once_success_and_failure(tmp_path, monkeypatch):
+    from safety import server
+    ok_script = tmp_path / "ok.py"
+    ok_script.write_text("print('page done')\n")
+    monkeypatch.setattr(config, "PAGE_SCRIPT", str(ok_script))
+    monkeypatch.setattr(config, "PAGE_TIMEOUT", 30)
+    rc, secs = server.run_page_once(config)
+    assert rc == 0 and secs >= 0
+    bad_script = tmp_path / "bad.py"
+    bad_script.write_text("import sys; sys.exit(3)\n")
+    monkeypatch.setattr(config, "PAGE_SCRIPT", str(bad_script))
+    rc, _ = server.run_page_once(config)
+    assert rc == 3                                   # failure reported, no exception
+
+
+def test_run_page_once_missing_script(monkeypatch):
+    from safety import server
+    monkeypatch.setattr(config, "PAGE_SCRIPT", "/nonexistent/nope.py")
+    rc, _ = server.run_page_once(config)
+    assert rc in (None, 2)                           # cannot start / interpreter error
+
+
 # ---- coverage guards ---------------------------------------------------------
 def test_radar_coverage_guard():
     assert rd.site_in_coverage(33.75, -101.96) is True         # TTU

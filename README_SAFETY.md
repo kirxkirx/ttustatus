@@ -7,7 +7,7 @@ information plus the recent safety-event log.
 
 ## Architecture (two cooperating processes)
 
-`make_status_page.py` is **ephemeral** (run every 90 s by `run_status_page.sh`), so the
+`make_status_page.py` is **ephemeral** (spawned every 90 s by the daemon), so the
 persistent Alpaca server and the rain poller live in a **separate long-running daemon**,
 `safety_monitor.py`. They share small JSON files:
 
@@ -62,32 +62,15 @@ extra components in `safety/monitor.py`.
    Then run the daemon with `~/safety-venv/bin/python` instead of `/usr/bin/python3`
    (edit that path in `run_safety_monitor.sh` and the systemd unit's `ExecStart`). A plain
    venv suffices — the daemon needs only flask + waitress + stdlib, not the Pi hardware libs.
-3. Set the WU API key (see the next section), then start the daemon via systemd (below).
-   The status page runs from a `@reboot` cron:
+3. Set the WU API key (see the next section), then install the single service:
+   ```bash
+   sudo ~/ttustatus/deploy/install.sh
    ```
-   @reboot /home/kirx/ttustatus/run_status_page.sh >/home/kirx/statuspage.log 2>&1 &
-   ```
-
-### systemd (recommended, for the safety daemon)
-
-```ini
-# /etc/systemd/system/ttu-safety.service
-[Unit]
-Description=TTU Alpaca SafetyMonitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=kirx
-WorkingDirectory=/home/kirx/ttustatus
-EnvironmentFile=/home/kirx/ttustatus.env
-ExecStart=/usr/bin/python3 /home/kirx/ttustatus/safety_monitor.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+   One systemd unit runs everything: the daemon spawns `make_status_page.py` every
+   ~90 s as an isolated subprocess (killed after 30 min if it ever hangs; a page
+   failure is logged and never affects the safety logic). Logs (rotating, via
+   journald): `journalctl -u ttu-safety -f`. Disable the built-in page runner with
+   `TTU_SAFETY_PAGE=0` if you prefer to schedule the page yourself.
 
 ### The WU API key (required, kept out of git)
 
@@ -106,13 +89,10 @@ format: `KEY=value`, no `export`, no quotes). Only the daemon needs it —
 `make_status_page.py` does not use the key. If the key is unset the daemon still runs
 (sun/humidity protection) but rain polling is disabled and the page shows rain "off".
 
-If you use `run_safety_monitor.sh` instead of systemd, load the file before launch by
-adding `set -a; . /home/kirx/ttustatus.env; set +a` above the `exec` line. Quick manual
-test: `TTU_SAFETY_WU_KEY=<key> python3 safety_monitor.py`.
-```bash
-sudo systemctl enable --now ttu-safety
-journalctl -u ttu-safety -f      # watch events live
-```
+After editing `ttustatus.env`, apply it with `sudo systemctl restart ttu-safety`.
+Quick manual test without systemd: `TTU_SAFETY_WU_KEY=<key> python3 safety_monitor.py`
+(the `run_*.sh` scripts remain as manual fallbacks; `run_safety_monitor.sh` sources
+`~/ttustatus.env` itself).
 
 ## Connect from NINA
 

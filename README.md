@@ -58,7 +58,7 @@ launchers.
 
 ```
 make_status_page.py     status-page generator (run every 90 s)
-run_status_page.sh       loop launcher for the status page (via @reboot cron)
+run_status_page.sh       manual fallback loop for the status page (normally not needed)
 safety_monitor.py        Alpaca SafetyMonitor daemon entry point
 run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd)
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
@@ -80,12 +80,17 @@ cp ~/ttustatus/ttustatus.env.example ~/ttustatus.env
 nano ~/ttustatus.env          # set TTU_SAFETY_WU_KEY=<your key>
 chmod 600 ~/ttustatus.env
 
-# 4. status page — @reboot cron (crontab -e):
-#    @reboot /home/kirx/ttustatus/run_status_page.sh >/home/kirx/statuspage.log 2>&1 &
-
-# 5. safety daemon — systemd (see README_SAFETY.md "systemd" for the unit file)
-sudo systemctl enable --now ttu-safety
+# 4. install ONE systemd service — the daemon also runs the status page:
+sudo ~/ttustatus/deploy/install.sh
 ```
+
+That's the whole deployment: **one service**. The safety daemon spawns
+`make_status_page.py` every ~90 s as an isolated subprocess (a page crash or hang is
+logged and killed after 30 min — it can never take the safety logic down). Logs go to
+journald (`journalctl -u ttu-safety -f`) with automatic rotation. A code update needs
+only `sudo systemctl restart ttu-safety`; rerun the installer if the unit file changed.
+(Migrating from the old setup: remove the `@reboot` line from `crontab -e` and
+`pkill -f run_status_page.sh`.)
 
 Then connect NINA to the Alpaca SafetyMonitor (device 0, port 11111). If NINA and the Pi are
 on different subnets, see README_SAFETY.md ("Connecting NINA").

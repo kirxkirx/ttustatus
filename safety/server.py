@@ -11,6 +11,10 @@ Threads:
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -32,6 +36,36 @@ def _fresh_sun(monitor, cfg):
     if not inp or inp["age"] is None or inp["age"] > cfg.INPUTS_STALE_SEC:
         return None
     return inp["sun_alt"]
+
+
+def run_page_once(cfg):
+    """Run make_status_page.py as an isolated subprocess; kill the whole process tree
+    if it hangs. Returns (rc, seconds); rc None = could not start / killed."""
+    start = time.time()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, cfg.PAGE_SCRIPT],
+            cwd=os.path.dirname(cfg.PAGE_SCRIPT) or ".",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=True)          # own process group -> killable as a tree
+    except Exception as e:
+        log.warning("cannot start status page script %s: %s", cfg.PAGE_SCRIPT, e)
+        return None, 0.0
+    try:
+        out, _ = proc.communicate(timeout=cfg.PAGE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.warning("status page run exceeded %ds — killing its process tree",
+                    cfg.PAGE_TIMEOUT)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        proc.wait()
+        return None, time.time() - start
+    if proc.returncode != 0:
+        tail = (out or b"")[-2000:].decode("utf-8", "replace")
+        log.warning("status page run failed (rc=%s):\n%s", proc.returncode, tail)
+    return proc.returncode, time.time() - start
 
 
 def main(argv=None):
@@ -125,6 +159,17 @@ def main(argv=None):
                 log.exception("connectivity probe failed")
             stop.wait(cfg.CONN_PROBE_INTERVAL)
 
+    def page_loop():
+        # One service for everything: the daemon runs the page generator every
+        # PAGE_INTERVAL, back-to-back if a run (night camera stack) takes longer.
+        while not stop.is_set():
+            try:
+                _, elapsed = run_page_once(cfg)
+            except Exception:
+                log.exception("status page runner failed")
+                elapsed = 0.0
+            stop.wait(max(1.0, cfg.PAGE_INTERVAL - elapsed))
+
     threading.Thread(target=evaluator, name="evaluator", daemon=True).start()
     threading.Thread(target=rain_loop, name="rain-poller", daemon=True).start()
     if nws is not None:
@@ -143,6 +188,11 @@ def main(argv=None):
         threading.Thread(target=conn_loop, name="conn-probe", daemon=True).start()
     else:
         log.warning("connectivity watchdog disabled (TTU_SAFETY_CONN=0)")
+    if cfg.PAGE_ENABLED:
+        threading.Thread(target=page_loop, name="page-runner", daemon=True).start()
+        log.info("status page runner: %s every %ds", cfg.PAGE_SCRIPT, cfg.PAGE_INTERVAL)
+    else:
+        log.warning("status page runner disabled (TTU_SAFETY_PAGE=0)")
     discovery.start(cfg.HTTP_PORT)
 
     app = create_app(monitor, cfg)

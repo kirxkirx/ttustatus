@@ -1,0 +1,18 @@
+# TTU Alpaca SafetyMonitor daemon.
+# Template file — installed by deploy/install.sh with the repo path and user filled in.
+[Unit]
+Description=TTU Alpaca SafetyMonitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__REPO__
+# optional secrets/overrides (WU API key, TTU_SAFETY_* vars); '-' = ok if absent
+EnvironmentFile=-/home/__USER__/ttustatus.env
+ExecStart=/usr/bin/python3 __REPO__/safety_monitor.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
