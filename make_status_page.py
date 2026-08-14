@@ -50,6 +50,13 @@ SAFETY_INPUTS_FILE = _SHM + "/safety_inputs.json"
 SAFETY_STATE_FILE = _SHM + "/safety_state.json"
 SAFETY_STATE_STALE_SEC = 300
 
+# The enclosure camera is OPTIONAL and disabled by default (at TTU the Pi + camera are
+# covered to reduce in-dome light pollution, so the camera sees nothing). Enable with
+# TTU_STATUS_CAMERA=1 in ~/ttustatus.env (the daemon passes its environment down to this
+# script). While disabled: no captures, no stacking, no image writes at all.
+CAMERA_ENABLED = os.environ.get("TTU_STATUS_CAMERA", "0").strip().lower() \
+    not in ("", "0", "false", "no")
+
 GPIO_PIN = board.D17
 
 DHT_RETRIES = 4
@@ -1115,6 +1122,10 @@ def take_snapshot(sun_info):
     camera_info["processing_command"] = "N/A"
     camera_info["error"] = None
 
+    if not CAMERA_ENABLED:
+        camera_info["mode"] = "disabled"
+        return False, camera_info
+
     use_stack = False
 
     if sun_info is not None and sun_info.get("available"):
@@ -1888,7 +1899,9 @@ def build_pills_html(best_source, ntp_info, gps_source, camera_ok, wifi_data):
     else:
         parts.append(build_pill_html("No GPS fix", " off"))
 
-    if camera_ok:
+    if camera_ok is None:
+        parts.append(build_pill_html("Camera disabled", " off"))
+    elif camera_ok:
         parts.append(build_pill_html("Enclosure camera OK", ""))
     else:
         parts.append(build_pill_html("Enclosure camera error", " warnc"))
@@ -1973,7 +1986,8 @@ def build_lede_html(t, h, sun_info, best_source, camera_ok,
 
     # "All systems" must actually mean all of them: clock sync, camera, GPS fix, NTP.
     ntp_ok = ntp_info is not None and ntp_info.get("service") == "active"
-    if best_source is not None and camera_ok and gps_source is not None and ntp_ok:
+    if (best_source is not None and camera_ok is not False
+            and gps_source is not None and ntp_ok):
         lead = '<span class="ok">All systems nominal.</span>'
     else:
         lead = '<span class="attn">Attention needed.</span>'
@@ -2324,6 +2338,9 @@ def build_ntp_html(ntp_info, ethernet_data):
 
 
 def build_camera_html(have_image, camera_info):
+    if camera_info is not None and camera_info.get("mode") == "disabled":
+        return ('      <p class="unavail">Camera disabled '
+                '(enable with TTU_STATUS_CAMERA=1 in ttustatus.env).</p>\n')
     image_name = None
     image_url = None
     image_html = None
@@ -2938,9 +2955,12 @@ def write_html(
     source_rows = parse_chrony_sources(chrony)
     best_source = find_best_chrony_source(source_rows)
 
-    camera_ok = bool(have_image)
-    if camera_info is not None and camera_info.get("error") is not None:
-        camera_ok = False
+    if camera_info is not None and camera_info.get("mode") == "disabled":
+        camera_ok = None            # disabled: not an error, excluded from "all systems"
+    else:
+        camera_ok = bool(have_image)
+        if camera_info is not None and camera_info.get("error") is not None:
+            camera_ok = False
 
     night_default = is_night_default(sun_info)
     if night_default:

@@ -4,7 +4,8 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
 
 1. **Status page** (`make_status_page.py`) — regenerates `/var/www/html/status.html` every
    ~90 s from the Pi's sensors: GPS, GPS-disciplined NTP/chrony, enclosure temp/humidity
-   (DHT11), sun altitude/twilight (astropy), and an enclosure camera snapshot.
+   (DHT11), sun altitude/twilight (astropy), and — optionally — an enclosure camera
+   snapshot (disabled by default; `TTU_STATUS_CAMERA=1` re-enables it).
 2. **Alpaca SafetyMonitor** (`safety_monitor.py` + `safety/`) — a small always-on daemon
    that aggregates **sun altitude**, **humidity**, **Weather Underground rain**, the
    **NWS forecast**, **GOES GLM lightning**, **MRMS radar** and an **internet-loss
@@ -45,7 +46,9 @@ CONUS-only, GLM is GOES-East) disable themselves loudly instead of reporting a f
 
 High-frequency transient files (safety inputs/state, page sensor cache) live in
 `/dev/shm` (RAM); the daemon writes its state file only on a decision change or a slow
-heartbeat. **Camera processing also runs on the RAM disk**: the night pipeline's
+heartbeat. **The camera is disabled by default** (`TTU_STATUS_CAMERA=1` in `ttustatus.env`
+re-enables it) — while off there are no captures, no stacking and no image writes at
+all. When enabled, **camera processing runs on the RAM disk**: the night pipeline's
 DNG/TIFF intermediates (GBs per cycle) are created in `/dev/shm`, converted and
 averaged in batches with deletion as it goes, and ImageMagick's pixel-cache spill is
 pointed there too — if the RAM disk is too small for the RAW pipeline, capture

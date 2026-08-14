@@ -117,6 +117,27 @@ def test_radar_section_renders():
     assert msp.build_radar_html({"components": {"radar": {"enabled": False}}}) == ""
 
 
+def test_camera_disabled_no_capture_no_error_state(monkeypatch):
+    # camera off (default): no subprocess may run, and "disabled" must not read as an error
+    monkeypatch.setattr(msp, "CAMERA_ENABLED", False)
+
+    def boom(*a, **k):
+        raise AssertionError("camera subprocess ran while disabled")
+    monkeypatch.setattr(msp, "run_subprocess", boom)
+    have_image, info = msp.take_snapshot(None)
+    assert have_image is False and info["mode"] == "disabled" and info["error"] is None
+    # section shows the disabled note, not "Snapshot unavailable"
+    sec = msp.build_camera_html(have_image, info)
+    assert "Camera disabled" in sec and "TTU_STATUS_CAMERA=1" in sec
+    # pills: neutral "Camera disabled" (off dot), never the error pill
+    pills = msp.build_pills_html(None, None, None, None, None)
+    assert "Camera disabled" in pills and "camera error" not in pills
+    # a disabled camera must not block "All systems nominal"
+    lede = msp.build_lede_html(20.0, 40.0, None, {"name": "PPS"}, None,
+                               gps_source="live", ntp_info={"service": "active"})
+    assert "All systems nominal" in lede
+
+
 def test_paused_tiles_never_claim_no_rain_or_stale_distance():
     # Daytime pause: WU must NOT say "no rain" and GLM must NOT show a stale distance —
     # both must display the no-data state instead (grey dot).
