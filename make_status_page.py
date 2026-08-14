@@ -1278,10 +1278,8 @@ def get_wifi_status(cache):
 
         time.sleep(WIFI_DELAY)
 
-    cached = get_cached_section(cache, "wifi", CACHE_MAX_AGE_WIFI)
-    if cached is not None:
-        return cached.get("interface"), cached.get("ssid"), cached.get("ip")
-
+    # No interface holds an IP right now. Unlike GPS (a static position), connectivity is
+    # inherently a LIVE state — showing a cached SSID/IP as "connected" would be false.
     return None
 
 
@@ -1908,7 +1906,8 @@ def build_pills_html(best_source, ntp_info, gps_source, camera_ok, wifi_data):
     return '  <div class="pills">\n' + "".join(parts) + '  </div>\n'
 
 
-def build_lede_html(t, h, sun_info, best_source, camera_ok):
+def build_lede_html(t, h, sun_info, best_source, camera_ok,
+                    dht_age=None, gps_source=None, ntp_info=None):
     sentences = []
     lead = None
     alt = None
@@ -1936,9 +1935,11 @@ def build_lede_html(t, h, sun_info, best_source, camera_ok):
         sentences.append("The station clock is not currently synchronized to any time source.")
 
     if t is not None and h is not None:
+        age_note = (" (sensor reading %d min old)" % (dht_age // 60)
+                    if dht_age is not None and dht_age > 150 else "")
         sentences.append(
-            "Enclosure reads %.1f °C (%.0f °F) at %d %% humidity."
-            % (t, celsius_to_fahrenheit(t), h)
+            "Enclosure reads %.1f °C (%.0f °F) at %d %% humidity.%s"
+            % (t, celsius_to_fahrenheit(t), h, age_note)
         )
     elif t is not None:
         sentences.append(
@@ -1970,7 +1971,9 @@ def build_lede_html(t, h, sun_info, best_source, camera_ok):
                 )
             )
 
-    if best_source is not None and camera_ok:
+    # "All systems" must actually mean all of them: clock sync, camera, GPS fix, NTP.
+    ntp_ok = ntp_info is not None and ntp_info.get("service") == "active"
+    if best_source is not None and camera_ok and gps_source is not None and ntp_ok:
         lead = '<span class="ok">All systems nominal.</span>'
     else:
         lead = '<span class="attn">Attention needed.</span>'
@@ -1978,7 +1981,7 @@ def build_lede_html(t, h, sun_info, best_source, camera_ok):
     return '  <p class="lede">%s %s</p>\n' % (lead, html.escape(" ".join(sentences)))
 
 
-def build_tiles_html(t, h, sun_info, tz_str):
+def build_tiles_html(t, h, sun_info, tz_str, dht_age=None):
     temp_html = None
     hum_html = None
     sun_html = None
@@ -2022,16 +2025,22 @@ def build_tiles_html(t, h, sun_info, tz_str):
         dawn_html = '<div class="v mono">%.0f<span class="u">min</span></div>' % until_civil_dawn
         dawn_sub = "civil dawn %s %s" % (format_astropy_hms(next_civil_dawn), tz_str)
 
+    # an old cached sensor reading must be labelled as such, not shown as current
+    if dht_age is not None and dht_age > 150:
+        dht_sub = "enclosure &middot; cached %d min ago" % (dht_age // 60)
+    else:
+        dht_sub = "enclosure"
+
     return """  <div class="tiles">
     <div class="tile">
       <div class="k">Temperature</div>
       %s
-      <div class="s">enclosure</div>
+      <div class="s">%s</div>
     </div>
     <div class="tile">
       <div class="k">Humidity</div>
       %s
-      <div class="s">enclosure</div>
+      <div class="s">%s</div>
     </div>
     <div class="tile">
       <div class="k">Sun altitude</div>
@@ -2046,7 +2055,9 @@ def build_tiles_html(t, h, sun_info, tz_str):
   </div>
 """ % (
         temp_html,
+        dht_sub,
         hum_html,
+        dht_sub,
         sun_html,
         html.escape(sun_sub),
         dawn_html,
@@ -2346,8 +2357,15 @@ def build_camera_html(have_image, camera_info):
     else:
         error_caption = "error: %s" % error
 
-    caption = "%s — %s, %s." % (
-        time.strftime("%H:%M:%S %Z"),
+    # honest timestamp: when the snapshot was actually WRITTEN (capture end), not when
+    # this page happened to be rendered — at night these can differ by many minutes
+    try:
+        cap_time = time.strftime("%H:%M:%S %Z",
+                                 time.localtime(os.path.getmtime(IMAGE_FILE)))
+    except Exception:
+        cap_time = "time unknown"
+    caption = "captured %s — %s, %s." % (
+        cap_time,
         mode_caption,
         error_caption
     )
@@ -2515,13 +2533,19 @@ def read_safety_state():
         return None
 
 
-def safety_dot_html(safe):
-    color = "var(--good)" if safe else "#b42318"
+def safety_dot_html(safe, unknown=False):
+    # Three honest states: green = confirmed OK by current data, red = unsafe,
+    # grey = NO current data (paused/off/unreachable) — never green, which would
+    # falsely suggest the condition was checked and found clear.
+    if unknown:
+        color = "var(--faint, #8b959c)"
+    else:
+        color = "var(--good)" if safe else "#b42318"
     return ('<span class="dot" style="background:%s;display:inline-block;'
             'margin-right:6px;vertical-align:middle"></span>' % color)
 
 
-def build_safety_tiles_html(comp):
+def build_safety_tiles_html(comp, state_stale=False):
     sun = comp.get("sun", {})
     hum = comp.get("humidity", {})
     rain = comp.get("rain", {})
@@ -2531,8 +2555,12 @@ def build_safety_tiles_html(comp):
         sun_v = '<div class="v mono">N/A</div>'
     else:
         sun_v = '<div class="v mono">%+.1f<span class="u">°</span></div>' % sun_val
-    if sun.get("safe"):
+    if sun.get("stale"):
+        sun_s = safety_dot_html(False, unknown=True) + "stale inputs"
+    elif sun.get("safe"):
         sun_s = safety_dot_html(True) + "below horizon"
+    elif sun_val is None:
+        sun_s = safety_dot_html(False, unknown=True) + "no data &mdash; failing safe"
     else:
         sun_s = safety_dot_html(False) + ("unsafe &gt; %g°" % sun.get("threshold_deg", 0))
 
@@ -2541,25 +2569,39 @@ def build_safety_tiles_html(comp):
         hum_v = '<div class="v mono">N/A</div>'
     else:
         hum_v = '<div class="v mono">%.0f<span class="u">%%</span></div>' % hum_val
-    if hum.get("safe"):
+    if hum.get("stale"):
+        hum_s = safety_dot_html(False, unknown=True) + "stale inputs"
+    elif hum.get("safe"):
         hum_s = safety_dot_html(True) + "ok"
-    else:
+    elif hum_val is None:
+        # no measurement -> we cannot claim a threshold breach, only that we fail safe
+        hum_s = safety_dot_html(False, unknown=True) + "no data &mdash; failing safe"
+    elif hum_val > hum.get("threshold_pct", 95):
         hum_s = safety_dot_html(False) + ("unsafe &gt; %g%%" % hum.get("threshold_pct", 95))
+    else:
+        # in the hysteresis hold band: the value itself is below the trip threshold
+        hum_s = safety_dot_html(False) + "holding (hysteresis, clears &lt; 93%)"
 
+    # Truthfulness rule: the value may only claim "no rain" when CURRENT data backs it.
+    # Paused / no reporting stations => the value IS the no-data state (grey dot).
     if not rain.get("enabled", True):
         rain_v = '<div class="v mono">off</div>'
-        rain_s = safety_dot_html(False) + "disabled &mdash; set WU_API_KEY"
+        rain_s = safety_dot_html(False, unknown=True) + "disabled &mdash; set WU_API_KEY"
     elif rain.get("latched"):
         rain_v = ('<div class="v mono">%d<span class="u">min</span></div>'
                   % (rain.get("seconds_remaining", 0) // 60))
         rain_s = safety_dot_html(False) + "rain latch active"
+    elif not rain.get("polling_active"):
+        rain_v = '<div class="v mono">paused</div>'
+        rain_s = safety_dot_html(True, unknown=True) + "not polling (daytime)"
+    elif rain.get("stations_live", 0) == 0:
+        rain_v = '<div class="v mono">no&nbsp;data</div>'
+        rain_s = safety_dot_html(True, unknown=True) + ("%d/%d stations reporting" % (
+            rain.get("stations_live", 0), rain.get("stations_total", 0)))
     else:
         rain_v = '<div class="v mono">no&nbsp;rain</div>'
-        if rain.get("polling_active"):
-            rain_s = safety_dot_html(True) + ("polling %d/%d stations" % (
-                rain.get("stations_live", 0), rain.get("stations_total", 0)))
-        else:
-            rain_s = safety_dot_html(True) + "polling paused (day)"
+        rain_s = safety_dot_html(True) + ("polling %d/%d stations" % (
+            rain.get("stations_live", 0), rain.get("stations_total", 0)))
 
     nws = comp.get("nws") or {}
 
@@ -2572,7 +2614,7 @@ def build_safety_tiles_html(comp):
 
     if not nws.get("available"):
         nws_v = '<div class="v mono" style="font-size:15px">N/A</div>'
-        nws_s = safety_dot_html(True) + "forecast unavailable"
+        nws_s = safety_dot_html(True, unknown=True) + "forecast unavailable"
     else:
         nws_v = ('<div class="v mono" style="font-size:13px;line-height:1.4">'
                  'now %s<br>nxt %s</div>' % (_cpt(nws.get("now_hour")),
@@ -2584,29 +2626,41 @@ def build_safety_tiles_html(comp):
     glm_tk = glm.get("trigger_km", 50)
     if not glm.get("enabled", False):
         glm_v = '<div class="v mono">off</div>'
-        glm_s = safety_dot_html(True) + "GLM off (deps)"
+        glm_s = safety_dot_html(True, unknown=True) + "GLM off (deps)"
     elif glm.get("latched"):
         glm_v = ('<div class="v mono">%d<span class="u">min</span></div>'
                  % (glm.get("seconds_remaining", 0) // 60))
         glm_s = safety_dot_html(False) + ("STRIKE &le;%g km" % glm_tk)
+    elif not glm.get("polling_active"):
+        # a stale nearest-flash distance would look like current data — don't show it
+        glm_v = '<div class="v mono">paused</div>'
+        glm_s = safety_dot_html(True, unknown=True) + "not polling (daytime)"
+    elif not glm.get("available"):
+        glm_v = '<div class="v mono">no&nbsp;data</div>'
+        glm_s = safety_dot_html(True, unknown=True) + "no successful poll yet"
     else:
         nk = glm.get("nearest_km")
         glm_v = ('<div class="v mono">%s</div>'
                  % ("&mdash;" if nk is None else '%.0f<span class="u">km</span>' % nk))
-        if glm.get("polling_active"):
-            glm_s = safety_dot_html(True) + ("no strike &le;%g km" % glm_tk)
-        else:
-            glm_s = safety_dot_html(True) + "polling paused (day)"
+        glm_s = safety_dot_html(True) + ("no strike &le;%g km" % glm_tk)
 
     # Connectivity has no tile — it's a quiet watchdog; when the internet is down long
     # enough it forces UNSAFE and shows up as a reason, so no always-on "online" blob here.
     tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>\n    </div>\n')
-    tiles = (tile % ("Sun altitude", sun_v, sun_s)
-             + tile % ("Humidity", hum_v, hum_s)
-             + tile % ("Rain (WU)", rain_v, rain_s)
-             + tile % ("NWS (now/next)", nws_v, nws_s)
-             + tile % ("Lightning (GLM)", glm_v, glm_s))
+    items = [("Sun altitude", sun_v, sun_s), ("Humidity", hum_v, hum_s),
+             ("Rain (WU)", rain_v, rain_s), ("NWS (now/next)", nws_v, nws_s),
+             ("Lightning (GLM)", glm_v, glm_s)]
+    if state_stale:
+        # The whole safety state is frozen (daemon down): none of the per-tile verdicts
+        # are current — grey-out every claim (mirrors the radar section's guard; the
+        # STALE banner alone must not leave green "no rain" behind). Numeric last values
+        # stay, labelled; but a verdict WORD like "no rain" is itself a claim and gets
+        # blanked — there is no current data to back it.
+        stale_sub = safety_dot_html(False, unknown=True) + "state stale &mdash; last known"
+        blank = '<div class="v mono">&mdash;</div>'
+        items = [(k, (blank if k == "Rain (WU)" else v), stale_sub) for k, v, _ in items]
+    tiles = "".join(tile % it for it in items)
     # auto-fit: 5-across on the ~1020px desktop wrap, and wraps to 3/2/1 columns on
     # narrower/phone screens instead of shrinking into an unreadable single row.
     return ('  <div class="tiles" '
@@ -2692,7 +2746,7 @@ def build_safety_html(state):
 
     tiles_head = ('    <h3 style="margin:14px 0 8px;font-size:14px">'
                   'Inputs it is using</h3>\n')
-    tiles = build_safety_tiles_html(comp)
+    tiles = build_safety_tiles_html(comp, state_stale=stale)
 
     events = state.get("events_tail") or []
     ev_text = "".join("%s\n" % html.escape(e) for e in events) or "(none yet)"
@@ -2723,7 +2777,9 @@ def build_radar_html(state):
 
     if state_stale:
         verdict = safety_dot_html(False) + "safety state stale &mdash; radar reading unknown"
-    elif rad.get("in_ring"):
+    elif rad.get("in_ring") and rad.get("available"):
+        # in_ring is only exported while fresh, but require available too (belt-and-braces
+        # against a state file written by an older daemon)
         near = rad.get("nearest_km")
         verdict = safety_dot_html(False) + ("<b>RAIN within %g km</b>%s" % (
             rk, "" if near is None else " &mdash; nearest %g km" % near))
@@ -2733,7 +2789,7 @@ def build_radar_html(state):
     elif rad.get("available"):
         verdict = safety_dot_html(True) + ("no rain within %g km" % rk)
     else:
-        verdict = safety_dot_html(True) + "no fresh frame (radar unreachable?)"
+        verdict = safety_dot_html(True, unknown=True) + "no fresh frame (radar unreachable?)"
 
     # The <img> uses a relative basename, which only resolves if the thumbnail lives in the
     # same web directory as status.html. There are up to two maps — a dark (night) and a
@@ -2795,8 +2851,11 @@ def build_radar_html(state):
 def build_forecast_html(state):
     nws = ((state or {}).get("components", {}) or {}).get("nws") or {}
     hours = nws.get("hours") or []
-    if not hours:
-        return ""   # forecast unavailable -> omit the section entirely
+    if not hours or not nws.get("available"):
+        return ""   # no current forecast -> omit rather than show rejected/old data
+    ts = (state or {}).get("ts")
+    if ts is None or (time.time() - ts) > SAFETY_STATE_STALE_SEC:
+        return ""   # frozen state (daemon down) -> the table would be stale too
 
     def pct(v):
         return "?" if v is None else "%.0f%%" % v
@@ -2859,7 +2918,8 @@ def write_html(
     sun_info,
     have_image,
     camera_info,
-    ntp_info
+    ntp_info,
+    dht_age=None
 ):
     source_rows = None
     best_source = None
@@ -2939,8 +2999,10 @@ def write_html(
     # Section 2: the observatory clock, sensors, and NTP service.
     parts.append('  <h2 style="margin:0 0 6px">Observatory clock, sensors &amp; NTP</h2>\n')
     parts.append(build_pills_html(best_source, ntp_info, gps_source, camera_ok, wifi_data))
-    parts.append(build_lede_html(t, h, sun_info, best_source, camera_ok))
-    parts.append(build_tiles_html(t, h, sun_info, tz_str))
+    parts.append(build_lede_html(t, h, sun_info, best_source, camera_ok,
+                                 dht_age=dht_age, gps_source=gps_source,
+                                 ntp_info=ntp_info))
+    parts.append(build_tiles_html(t, h, sun_info, tz_str, dht_age=dht_age))
 
     parts.append('  <div class="grid">\n')
     parts.append('    <div>\n')
@@ -3028,7 +3090,8 @@ def main():
         sun_info,
         have_image,
         camera_info,
-        ntp_info
+        ntp_info,
+        dht_age=h_age
     )
 
 

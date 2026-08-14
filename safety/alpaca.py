@@ -159,35 +159,51 @@ def _setup_html(monitor, cfg) -> str:
     comp = st["components"]
     rows = []
 
-    def row(name, value, is_safe_flag):
-        dot = "#1a7f37" if is_safe_flag else "#b42318"
+    def row(name, value, is_safe_flag, unknown=False):
+        # grey = no current data; green strictly means "checked and clear"
+        dot = "#8b959c" if unknown else ("#1a7f37" if is_safe_flag else "#b42318")
         return (f'<tr><td>{html.escape(name)}</td><td>{html.escape(str(value))}</td>'
                 f'<td><span style="color:{dot}">&#9679;</span></td></tr>')
 
     sun = comp["sun"]
-    rows.append(row("Sun altitude",
-                    "unknown" if sun["value_deg"] is None else f'{sun["value_deg"]:.1f}° '
-                    f'(unsafe > {sun["threshold_deg"]:g}°)', sun["safe"]))
+    if sun.get("stale"):
+        rows.append(row("Sun altitude", "unknown (inputs stale)", False, unknown=True))
+    else:
+        rows.append(row("Sun altitude",
+                        "unknown" if sun["value_deg"] is None else f'{sun["value_deg"]:.1f}° '
+                        f'(unsafe > {sun["threshold_deg"]:g}°)', sun["safe"],
+                        unknown=sun["value_deg"] is None))
     hum = comp["humidity"]
-    rows.append(row("Humidity",
-                    "unknown" if hum["value_pct"] is None else f'{hum["value_pct"]:.0f}% '
-                    f'(unsafe > {hum["threshold_pct"]:g}%)', hum["safe"]))
+    if hum.get("stale"):
+        rows.append(row("Humidity", "unknown (inputs stale)", False, unknown=True))
+    else:
+        rows.append(row("Humidity",
+                        "unknown" if hum["value_pct"] is None else f'{hum["value_pct"]:.0f}% '
+                        f'(unsafe > {hum["threshold_pct"]:g}%)', hum["safe"],
+                        unknown=hum["value_pct"] is None))
     rain = comp["rain"]
+    rain_unknown = False
     if not rain.get("enabled", True):
-        rv = "disabled (no WU key)"
+        rv, rain_unknown = "disabled (no WU key)", True
     elif rain["latched"]:
         rv = f'RAIN — latched, {rain["seconds_remaining"] // 60} min remaining'
-    elif rain["polling_active"]:
-        rv = f'no rain, polling {rain["stations_live"]}/{rain["stations_total"]} stations'
+    elif not rain["polling_active"]:
+        rv, rain_unknown = "polling paused (daytime) — no current data", True
+    elif rain.get("stations_live", 0) == 0:
+        rv = (f'no station data ({rain["stations_live"]}/{rain["stations_total"]} '
+              f'reporting)')
+        rain_unknown = True
     else:
-        rv = "no rain, polling paused (daytime)"
-    rows.append(row("Rain (WU)", rv, rain["safe"]))
+        rv = f'no rain, polling {rain["stations_live"]}/{rain["stations_total"]} stations'
+    rows.append(row("Rain (WU)", rv, rain["safe"], unknown=rain_unknown))
 
     nws = comp.get("nws")
     if nws:
         if not nws.get("available"):
             nv = "unavailable / stale (not gating)"
+            nws_unknown = True
         else:
+            nws_unknown = False
             th = nws.get("thresholds", {})
 
             def _fc(h):
@@ -198,42 +214,52 @@ def _setup_html(monitor, cfg) -> str:
                 _fc(nws.get("now_hour")), _fc(nws.get("next_hour")),
                 th.get("cloud_pct", 70), th.get("precip_prob_pct", 15),
                 th.get("thunder_prob_pct", 10)))
-        rows.append(row("NWS forecast (this/next hr)", nv, nws.get("safe", True)))
+        rows.append(row("NWS forecast (this/next hr)", nv, nws.get("safe", True),
+                        unknown=nws_unknown))
 
     glm = comp.get("glm")
     if glm:
         tk = glm.get("trigger_km", 50)
+        glm_unknown = False
         if not glm.get("enabled"):
-            gv = "disabled (numpy/netCDF4 not installed)"
+            gv, glm_unknown = "disabled (numpy/netCDF4 not installed)", True
         elif glm.get("latched"):
             gv = "STRIKE ≤%g km — latched, %d min remaining" % (
                 tk, glm.get("seconds_remaining", 0) // 60)
+        elif not glm.get("polling_active"):
+            gv, glm_unknown = "polling paused (daytime) — no current data", True
+        elif not glm.get("available"):
+            gv, glm_unknown = "no fresh data (no recent successful poll)", True
         else:
             nk = glm.get("nearest_km")
-            near = "no strikes seen" if nk is None else "nearest %s km %s" % (
+            gv = "no strikes seen" if nk is None else "no strike in ring; nearest %s km %s" % (
                 nk, glm.get("nearest_bearing") or "")
-            state_txt = "polling" if glm.get("polling_active") else "polling paused (daytime)"
-            gv = "%s; %s" % (near, state_txt)
-        rows.append(row("Lightning (GLM ≤%g km)" % tk, gv, glm.get("safe", True)))
+        rows.append(row("Lightning (GLM ≤%g km)" % tk, gv, glm.get("safe", True),
+                        unknown=glm_unknown))
 
     rad = comp.get("radar")
     if rad:
         rk = rad.get("trigger_km", 50)
+        rad_unknown = False
         if not rad.get("enabled"):
-            rv = "disabled (Pillow not installed)"
+            rv, rad_unknown = "disabled (Pillow not installed)", True
         elif not rad.get("available"):
-            rv = "no fresh frame (radar unreachable?)"
+            rv, rad_unknown = "no fresh frame (radar unreachable?)", True
         elif rad.get("in_ring"):
             near = rad.get("nearest_km")
             rv = "RAIN within %g km%s" % (rk, "" if near is None else " (nearest %g km)" % near)
         else:
             rv = "no rain within %g km" % rk
-        rows.append(row("Radar (MRMS ≤%g km)" % rk, rv, rad.get("safe", True)))
+        rows.append(row("Radar (MRMS ≤%g km)" % rk, rv, rad.get("safe", True),
+                        unknown=rad_unknown))
 
     conn = comp.get("connectivity")
     if conn:
-        if not conn.get("probed"):
-            cv = "online (not yet probed)"
+        conn_unknown = False
+        if not conn.get("enabled", True):
+            cv, conn_unknown = "watchdog disabled", True
+        elif not conn.get("probed"):
+            cv, conn_unknown = "not yet probed — no data", True
         elif conn.get("online"):
             cv = "online"
         elif conn.get("safe"):
@@ -241,7 +267,7 @@ def _setup_html(monitor, cfg) -> str:
                 conn.get("offline_min", 0), conn.get("threshold_sec", 3600) // 60)
         else:
             cv = "OFFLINE %d min — no internet, failing safe" % conn.get("offline_min", 0)
-        rows.append(row("Internet", cv, conn.get("safe", True)))
+        rows.append(row("Internet", cv, conn.get("safe", True), unknown=conn_unknown))
 
     reasons = ""
     if st["reasons"]:

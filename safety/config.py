@@ -64,10 +64,21 @@ def round_coords(lat: float, lon: float) -> tuple:
     return (round(lat, GEOCODE_ROUND_DECIMALS), round(lon, GEOCODE_ROUND_DECIMALS))
 
 
-GEOCODE_FROM_ENV = "TTU_SAFETY_LAT" in os.environ or "TTU_SAFETY_LON" in os.environ
+_LAT_SET = "TTU_SAFETY_LAT" in os.environ
+_LON_SET = "TTU_SAFETY_LON" in os.environ
+GEOCODE_FROM_ENV = _LAT_SET or _LON_SET
 GEOCODE = round_coords(_env_float("TTU_SAFETY_LAT", 33.7483333),
                        _env_float("TTU_SAFETY_LON", -101.9584001))   # TTU observatory
-GEOCODE_SOURCE = "env" if GEOCODE_FROM_ENV else "built-in default (TTU)"
+if _LAT_SET and _LON_SET:
+    GEOCODE_SOURCE = "env"
+elif GEOCODE_FROM_ENV:
+    # exactly one of the pair set: the other half silently came from the TTU default —
+    # say so, loudly (the label is shown on /setup, the warning at startup)
+    GEOCODE_SOURCE = "env (INCOMPLETE — other coordinate from built-in default!)"
+    CONFIG_WARNINGS.append("only one of TTU_SAFETY_LAT/TTU_SAFETY_LON is set — "
+                           "the other comes from the built-in TTU default")
+else:
+    GEOCODE_SOURCE = "built-in default (TTU)"
 GEOCODE_MISMATCH_KM = _env_float("TTU_SAFETY_GEO_MISMATCH_KM", 0.1)  # warn beyond ~100 m
 WU_MAX_STATION_KM = _env_float("TTU_SAFETY_WU_MAX_KM", 60.0)  # drop 'nearest' beyond this
 WU_POLL_INTERVAL = _env_int("TTU_SAFETY_POLL_INTERVAL", 600)  # s between WU polls
@@ -116,6 +127,7 @@ GLM_WINDOW_MIN = _env_int("TTU_SAFETY_GLM_WINDOW_MIN", 5)             # look-bac
 GLM_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_GLM_SUN_BELOW", 5.0)  # night gate (like WU)
 GLM_LATCH_FILE = _env_str("TTU_SAFETY_GLM_LATCH_FILE",
                           os.path.expanduser("~/safety_glm_latch.json"))
+GLM_STALE_AFTER_SEC = _env_int("TTU_SAFETY_GLM_STALE_SEC", 900)  # older poll => no data
 
 # --- MRMS radar (rain within a radius) --------------------------------------
 # Every RADAR_POLL_INTERVAL (DAY AND NIGHT — free data) fetch the latest MRMS composite

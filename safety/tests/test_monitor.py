@@ -296,7 +296,7 @@ def test_no_conn_watch_is_safe(env, write_inputs):
     m = SafetyMonitor(env["cfg"], env["log"], env["poller"])   # conn=None
     st = m.evaluate()
     assert st["is_safe"] is True
-    assert st["components"]["connectivity"]["online"] is True
+    assert st["components"]["connectivity"]["online"] is None   # honest: never probed
 
 
 def test_env_float_rejects_nonfinite(monkeypatch):

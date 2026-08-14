@@ -82,7 +82,7 @@ def test_nws_forecast_section_and_tile_render():
     assert "no&nbsp;rain" in tiles                     # rain wording fixed
     assert "Lightning (GLM" in tiles                   # GLM tile present (off by default here)
     assert "Internet" not in tiles                     # connectivity has no always-on tile
-    fc = msp.build_forecast_html({"components": {"nws": nws}})
+    fc = msp.build_forecast_html({"ts": time.time(), "components": {"nws": nws}})
     assert "12-hour forecast" in fc and "Mon 00:00" in fc and "NWS" in fc
     assert "mph" in fc                                 # wind column present
     # no forecast data -> section omitted, no crash
@@ -115,6 +115,27 @@ def test_radar_section_renders():
     assert "stale" in msp.build_radar_html(st3) and "no rain within 50" not in msp.build_radar_html(st3)
     # disabled -> section omitted
     assert msp.build_radar_html({"components": {"radar": {"enabled": False}}}) == ""
+
+
+def test_paused_tiles_never_claim_no_rain_or_stale_distance():
+    # Daytime pause: WU must NOT say "no rain" and GLM must NOT show a stale distance —
+    # both must display the no-data state instead (grey dot).
+    comp = {"sun": {"value_deg": 41.5, "threshold_deg": 0.0, "safe": False},
+            "humidity": {"value_pct": 40.0, "threshold_pct": 95.0, "safe": True},
+            "rain": {"safe": True, "enabled": True, "latched": False,
+                     "polling_active": False, "stations_live": 0, "stations_total": 0},
+            "nws": {"available": False},
+            "glm": {"enabled": True, "available": True, "latched": False,
+                    "polling_active": False, "nearest_km": 158.0, "trigger_km": 50,
+                    "safe": True}}
+    tiles = msp.build_safety_tiles_html(comp)
+    assert "no&nbsp;rain" not in tiles           # the misleading claim is gone
+    assert "paused" in tiles and "not polling (daytime)" in tiles
+    assert "158" not in tiles                    # stale GLM distance hidden while paused
+    # polling but zero stations reporting -> "no data", not "no rain"
+    comp["rain"].update(polling_active=True, stations_live=0, stations_total=10)
+    tiles2 = msp.build_safety_tiles_html(comp)
+    assert "no&nbsp;data" in tiles2 and "no&nbsp;rain" not in tiles2
 
 
 def test_glm_tile_latched_render():

@@ -282,13 +282,18 @@ class GlmLightningPoller:
             res = self._last_result or {}
             polling_active = (deps_available() and sun_alt is not None
                               and sun_alt < self.cfg.GLM_POLL_SUN_BELOW_DEG)
+            # observation fields are only "current" while the last poll is recent —
+            # last night's nearest-flash must not be presented as today's data
+            fresh = (self._last_poll_ts is not None
+                     and (now - self._last_poll_ts) <= self.cfg.GLM_STALE_AFTER_SEC)
             return {
                 "safe": not latched, "enabled": deps_available(),
-                "available": deps_available() and bool(res.get("ok")),
+                "available": deps_available() and bool(res.get("ok")) and fresh,
                 "latched": latched, "latched_until": self._latch_until,
                 "seconds_remaining": remaining, "last_flash_ts": self._last_flash_ts,
-                "in_ring": bool(res.get("in_ring")),
-                "nearest_km": self._nearest_km, "nearest_bearing": self._nearest_bearing,
+                "in_ring": bool(res.get("in_ring")) and fresh,
+                "nearest_km": self._nearest_km if fresh else None,
+                "nearest_bearing": self._nearest_bearing if fresh else None,
                 "polling_active": polling_active, "last_poll_ts": self._last_poll_ts,
                 "granules_scanned": res.get("granules_scanned", 0),
                 "trigger_km": self.cfg.GLM_TRIGGER_KM,

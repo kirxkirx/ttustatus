@@ -467,13 +467,15 @@ class RadarPoller:
             return {
                 # Unsafe on a fresh in-ring frame, OR while the blind-gap latch holds. A stale
                 # frame with no recent detection is "unknown" (available False), no veto.
+                # Observation fields are exported ONLY while fresh — a stale in_ring/nearest
+                # must never be rendered as a current observation.
                 "safe": not unsafe,
                 "latched": bool(latched and not live_unsafe),
                 "enabled": deps_available(),
                 "available": available,
-                "in_ring": self._in_ring,
-                "nearest_km": self._nearest_km,
-                "pixels": self._count,
+                "in_ring": bool(fresh and self._in_ring),
+                "nearest_km": self._nearest_km if fresh else None,
+                "pixels": self._count if fresh else 0,
                 "frame_utc": self._frame_utc,
                 "age_s": round(now - self._last_ok_ts) if self._last_ok_ts else None,
                 "trigger_km": self.cfg.RADAR_TRIGGER_KM,

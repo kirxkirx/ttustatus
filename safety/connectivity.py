@@ -69,7 +69,9 @@ class ConnectivityWatch:
         offline_too_long = offline_sec > self.cfg.CONN_OFFLINE_UNSAFE_SEC
         return {
             "safe": not offline_too_long,
-            "online": online,
+            "enabled": True,
+            # before the first probe we have NO data — export None, not a claimed "online"
+            "online": online if probed else None,
             "offline_sec": round(offline_sec),
             "offline_min": round(offline_sec / 60),
             "threshold_sec": self.cfg.CONN_OFFLINE_UNSAFE_SEC,
@@ -79,9 +81,9 @@ class ConnectivityWatch:
 
 
 def unavailable_component(cfg):
-    """When the watchdog is disabled — never vetoes."""
+    """When the watchdog is disabled — never vetoes, and claims nothing."""
     return {
-        "safe": True, "online": True, "offline_sec": 0, "offline_min": 0,
+        "safe": True, "enabled": False, "online": None, "offline_sec": 0, "offline_min": 0,
         "threshold_sec": cfg.CONN_OFFLINE_UNSAFE_SEC, "probed": False,
         "source": "internet reachability probe (disabled)",
     }
