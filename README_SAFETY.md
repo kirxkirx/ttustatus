@@ -114,7 +114,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_HTTP_PORT` | `11111` | Alpaca port |
 | `TTU_SAFETY_HTTP_HOST` | `0.0.0.0` | bind address (LAN) |
 | `TTU_SAFETY_POLL_INTERVAL` | `600` | seconds between WU polls (night only) |
-| `TTU_SAFETY_RAIN_LATCH_HOURS` | `3.0` | how long UNSAFE persists after rain |
+| `TTU_SAFETY_RAIN_LATCH_HOURS` | `1.0` | freeze time: how long UNSAFE persists after the last rain |
 | `TTU_SAFETY_INPUTS_STALE_SEC` | `600` | older inputs → fail-safe UNSAFE |
 | `TTU_SAFETY_WU_KEY` | **(required)** | Weather Underground PWS API key — set via env, never commit (see above) |
 | `TTU_SAFETY_LAT` / `_LON` | (adopted from GPS) | site coordinates; unset ⇒ the daemon adopts the status page's GPS fix once at startup (rounded to ~100 m). All derived values (NWS grid, WU stations, radar/GLM rings, cached tiles) follow them |
