@@ -64,14 +64,36 @@ def test_latch_holds_veto_during_blind_gap(monkeypatch):
     assert c["available"] is False and c["safe"] is False and c["latched"] is True
 
 
-def test_latch_cancelled_by_fresh_clear_frame(monkeypatch):
-    # a fresh poll showing the ring clear cancels the latch immediately (keeps live feel)
+def test_freeze_survives_a_fresh_clear_frame(monkeypatch):
+    # POST-RAIN FREEZE: rain leaving the ring does NOT reopen the dome — the veto holds
+    # for RADAR_LATCH_SEC after the last in-ring detection even with clear frames coming in.
     p = _poller(monkeypatch)
     now = 1000.0
     p._in_ring = False
-    p._last_rain_ts = now - 60
-    p._last_ok_ts = now                # fresh & clear
-    assert p.component(-10.0, now)["safe"] is True
+    p._last_rain_ts = now - 60          # rain a minute ago
+    p._last_ok_ts = now                 # fresh & clear right now
+    c = p.component(-10.0, now)
+    assert c["safe"] is False and c["latched"] is True
+    assert c["available"] is True       # the frame itself is current...
+    assert c["in_ring"] is False        # ... and honestly reports a clear ring
+    # the countdown is exported so the page can say how long is left
+    assert 0 < c["seconds_remaining"] <= config.RADAR_LATCH_SEC
+    assert c["freeze_sec"] == config.RADAR_LATCH_SEC
+
+
+def test_freeze_clears_when_the_window_elapses(monkeypatch):
+    p = _poller(monkeypatch)
+    now = 1000.0
+    p._in_ring = False
+    p._last_rain_ts = now - (config.RADAR_LATCH_SEC + 1)
+    p._last_ok_ts = now
+    c = p.component(-10.0, now)
+    assert c["safe"] is True and c["latched"] is False and c["seconds_remaining"] == 0
+
+
+def test_freeze_is_thirty_minutes():
+    # the operator-chosen value; a stray edit must not pass unnoticed
+    assert config.RADAR_LATCH_SEC == 1800
 
 
 def test_latch_expires_bounded(monkeypatch):

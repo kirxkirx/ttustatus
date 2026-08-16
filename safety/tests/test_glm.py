@@ -27,9 +27,16 @@ def test_poll_sets_latch_on_in_ring(tmp_path, monkeypatch):
     c = p.component(sun_alt=-10.0, now=1001.0)
     assert c["latched"] is True and c["safe"] is False
     assert c["nearest_km"] == 12.3 and c["in_ring"] is True
-    # clears after the cool-off (3 h)
+    # clears after the cool-off / freeze (30 min)
     later = 1000.0 + config.GLM_COOLOFF_HOURS * 3600 + 1
     assert p.component(-10.0, later)["latched"] is False
+    # still latched just BEFORE the window closes (the freeze really lasts its full time)
+    assert p.component(-10.0, 1000.0 + config.GLM_COOLOFF_HOURS * 3600 - 5)["latched"] is True
+
+
+def test_cooloff_default_is_thirty_minutes():
+    # the operator-chosen freeze time; a stray edit must not pass unnoticed
+    assert config.GLM_COOLOFF_HOURS == 0.5
 
 
 def test_no_ring_no_latch(tmp_path, monkeypatch):

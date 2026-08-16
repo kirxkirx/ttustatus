@@ -243,11 +243,18 @@ def _setup_html(monitor, cfg) -> str:
         rad_unknown = False
         if not rad.get("enabled"):
             rv, rad_unknown = "disabled (Pillow not installed)", True
-        elif not rad.get("available"):
-            rv, rad_unknown = "no fresh frame (radar unreachable?)", True
         elif rad.get("in_ring"):
             near = rad.get("nearest_km")
             rv = "RAIN within %g km%s" % (rk, "" if near is None else " (nearest %g km)" % near)
+        elif rad.get("latched"):
+            # the freeze holds the veto whether or not the current frame is fresh, so it
+            # is checked before availability — otherwise this row would read "no data"
+            # while the component is in fact vetoing
+            rv = "recent rain ≤%g km — freeze, %d min remaining%s" % (
+                rk, rad.get("seconds_remaining", 0) // 60,
+                "" if rad.get("available") else " (no fresh frame)")
+        elif not rad.get("available"):
+            rv, rad_unknown = "no fresh frame (radar unreachable?)", True
         else:
             rv = "no rain within %g km" % rk
         rows.append(row("Radar (MRMS ≤%g km)" % rk, rv, rad.get("safe", True),

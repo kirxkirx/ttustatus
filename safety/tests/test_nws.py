@@ -8,31 +8,49 @@ def _res(nc=0, npp=0, nt=0, xc=0, xp=0, xt=0, age=5, ok=True):
             "next_hour": {"cloud_cover_pct": xc, "precip_prob_pct": xp, "thunder_prob_pct": xt}}
 
 
+# Tests are written RELATIVE to the configured thresholds so that tuning them (they are
+# operator-facing knobs) does not silently invalidate the suite.
+CLOUD, PRECIP, THUNDER = (config.NWS_CLOUD_MAX, config.NWS_PRECIP_PROB_MAX,
+                          config.NWS_THUNDER_PROB_MAX)
+
+
+def test_configured_thresholds_are_the_intended_defaults():
+    # the values the operator asked for; a stray edit to config must not pass unnoticed
+    assert (CLOUD, PRECIP, THUNDER) == (70.0, 20.0, 15.0)
+
+
 def test_safe_when_all_under():
-    ev = nf.evaluate(_res(nc=60, xc=69, npp=15, xt=10), config)
+    ev = nf.evaluate(_res(nc=CLOUD - 10, xc=CLOUD - 1, npp=PRECIP - 1, xt=THUNDER - 1), config)
     assert ev["available"] and ev["safe"] and ev["reasons"] == []
 
 
 def test_cloud_over_next_hour():
-    ev = nf.evaluate(_res(xc=71), config)
+    ev = nf.evaluate(_res(xc=CLOUD + 1), config)
     assert not ev["safe"]
     assert any("cloud cover" in r and "next hour" in r for r in ev["reasons"])
 
 
 def test_precip_over_this_hour():
-    ev = nf.evaluate(_res(npp=16), config)
+    ev = nf.evaluate(_res(npp=PRECIP + 1), config)
     assert not ev["safe"]
     assert any("precip" in r and "this hour" in r for r in ev["reasons"])
 
 
 def test_thunder_over():
-    ev = nf.evaluate(_res(xt=11), config)
+    ev = nf.evaluate(_res(xt=THUNDER + 1), config)
     assert not ev["safe"] and any("thunder" in r for r in ev["reasons"])
+
+
+def test_just_under_the_new_thresholds_is_safe():
+    # 20 % precip / 15 % thunder must NOT trip (the raised limits are inclusive-safe)
+    ev = nf.evaluate(_res(npp=20, nt=15, xp=20, xt=15), config)
+    assert ev["safe"] and ev["reasons"] == []
 
 
 def test_boundary_exact_is_safe():
     # strictly greater-than: exactly at the limit is still safe
-    ev = nf.evaluate(_res(nc=70, npp=15, nt=10, xc=70, xp=15, xt=10), config)
+    ev = nf.evaluate(_res(nc=CLOUD, npp=PRECIP, nt=THUNDER,
+                          xc=CLOUD, xp=PRECIP, xt=THUNDER), config)
     assert ev["safe"]
 
 

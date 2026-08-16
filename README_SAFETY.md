@@ -34,8 +34,9 @@ Durable files (survive reboot): `~/safety_latch.json` (the rain latch) and
 
 **Rain latch:** WU is polled only when the sun is **below 5°** (daytime = zero API
 calls). The **first** station reporting any rain trips UNSAFE immediately — no
-confirmation, no second reading — and it stays unsafe for **3 hours after the last** rain
-seen at any station. The latch is persisted, so a daemon restart or reboot keeps it.
+confirmation, no second reading — and it stays unsafe for **1 hour after the last** rain
+seen at any station (the freeze time). The latch is persisted, so a daemon restart or
+reboot keeps it.
 
 More inputs (cloud sensor, ceilometer, radar, plate-solve failures) can be added later as
 extra components in `safety/monitor.py`.
@@ -126,10 +127,10 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent NWS asks for (add a contact) |
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
 | `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min) |
-| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `70` / `15` / `10` | % thresholds (unsafe when exceeded, this or next hour) |
+| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `70` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour) |
 | `TTU_SAFETY_GLM` | `1` | enable the GLM lightning component (`0` disables) |
 | `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE |
-| `TTU_SAFETY_GLM_COOLOFF_HOURS` | `3.0` | latch duration after the last nearby flash |
+| `TTU_SAFETY_GLM_COOLOFF_HOURS` | `0.5` | freeze time (h) after the last nearby flash |
 | `TTU_SAFETY_GLM_POLL_INTERVAL` | `300` | seconds between GLM polls (night only) |
 | `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes fetched per poll |
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
@@ -178,8 +179,10 @@ aren't re-downloaded each cycle**) with the **50 km ring** and **10 km / 10 mi s
 written beside `status.html`; the observatory page shows it with attribution and a source
 note. **Two versions are rendered — a dark map for the night page style and a light
 (`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches the page's
-day/night toggle.** Live check (unsafe while rain is in the ring; a fresh clear frame or a
-30-min blind-gap latch handle "recently rained"); a fetch error or stale frame → *unavailable*, which does not veto on its own. The
+day/night toggle.** Live check: unsafe while rain is in the ring **and for 30 min after the
+last in-ring detection** — a freeze that clear frames do not cancel, so the roof does not
+reopen the moment a cell's edge leaves the ring (it also covers the feed going blind). A
+fetch error or stale frame → *unavailable*, which does not veto on its own. The
 slow tile/radar fetch + render runs in its own thread, so it never delays page/monitor
 refresh. Needs Pillow (`sudo apt install python3-pil`); absent → radar disabled.
 
@@ -187,7 +190,7 @@ refresh. Needs Pillow (`sudo apt install python3-pil`); absent → radar disable
 
 Every 5 min **while the sun is below 5°** (night, like WU rain) the daemon fetches the last
 5 min of **GOES-19 GLM total-lightning** granules from AWS Open Data (anonymous S3, no key)
-and **latches UNSAFE for 3 h** if any flash is within **50 km**. Parsing is **entirely in
+and **latches UNSAFE for 30 min** (the freeze time) if any flash is within **50 km**. Parsing is **entirely in
 RAM** (in-memory netCDF, `/dev/shm` fallback) — **no SD-card writes** — and the slow
 S3/netCDF poll runs in its own thread, so it never blocks `evaluate()` or the status page.
 Needs `numpy` + `netCDF4` (`sudo apt install python3-numpy python3-netcdf4`); if absent, GLM
@@ -199,7 +202,7 @@ never forces unsafe on its own; "no flashes" is never proof of safety.
 
 A pre-emptive layer: every 15 min the daemon pulls the free **NWS gridpoint forecast**
 (api.weather.gov, no key) and flags **UNSAFE if THIS hour or NEXT hour** exceeds any of:
-cloud cover > 70%, precip probability > 15%, thunder probability > 10%. A fetch error or a
+cloud cover > 70%, precip probability > 20%, thunder probability > 15%. A fetch error or a
 stale forecast is treated as *unavailable* (does not by itself flip unsafe — it's a
 forecast, not a local sensor); a breach in a fresh forecast does. Both the daemon's
 `/setup` page and the observatory status page show the inputs, the conclusion, and (on the

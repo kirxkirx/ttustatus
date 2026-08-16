@@ -2801,8 +2801,10 @@ def build_radar_html(state):
         verdict = safety_dot_html(False) + ("<b>RAIN within %g km</b>%s" % (
             rk, "" if near is None else " &mdash; nearest %g km" % near))
     elif rad.get("latched"):
-        verdict = safety_dot_html(False) + ("recent rain (feed blind &mdash; holding %g km "
-                                            "veto)" % rk)
+        left = int(rad.get("seconds_remaining", 0) // 60)
+        verdict = safety_dot_html(False) + (
+            "recent rain within %g km &mdash; %d min of the %g min freeze left" % (
+                rk, left, rad.get("freeze_sec", 1800) / 60.0))
     elif rad.get("available"):
         verdict = safety_dot_html(True) + ("no rain within %g km" % rk)
     else:

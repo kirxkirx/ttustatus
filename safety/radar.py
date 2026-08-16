@@ -8,9 +8,10 @@ from the Iowa Environmental Mesonet (free, no key), and:
     they are NOT re-downloaded every cycle) with the radar overlaid, the 50 km ring, and
     10 km / 10 mi scale bars, saved where the status page can load it.
 
-Live check: unsafe while rain is within the ring. If the feed goes BLIND right after an
-in-ring detection, the radar holds its own veto for RADAR_LATCH_SEC (a fresh clear frame
-cancels it immediately) — it does NOT rely on the WU latch, which only arms when rain
+Live check: unsafe while rain is within the ring, and for RADAR_LATCH_SEC (30 min) after
+the LAST in-ring detection — a post-rain freeze that clear frames do NOT cancel, so the
+roof does not reopen the instant a cell's edge leaves the ring, and a blind feed cannot
+drop the veto either. The radar does NOT rely on the WU latch, which only arms when rain
 reaches a nearby station, not for a ranged echo. Fail-safe: a fetch error or stale frame
 with no recent detection => unavailable (no veto on its own). Needs Pillow; absent =>
 radar disabled.
@@ -360,9 +361,9 @@ class RadarPoller:
         self._frame_utc = None
         self._thumb_ok = False
         self._coverage_warned = False
-        # The blind-gap latch must survive a daemon restart (systemd Restart=always would
-        # otherwise silently drop the veto mid-outage) — persist last_rain_ts like the
-        # WU/GLM latches.
+        # The post-rain freeze must survive a daemon restart (systemd Restart=always
+        # would otherwise silently drop the veto mid-event) — persist last_rain_ts like
+        # the WU/GLM latches.
         self._last_rain_ts = None
         try:
             with open(cfg.RADAR_LATCH_FILE, encoding="utf-8") as f:
@@ -370,7 +371,7 @@ class RadarPoller:
             if isinstance(lr, (int, float)) and math.isfinite(lr):
                 self._last_rain_ts = lr
                 if (time.time() - lr) < cfg.RADAR_LATCH_SEC:
-                    log.info("restored radar blind-gap latch (%d min old)",
+                    log.info("restored radar post-rain freeze (%d min old)",
                              int((time.time() - lr) / 60))
         except Exception:
             pass
@@ -452,25 +453,31 @@ class RadarPoller:
             fresh = (self._last_ok_ts is not None
                      and (now - self._last_ok_ts) <= self.cfg.RADAR_STALE_AFTER_SEC)
             live_unsafe = fresh and self._in_ring
-            # Persistence across a BLIND gap: after the last in-ring detection, hold the veto
-            # until either a FRESH clear frame cancels it (keeps the live feel) or the bounded
-            # latch window elapses (so a permanent outage self-clears instead of sticking).
-            # This closes the hole where a cell sits at ~40 km (inside the ring, over no WU
-            # station, so WU never latches) and then IEM goes blind, dropping the veto.
+            # FREEZE after the last in-ring detection: hold the veto for RADAR_LATCH_SEC
+            # even once frames come back clear. Rain leaving the 50 km ring is not by
+            # itself a reason to reopen — the cell can turn back, and the roof should not
+            # chase the radar edge. The window is bounded, so a genuinely departed cell
+            # (or a blind feed) self-clears instead of sticking. It also covers an echo
+            # inside the ring but over no WU station, where WU never latches at all.
             latched = (self._last_rain_ts is not None
-                       and (now - self._last_rain_ts) < self.cfg.RADAR_LATCH_SEC
-                       and not (fresh and not self._in_ring))
+                       and (now - self._last_rain_ts) < self.cfg.RADAR_LATCH_SEC)
             # Pillow absent => radar never really ran; never veto from an artificial state.
             unsafe = deps_available() and (live_unsafe or latched)
             available = deps_available() and fresh
             polling_active = deps_available()      # radar polls day and night
             return {
-                # Unsafe on a fresh in-ring frame, OR while the blind-gap latch holds. A stale
+                # Unsafe on a fresh in-ring frame, OR while the post-rain freeze holds. A stale
                 # frame with no recent detection is "unknown" (available False), no veto.
                 # Observation fields are exported ONLY while fresh — a stale in_ring/nearest
                 # must never be rendered as a current observation.
                 "safe": not unsafe,
                 "latched": bool(latched and not live_unsafe),
+                # countdown of the post-rain freeze, so the page can say how long is left
+                # instead of just asserting "recent rain"
+                "seconds_remaining": (
+                    max(0, round(self._last_rain_ts + self.cfg.RADAR_LATCH_SEC - now))
+                    if latched else 0),
+                "freeze_sec": self.cfg.RADAR_LATCH_SEC,
                 "enabled": deps_available(),
                 "available": available,
                 "in_ring": bool(fresh and self._in_ring),
@@ -493,6 +500,7 @@ class RadarPoller:
 def unavailable_component(cfg):
     return {
         "safe": True, "enabled": False, "available": False, "in_ring": False,
+        "latched": False, "seconds_remaining": 0, "freeze_sec": cfg.RADAR_LATCH_SEC,
         "nearest_km": None, "pixels": 0, "frame_utc": None, "age_s": None,
         "trigger_km": cfg.RADAR_TRIGGER_KM, "dbz": cfg.RADAR_DBZ, "polling_active": False,
         "thumb_available": False, "thumb_path": cfg.RADAR_THUMB_PATH, "thumb_path_day": None,

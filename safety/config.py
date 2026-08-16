@@ -92,7 +92,9 @@ SUN_UNSAFE_ABOVE_DEG = 0.0      # unsafe when sun altitude > 0 (no refraction/si
 RAIN_POLL_SUN_BELOW_DEG = 5.0   # only poll WU when sun altitude < this (save calls)
 HUMIDITY_UNSAFE_ABOVE = 95.0    # unsafe when humidity > 95 %
 HUMIDITY_CLEAR_BELOW = 93.0     # hysteresis: clear humidity-unsafe below this
-RAIN_LATCH_HOURS = _env_float("TTU_SAFETY_RAIN_LATCH_HOURS", 3.0)
+# Freeze time after the LAST rain reading at a WU station: hold unsafe this long, then
+# clear if nothing else is still triggering.
+RAIN_LATCH_HOURS = _env_float("TTU_SAFETY_RAIN_LATCH_HOURS", 1.0)
 INPUTS_STALE_SEC = _env_int("TTU_SAFETY_INPUTS_STALE_SEC", 600)  # older => fail safe
 CLOCK_SKEW_TOLERANCE_SEC = 5    # future-dated inputs beyond this => also stale
 
@@ -107,8 +109,8 @@ NWS_GRID = _env_str("TTU_SAFETY_NWS_GRID", "")   # e.g. "LUB/46,41"; empty => re
 NWS_POLL_INTERVAL = _env_int("TTU_SAFETY_NWS_POLL_INTERVAL", 900)     # 15 min
 NWS_STALE_AFTER_MIN = _env_int("TTU_SAFETY_NWS_STALE_MIN", 150)
 NWS_CLOUD_MAX = _env_float("TTU_SAFETY_NWS_CLOUD_MAX", 70.0)          # % ; unsafe when >
-NWS_PRECIP_PROB_MAX = _env_float("TTU_SAFETY_NWS_PRECIP_MAX", 15.0)   # % ; unsafe when >
-NWS_THUNDER_PROB_MAX = _env_float("TTU_SAFETY_NWS_THUNDER_MAX", 10.0)  # % ; unsafe when >
+NWS_PRECIP_PROB_MAX = _env_float("TTU_SAFETY_NWS_PRECIP_MAX", 20.0)   # % ; unsafe when >
+NWS_THUNDER_PROB_MAX = _env_float("TTU_SAFETY_NWS_THUNDER_MAX", 15.0)  # % ; unsafe when >
 NWS_RENDER_HOURS = _env_int("TTU_SAFETY_NWS_RENDER_HOURS", 12)        # 12-h table (display)
 LOCAL_TZ = _env_str("TTU_SAFETY_LOCAL_TZ", "America/Chicago")         # for the render table
 
@@ -121,7 +123,8 @@ LOCAL_TZ = _env_str("TTU_SAFETY_LOCAL_TZ", "America/Chicago")         # for the 
 GLM_ENABLED = _env_str("TTU_SAFETY_GLM", "1").strip().lower() not in ("0", "false", "no")
 GLM_BUCKET = _env_str("TTU_SAFETY_GLM_BUCKET", "noaa-goes19")
 GLM_TRIGGER_KM = _env_float("TTU_SAFETY_GLM_TRIGGER_KM", 50.0)
-GLM_COOLOFF_HOURS = _env_float("TTU_SAFETY_GLM_COOLOFF_HOURS", 3.0)   # same as WU rain latch
+# Freeze time after the last in-range flash (30 min), matching the radar freeze.
+GLM_COOLOFF_HOURS = _env_float("TTU_SAFETY_GLM_COOLOFF_HOURS", 0.5)
 GLM_POLL_INTERVAL = _env_int("TTU_SAFETY_GLM_POLL_INTERVAL", 300)     # 5 min
 GLM_WINDOW_MIN = _env_int("TTU_SAFETY_GLM_WINDOW_MIN", 5)             # look-back per poll
 GLM_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_GLM_SUN_BELOW", 5.0)  # night gate (like WU)
@@ -136,7 +139,7 @@ GLM_STALE_AFTER_SEC = _env_int("TTU_SAFETY_GLM_STALE_SEC", 900)  # older poll =>
 # Also renders a TTU-centered radar thumbnail (dark OSM tiles, cached to disk) with the
 # 50 km ring + scale bars for the status page. Needs Pillow (apt: python3-pil); absent =>
 # radar disabled (other layers unaffected). A fetch error/stale frame => unavailable (does
-# not by itself force unsafe); the radar keeps its own blind-gap latch (RADAR_LATCH_SEC).
+# not by itself force unsafe); the radar keeps its own post-rain freeze (RADAR_LATCH_SEC).
 RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "false", "no")
 RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 50.0)
 RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
@@ -144,10 +147,11 @@ RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
 # NOTE: radar polls day AND night (free data, daytime rain matters, live map) — unlike
 # the WU/GLM night gates.
 RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older => unavailable
-# Hold the veto this long after the last in-ring detection if the feed goes blind, so a
-# ranged echo (inside 50 km but over no WU station) can't reopen the dome when IEM drops.
-# A fresh clear frame cancels it immediately (keeps the live feel).
-RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 1800)  # 30 min blind-gap latch
+# FREEZE TIME after the last in-ring detection: hold the veto this long even if later
+# frames are clear, so the dome does not reopen the moment a cell's leading edge leaves
+# the ring (and so a ranged echo can't reopen it when IEM goes blind, since a cell inside
+# 50 km may sit over no WU station at all).
+RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 1800)  # 30 min post-rain freeze
 RADAR_LATCH_FILE = _env_str("TTU_SAFETY_RADAR_LATCH_FILE",
                             os.path.expanduser("~/safety_radar_latch.json"))
 # thumbnail: written where the status page can load it (beside status.html on the Pi)
@@ -173,7 +177,7 @@ RADAR_TILE_URL_DAY = _env_str(
     "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png")  # OSM data, light theme
 RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
 RADAR_ATTRIBUTION = "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS via IEM"
-# (Persistence note: the radar keeps its OWN blind-gap latch above — it does NOT rely on the
+# (Persistence note: the radar keeps its OWN post-rain freeze above — it does NOT rely on the
 # WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
 
 # --- status-page runner ------------------------------------------------------

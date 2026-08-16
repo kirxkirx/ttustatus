@@ -66,7 +66,7 @@ def test_rain_latch_trips_on_first_detection_and_expires(env, write_inputs, monk
     st = m.evaluate()
     assert st["is_safe"] is False
     assert any("rain latch" in r for r in st["reasons"])
-    # latch persists ~3 h; simulate expiry
+    # the latch persists for RAIN_LATCH_HOURS (1 h); simulate expiry
     poller._latch_until = time.time() - 1
     assert m.evaluate()["is_safe"] is True
 
@@ -193,7 +193,7 @@ def _glm_comp(safe, latched=False, remaining=0):
             "latched_until": None, "seconds_remaining": remaining, "in_ring": latched,
             "nearest_km": 12.0 if latched else 800.0, "nearest_bearing": "N",
             "polling_active": True, "last_poll_ts": None, "granules_scanned": 15,
-            "trigger_km": 50.0, "cooloff_hours": 3.0, "source": "GLM"}
+            "trigger_km": 50.0, "cooloff_hours": 0.5, "source": "GLM"}
 
 
 def test_glm_latch_makes_unsafe(env, write_inputs):
@@ -306,3 +306,9 @@ def test_env_float_rejects_nonfinite(monkeypatch):
     assert config._env_float("TTU_TEST_FLOAT", 3.0) == 3.0
     monkeypatch.setenv("TTU_TEST_FLOAT", "2.5")
     assert config._env_float("TTU_TEST_FLOAT", 3.0) == 2.5
+
+
+def test_rain_latch_default_is_one_hour():
+    # the operator-chosen freeze time after the last WU station rain reading
+    from safety import config as _cfg
+    assert _cfg.RAIN_LATCH_HOURS == 1.0
