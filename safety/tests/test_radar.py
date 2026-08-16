@@ -91,9 +91,9 @@ def test_freeze_clears_when_the_window_elapses(monkeypatch):
     assert c["safe"] is True and c["latched"] is False and c["seconds_remaining"] == 0
 
 
-def test_freeze_is_thirty_minutes():
+def test_freeze_is_fifteen_minutes():
     # the operator-chosen value; a stray edit must not pass unnoticed
-    assert config.RADAR_LATCH_SEC == 1800
+    assert config.RADAR_LATCH_SEC == 900
 
 
 def test_latch_expires_bounded(monkeypatch):

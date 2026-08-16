@@ -123,7 +123,8 @@ LOCAL_TZ = _env_str("TTU_SAFETY_LOCAL_TZ", "America/Chicago")         # for the 
 GLM_ENABLED = _env_str("TTU_SAFETY_GLM", "1").strip().lower() not in ("0", "false", "no")
 GLM_BUCKET = _env_str("TTU_SAFETY_GLM_BUCKET", "noaa-goes19")
 GLM_TRIGGER_KM = _env_float("TTU_SAFETY_GLM_TRIGGER_KM", 50.0)
-# Freeze time after the last in-range flash (30 min), matching the radar freeze.
+# Freeze time after the last in-range flash (30 min — lightning warrants a longer
+# hold than the 15 min radar rain freeze).
 GLM_COOLOFF_HOURS = _env_float("TTU_SAFETY_GLM_COOLOFF_HOURS", 0.5)
 GLM_POLL_INTERVAL = _env_int("TTU_SAFETY_GLM_POLL_INTERVAL", 300)     # 5 min
 GLM_WINDOW_MIN = _env_int("TTU_SAFETY_GLM_WINDOW_MIN", 5)             # look-back per poll
@@ -151,7 +152,7 @@ RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older =>
 # frames are clear, so the dome does not reopen the moment a cell's leading edge leaves
 # the ring (and so a ranged echo can't reopen it when IEM goes blind, since a cell inside
 # 50 km may sit over no WU station at all).
-RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 1800)  # 30 min post-rain freeze
+RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 900)   # 15 min post-rain freeze
 RADAR_LATCH_FILE = _env_str("TTU_SAFETY_RADAR_LATCH_FILE",
                             os.path.expanduser("~/safety_radar_latch.json"))
 # thumbnail: written where the status page can load it (beside status.html on the Pi)

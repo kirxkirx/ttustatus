@@ -136,6 +136,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
 | `TTU_SAFETY_RADAR_KM` | `50` | any echo within this radius → UNSAFE |
 | `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
+| `TTU_SAFETY_RADAR_LATCH_SEC` | `900` | freeze time (s) after the last in-ring echo; clear frames do not cancel it |
 | `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (day and night) |
 | `TTU_SAFETY_RADAR_THUMB` | `/var/www/html/ttu_radar.png` | thumbnail path (beside status.html) |
 | `TTU_SAFETY_RADAR_TILE_URL` | Carto dark | night basemap tile template (OSM data) |
@@ -179,7 +180,7 @@ aren't re-downloaded each cycle**) with the **50 km ring** and **10 km / 10 mi s
 written beside `status.html`; the observatory page shows it with attribution and a source
 note. **Two versions are rendered — a dark map for the night page style and a light
 (`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches the page's
-day/night toggle.** Live check: unsafe while rain is in the ring **and for 30 min after the
+day/night toggle.** Live check: unsafe while rain is in the ring **and for 15 min after the
 last in-ring detection** — a freeze that clear frames do not cancel, so the roof does not
 reopen the moment a cell's edge leaves the ring (it also covers the feed going blind). A
 fetch error or stale frame → *unavailable*, which does not veto on its own. The

@@ -8,7 +8,7 @@ from the Iowa Environmental Mesonet (free, no key), and:
     they are NOT re-downloaded every cycle) with the radar overlaid, the 50 km ring, and
     10 km / 10 mi scale bars, saved where the status page can load it.
 
-Live check: unsafe while rain is within the ring, and for RADAR_LATCH_SEC (30 min) after
+Live check: unsafe while rain is within the ring, and for RADAR_LATCH_SEC (15 min) after
 the LAST in-ring detection — a post-rain freeze that clear frames do NOT cancel, so the
 roof does not reopen the instant a cell's edge leaves the ring, and a blind feed cannot
 drop the veto either. The radar does NOT rely on the WU latch, which only arms when rain
