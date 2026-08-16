@@ -1,11 +1,12 @@
-"""MRMS radar component for the SafetyMonitor — a simple 50 km "any rain" ring.
+"""MRMS radar component for the SafetyMonitor — a simple 30 km "any rain" ring.
 
-Every poll (night only, like WU) it fetches the latest MRMS composite-reflectivity frame
+Every poll (DAY AND NIGHT — free data, and daytime rain matters for the roof) it fetches
+the latest MRMS composite-reflectivity frame
 from the Iowa Environmental Mesonet (free, no key), and:
   * CHECK: declares unsafe if any echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of the dome.
     Deliberately simple — no upwind/downwind logic, just a plain radius.
   * THUMBNAIL: renders a TTU-centered map (dark OSM tiles from Carto, cached to disk so
-    they are NOT re-downloaded every cycle) with the radar overlaid, the 50 km ring, and
+    they are NOT re-downloaded every cycle) with the radar overlaid, the trigger ring, and
     10 km / 10 mi scale bars, saved where the status page can load it.
 
 A single frame never vetoes: an in-ring echo must repeat on RADAR_TRIGGER_AFTER (2)
@@ -96,7 +97,7 @@ def _dbz(idx):
     return None if idx == 255 else -32.0 + idx * 0.5
 
 
-# ---- radar fetch + 50 km check --------------------------------------------
+# ---- radar fetch + in-ring check --------------------------------------------
 def latest_frame(max_back=8):
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     if now.minute % 2:
@@ -214,7 +215,7 @@ class Thumbnailer:
         gx0, gy0, gx1, gy1 = int(x0f * 256), int(y0f * 256), int(x1f * 256), int(y1f * 256)
         self._tilebox = (gx0, gy0, gx1, gy1, z)
         # Non-square output matching the Mercator canvas aspect, so px/km is equal on both
-        # axes: the 50 km ring draws as a true circle and one scale bar is valid in every
+        # axes: the trigger ring draws as a true circle and one scale bar is valid in every
         # direction (a square would stretch E-W by 1/cos(lat) ~ 1.2x here).
         cw, ch = gx1 - gx0, gy1 - gy0
         self._ox = cfg.RADAR_THUMB_PX
@@ -301,7 +302,7 @@ class Thumbnailer:
         lat0, lon0 = cfg.GEOCODE
         ink, stroke = self.colors["ink"], self.colors["stroke"]
 
-        # 50 km ring
+        # trigger ring (RADAR_TRIGGER_KM)
         ring = [self._mv(*dest_point(lat0, lon0, cfg.RADAR_TRIGGER_KM, b))
                 for b in range(0, 361, 6)]
         d.line(ring, fill=self.colors["ring"], width=2)
@@ -481,7 +482,7 @@ class RadarPoller:
             confirmed = self._ring_streak >= self._trigger_after
             live_unsafe = fresh and self._in_ring and confirmed
             # FREEZE after the last in-ring detection: hold the veto for RADAR_LATCH_SEC
-            # even once frames come back clear. Rain leaving the 50 km ring is not by
+            # even once frames come back clear. Rain leaving the ring is not by
             # itself a reason to reopen — the cell can turn back, and the roof should not
             # chase the radar edge. The window is bounded, so a genuinely departed cell
             # (or a blind feed) self-clears instead of sticking. It also covers an echo

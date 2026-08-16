@@ -134,7 +134,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_GLM_POLL_INTERVAL` | `300` | seconds between GLM polls (night only) |
 | `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes fetched per poll |
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
-| `TTU_SAFETY_RADAR_KM` | `50` | any echo within this radius → UNSAFE |
+| `TTU_SAFETY_RADAR_KM` | `30` | any echo within this radius → UNSAFE |
 | `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
 | `TTU_SAFETY_RADAR_TRIGGER_AFTER` | `2` | consecutive polls that must show an in-ring echo before it triggers (`1` = trigger on a single frame) |
 | `TTU_SAFETY_RADAR_LATCH_SEC` | `900` | freeze time (s) after the last in-ring echo; clear frames do not cancel it |
@@ -175,16 +175,16 @@ silently unavailable (no internet). A response of any kind (even an HTTP error) 
 
 Every 5 min — **day and night** (the data is free) — the daemon pulls the latest **MRMS composite reflectivity** (NOAA
 via the Iowa Environmental Mesonet, free/no key) and declares **UNSAFE if any echo ≥ 20 dBZ
-is within 50 km** of the dome — a deliberately simple radius, no upwind logic. It also
+is within 30 km** of the dome — a deliberately simple radius, no upwind logic. It also
 renders a **TTU-centered radar thumbnail** (dark OSM/Carto tiles, **cached to disk so they
-aren't re-downloaded each cycle**) with the **50 km ring** and **10 km / 10 mi scale bars**,
+aren't re-downloaded each cycle**) with the **30 km ring** and **10 km / 10 mi scale bars**,
 written beside `status.html`; the observatory page shows it with attribution and a source
 note. **Two versions are rendered — a dark map for the night page style and a light
 (`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches the page's
 day/night toggle.** An echo must appear on **two consecutive polls** (~5 min apart) before
 it triggers: MRMS composites occasionally carry a one-frame artefact — an aircraft,
 anomalous propagation, ground clutter — and a single frame should not close the dome. The
-first, unconfirmed frame is shown on both pages as *"echo within 50 km — unconfirmed (1 of
+first, unconfirmed frame is shown on both pages as *"echo within 30 km — unconfirmed (1 of
 2 frames), not triggering"* with a grey dot, and it starts no freeze. Live check: unsafe
 while a **confirmed** echo is in the ring **and for 15 min after the last one** — a freeze that clear frames do not cancel, so the roof does not
 reopen the moment a cell's edge leaves the ring (it also covers the feed going blind). A

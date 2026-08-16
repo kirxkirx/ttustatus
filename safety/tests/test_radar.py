@@ -260,3 +260,8 @@ def test_clear_frame_between_echoes_resets_the_count(monkeypatch):
 def test_confirmation_default_is_two_frames():
     # the operator-chosen value; a stray edit must not pass unnoticed
     assert config.RADAR_TRIGGER_AFTER == 2
+
+
+def test_trigger_radius_default_is_thirty_km():
+    # the operator-chosen ring; the map plot and both pages label themselves from it
+    assert config.RADAR_TRIGGER_KM == 30.0

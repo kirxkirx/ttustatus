@@ -93,17 +93,17 @@ def test_radar_section_renders():
     now = time.time()
     # thumb_path must be co-located with make_status_page.HTML_FILE for the <img> to show
     thumb = os.path.join(os.path.dirname(msp.HTML_FILE), "ttu_radar.png")
-    base = {"trigger_km": 50, "enabled": True, "available": True,
+    base = {"trigger_km": 30, "enabled": True, "available": True,
             "thumb_available": True, "thumb_path": thumb,
             "attribution": "© OpenStreetMap contributors, © CARTO", "frame_utc": "2026-01-01"}
     # fresh state + rain in ring -> unsafe wording + image + attribution + source
     st = {"ts": now, "components": {"radar": {**base, "in_ring": True, "nearest_km": 18.0}}}
     h = msp.build_radar_html(st)
-    assert "Radar (MRMS" in h and "RAIN within 50" in h and "ttu_radar.png" in h
+    assert "Radar (MRMS" in h and "RAIN within 30" in h and "ttu_radar.png" in h
     assert "CARTO" in h and "MRMS" in h and "Iowa Environmental" in h   # source + attribution
     # clear ring (fresh)
     st2 = {"ts": now, "components": {"radar": {**base, "in_ring": False}}}
-    assert "no rain within 50" in msp.build_radar_html(st2)
+    assert "no rain within 30" in msp.build_radar_html(st2)
     # day + night maps -> both <img> emitted with switch classes
     day = os.path.join(os.path.dirname(msp.HTML_FILE), "ttu_radar_day.png")
     st_both = {"ts": now, "components": {"radar": {**base, "in_ring": False,
@@ -112,7 +112,7 @@ def test_radar_section_renders():
     assert "radar-night" in hb and "radar-day" in hb and "ttu_radar_day.png" in hb
     # stale state -> never a green "no rain"; shows stale
     st3 = {"ts": now - 99999, "components": {"radar": {**base, "in_ring": False}}}
-    assert "stale" in msp.build_radar_html(st3) and "no rain within 50" not in msp.build_radar_html(st3)
+    assert "stale" in msp.build_radar_html(st3) and "no rain within 30" not in msp.build_radar_html(st3)
     # disabled -> section omitted
     assert msp.build_radar_html({"components": {"radar": {"enabled": False}}}) == ""
 

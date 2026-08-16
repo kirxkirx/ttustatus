@@ -345,7 +345,8 @@ class SafetyMonitor:
             reasons.append("lightning within %g km (GLM latch %d min left)"
                            % (glm["trigger_km"], glm["seconds_remaining"] // 60))
 
-        # MRMS radar (simple 50 km any-rain ring). Live check; unavailable => no veto.
+        # MRMS radar (simple any-rain ring, RADAR_TRIGGER_KM). Live check; unavailable
+        # => no veto.
         if self.radar is not None:
             radar = self.radar.component(None if stale else sun_alt, now)
         else:

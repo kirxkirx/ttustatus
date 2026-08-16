@@ -239,7 +239,7 @@ def _setup_html(monitor, cfg) -> str:
 
     rad = comp.get("radar")
     if rad:
-        rk = rad.get("trigger_km", 50)
+        rk = rad.get("trigger_km", 30)
         rad_unknown = False
         if not rad.get("enabled"):
             rv, rad_unknown = "disabled (Pillow not installed)", True

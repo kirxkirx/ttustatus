@@ -2782,7 +2782,7 @@ def build_radar_html(state):
     rad = ((state or {}).get("components", {}) or {}).get("radar")
     if not rad or not rad.get("enabled"):
         return ""   # radar off / Pillow missing -> omit the section
-    rk = rad.get("trigger_km", 50)
+    rk = rad.get("trigger_km", 30)
 
     # Fail-safe display: if the whole safety state is stale (daemon hung/crashed), do NOT
     # show a reassuring green "no rain" over a frozen thumbnail — the radar verdict is only

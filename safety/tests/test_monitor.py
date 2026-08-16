@@ -231,7 +231,7 @@ class _StubRadar:
 def _radar_comp(safe, in_ring=False, near=None):
     return {"safe": safe, "enabled": True, "available": True, "in_ring": in_ring,
             "nearest_km": near, "pixels": 5 if in_ring else 0, "frame_utc": None,
-            "age_s": 60, "trigger_km": 50.0, "dbz": 20.0, "polling_active": True,
+            "age_s": 60, "trigger_km": 30.0, "dbz": 20.0, "polling_active": True,
             "thumb_available": True, "thumb_path": "/x/ttu_radar.png",
             "attribution": "attr", "source": "MRMS"}
 
