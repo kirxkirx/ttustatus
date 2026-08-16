@@ -243,6 +243,14 @@ def _setup_html(monitor, cfg) -> str:
         rad_unknown = False
         if not rad.get("enabled"):
             rv, rad_unknown = "disabled (Pillow not installed)", True
+        elif rad.get("unconfirmed_echo"):
+            # checked before in_ring: an unconfirmed echo is not a veto, and this row must
+            # not read "RAIN" while the component reports safe
+            near = rad.get("nearest_km")
+            rv = "echo ≤%g km%s — unconfirmed (%d of %d frames), not triggering" % (
+                rk, "" if near is None else " (nearest %g km)" % near,
+                rad.get("ring_streak", 1), rad.get("trigger_after", 2))
+            rad_unknown = True
         elif rad.get("in_ring"):
             near = rad.get("nearest_km")
             rv = "RAIN within %g km%s" % (rk, "" if near is None else " (nearest %g km)" % near)

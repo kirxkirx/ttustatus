@@ -145,6 +145,13 @@ RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "
 RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 50.0)
 RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
 RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
+# CONFIRMATION: how many CONSECUTIVE polls must see an in-ring echo before the radar
+# vetoes. MRMS composites occasionally carry a single-frame artefact (aircraft, anomalous
+# propagation, a ground-clutter or de-aliasing glitch), and one such frame should not
+# close the dome. Costs one poll interval (~5 min) of extra latency on real rain, which is
+# affordable for a 50 km early-warning ring — the close-in layers (WU stations, GLM) are
+# unaffected. Set to 1 to trigger on a single frame again.
+RADAR_TRIGGER_AFTER = _env_int("TTU_SAFETY_RADAR_TRIGGER_AFTER", 2)
 # NOTE: radar polls day AND night (free data, daytime rain matters, live map) — unlike
 # the WU/GLM night gates.
 RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older => unavailable

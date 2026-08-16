@@ -29,10 +29,28 @@ def test_unsafe_when_rain_in_ring_and_fresh(monkeypatch):
     now = 1000.0
     p._last_ok_ts = now
     p._in_ring = True
+    p._ring_streak = p._trigger_after          # confirmed over consecutive frames
     p._nearest_km = 12.0
     c = p.component(sun_alt=-10.0, now=now)
     assert c["available"] is True and c["in_ring"] is True and c["safe"] is False
     assert c["nearest_km"] == 12.0 and c["trigger_km"] == config.RADAR_TRIGGER_KM
+
+
+def test_single_echo_does_not_trigger(monkeypatch):
+    # One frame is an observation, not weather: MRMS artefacts (aircraft, anomalous
+    # propagation, clutter) show up for a single frame and must not close the dome.
+    p = _poller(monkeypatch)
+    now = 1000.0
+    p._last_ok_ts = now
+    p._in_ring = True
+    p._ring_streak = 1
+    p._nearest_km = 12.0
+    c = p.component(sun_alt=-10.0, now=now)
+    assert c["safe"] is True, "a single radar frame triggered a closure"
+    assert c["unconfirmed_echo"] is True        # ... and it is reported, not hidden
+    assert c["in_ring"] is True                 # the observation stays honest
+    assert c["ring_streak"] == 1 and c["trigger_after"] == config.RADAR_TRIGGER_AFTER
+    assert c["latched"] is False                # no freeze started by an unconfirmed echo
 
 
 def test_safe_when_ring_clear(monkeypatch):
@@ -148,6 +166,7 @@ def test_poll_now_sets_state(monkeypatch):
             return None
     monkeypatch.setattr(rd, "Image", type("I", (), {"open": staticmethod(lambda b: _Img())}))
     monkeypatch.setattr(rd, "check_rain", lambda cfg, img: (True, 8.5, 42))
+    p._trigger_after = 1                       # confirmation is exercised separately
     r = p.poll_now(now=1000.0)
     assert r["ok"] and r["in_ring"] is True
     assert p._in_ring is True and p._nearest_km == 8.5 and p._last_ok_ts == 1000.0
@@ -183,3 +202,61 @@ def test_thumbnailer_geometry():
     latmin, latmax, lonmin, lonmax = rd._region(config)
     assert latmin < config.GEOCODE[0] < latmax
     assert lonmin < config.GEOCODE[1] < lonmax
+
+
+def _stub_fetch(monkeypatch, ring_sequence):
+    """Drive poll_now without PIL: each call returns the next (in_ring, nearest) pair."""
+    import datetime as _dt
+    monkeypatch.setattr(rd, "latest_frame",
+                        lambda: (_dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc),
+                                 "http://x/lcref.png"))
+    monkeypatch.setattr(rd, "_get", lambda url, timeout=25: b"x")
+
+    class _Img:
+        def load(self):
+            return None
+    monkeypatch.setattr(rd, "Image", type("I", (), {"open": staticmethod(lambda b: _Img())}))
+    seq = list(ring_sequence)
+
+    def _check(cfg, img):
+        in_ring = seq.pop(0)
+        return (in_ring, 12.0 if in_ring else None, 42 if in_ring else 0)
+    monkeypatch.setattr(rd, "check_rain", _check)
+
+
+def test_two_consecutive_echoes_are_needed_to_trigger(monkeypatch):
+    p = _poller(monkeypatch)
+    _stub_fetch(monkeypatch, [True, True])
+    t = 1000.0
+    r1 = p.poll_now(now=t)
+    assert r1["in_ring"] is True and r1["streak"] == 1 and r1["confirmed"] is False
+    c1 = p.component(-10.0, t)
+    assert c1["safe"] is True and c1["unconfirmed_echo"] is True
+    assert p._last_rain_ts is None, "an unconfirmed echo started the freeze"
+
+    t += config.RADAR_POLL_INTERVAL
+    r2 = p.poll_now(now=t)
+    assert r2["streak"] == 2 and r2["confirmed"] is True
+    c2 = p.component(-10.0, t)
+    assert c2["safe"] is False and c2["unconfirmed_echo"] is False
+    assert p._last_rain_ts == t                      # freeze starts on confirmation
+
+
+def test_clear_frame_between_echoes_resets_the_count(monkeypatch):
+    # The glitch case: echo, then clear, then echo again — never two in a row, so the
+    # dome stays open and no freeze is ever armed.
+    p = _poller(monkeypatch)
+    _stub_fetch(monkeypatch, [True, False, True])
+    t = 1000.0
+    for expected_streak in (1, 0, 1):
+        r = p.poll_now(now=t)
+        assert r["streak"] == expected_streak, r
+        assert r["confirmed"] is False
+        assert p.component(-10.0, t)["safe"] is True
+        t += config.RADAR_POLL_INTERVAL
+    assert p._last_rain_ts is None
+
+
+def test_confirmation_default_is_two_frames():
+    # the operator-chosen value; a stray edit must not pass unnoticed
+    assert config.RADAR_TRIGGER_AFTER == 2

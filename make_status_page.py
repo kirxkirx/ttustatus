@@ -2794,6 +2794,14 @@ def build_radar_html(state):
 
     if state_stale:
         verdict = safety_dot_html(False) + "safety state stale &mdash; radar reading unknown"
+    elif rad.get("unconfirmed_echo"):
+        # An echo IS present but has not repeated yet, so the layer is not vetoing. Checked
+        # BEFORE the in_ring branch: saying "RAIN" here would contradict safe=True.
+        near = rad.get("nearest_km")
+        verdict = safety_dot_html(True, unknown=True) + (
+            "echo within %g km%s &mdash; unconfirmed (%d of %d frames), not triggering" % (
+                rk, "" if near is None else ", nearest %g km" % near,
+                rad.get("ring_streak", 1), rad.get("trigger_after", 2)))
     elif rad.get("in_ring") and rad.get("available"):
         # in_ring is only exported while fresh, but require available too (belt-and-braces
         # against a state file written by an older daemon)

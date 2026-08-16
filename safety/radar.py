@@ -8,6 +8,11 @@ from the Iowa Environmental Mesonet (free, no key), and:
     they are NOT re-downloaded every cycle) with the radar overlaid, the 50 km ring, and
     10 km / 10 mi scale bars, saved where the status page can load it.
 
+A single frame never vetoes: an in-ring echo must repeat on RADAR_TRIGGER_AFTER (2)
+CONSECUTIVE polls before it counts, because MRMS composites occasionally carry a
+one-frame artefact (aircraft, anomalous propagation, clutter). The first, unconfirmed
+frame is reported honestly — neither "rain" nor "no rain" — and starts no freeze.
+
 Live check: unsafe while rain is within the ring, and for RADAR_LATCH_SEC (15 min) after
 the LAST in-ring detection — a post-rain freeze that clear frames do NOT cancel, so the
 roof does not reopen the instant a cell's edge leaves the ring, and a blind feed cannot
@@ -356,6 +361,8 @@ class RadarPoller:
         self._last_ok_ts = None
         self._last_poll_ts = None
         self._in_ring = False
+        self._ring_streak = 0          # consecutive polls with an in-ring echo
+        self._trigger_after = max(1, int(getattr(cfg, "RADAR_TRIGGER_AFTER", 2)))
         self._nearest_km = None
         self._count = 0
         self._frame_utc = None
@@ -422,14 +429,33 @@ class RadarPoller:
             self._nearest_km = nearest
             self._count = count
             self._thumb_ok = thumb_ok
-            if in_ring:
+            # Consecutive-frame confirmation: one frame is an observation, N in a row are
+            # weather. A clear frame resets the count; a FAILED fetch does not (we return
+            # earlier, so a gap in the data never counts as "clear").
+            self._ring_streak = (self._ring_streak + 1) if in_ring else 0
+            confirmed = in_ring and self._ring_streak >= self._trigger_after
+            if confirmed:
+                # the freeze starts only on a CONFIRMED detection, so a one-frame artefact
+                # cannot hold the veto for the whole post-rain freeze window
                 self._last_rain_ts = now
                 self._save_rain_ts()
-        if in_ring:
+        if confirmed:
             self.log.record("RADAR-RAIN", reason=f"echo within {self.cfg.RADAR_TRIGGER_KM:g} km",
                             source="mrms", result="unsafe",
+                            nearest=f"{nearest}km", pixels=count,
+                            frames=f"{self._ring_streak}/{self._trigger_after}")
+        elif in_ring:
+            log.info("radar echo within %g km (nearest %s km, %d px) — frame %d of %d, "
+                     "not vetoing until confirmed",
+                     self.cfg.RADAR_TRIGGER_KM, nearest, count,
+                     self._ring_streak, self._trigger_after)
+            self.log.record("RADAR-ECHO", reason=f"unconfirmed echo within "
+                                                 f"{self.cfg.RADAR_TRIGGER_KM:g} km",
+                            source="mrms", result=f"frame {self._ring_streak} of "
+                                                  f"{self._trigger_after}",
                             nearest=f"{nearest}km", pixels=count)
-        return {"ok": True, "in_ring": in_ring, "nearest_km": nearest, "count": count}
+        return {"ok": True, "in_ring": in_ring, "nearest_km": nearest, "count": count,
+                "streak": self._ring_streak, "confirmed": confirmed}
 
     def maybe_poll(self, sun_alt, now=None):
         # Radar polls DAY AND NIGHT (unlike WU/GLM): the data is free, daytime rain
@@ -452,7 +478,8 @@ class RadarPoller:
         with self._lock:
             fresh = (self._last_ok_ts is not None
                      and (now - self._last_ok_ts) <= self.cfg.RADAR_STALE_AFTER_SEC)
-            live_unsafe = fresh and self._in_ring
+            confirmed = self._ring_streak >= self._trigger_after
+            live_unsafe = fresh and self._in_ring and confirmed
             # FREEZE after the last in-ring detection: hold the veto for RADAR_LATCH_SEC
             # even once frames come back clear. Rain leaving the 50 km ring is not by
             # itself a reason to reopen — the cell can turn back, and the roof should not
@@ -481,6 +508,12 @@ class RadarPoller:
                 "enabled": deps_available(),
                 "available": available,
                 "in_ring": bool(fresh and self._in_ring),
+                # an echo seen but not yet confirmed: a real observation that is
+                # deliberately NOT vetoing, so the page can say so instead of claiming
+                # either "rain" or "no rain"
+                "unconfirmed_echo": bool(fresh and self._in_ring and not confirmed),
+                "ring_streak": self._ring_streak if fresh else 0,
+                "trigger_after": self._trigger_after,
                 "nearest_km": self._nearest_km if fresh else None,
                 "pixels": self._count if fresh else 0,
                 "frame_utc": self._frame_utc,
@@ -500,6 +533,8 @@ class RadarPoller:
 def unavailable_component(cfg):
     return {
         "safe": True, "enabled": False, "available": False, "in_ring": False,
+        "unconfirmed_echo": False, "ring_streak": 0,
+        "trigger_after": getattr(cfg, "RADAR_TRIGGER_AFTER", 2),
         "latched": False, "seconds_remaining": 0, "freeze_sec": cfg.RADAR_LATCH_SEC,
         "nearest_km": None, "pixels": 0, "frame_utc": None, "age_s": None,
         "trigger_km": cfg.RADAR_TRIGGER_KM, "dbz": cfg.RADAR_DBZ, "polling_active": False,
