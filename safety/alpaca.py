@@ -212,8 +212,8 @@ def _setup_html(monitor, cfg) -> str:
                     h.get("thunder_prob_pct"))) if h else "?"
             nv = ("now[%s] next[%s]  (limits c>%g%% p>%g%% t>%g%%)" % (
                 _fc(nws.get("now_hour")), _fc(nws.get("next_hour")),
-                th.get("cloud_pct", 70), th.get("precip_prob_pct", 15),
-                th.get("thunder_prob_pct", 10)))
+                th.get("cloud_pct", 50), th.get("precip_prob_pct", 20),
+                th.get("thunder_prob_pct", 15)))
         rows.append(row("NWS forecast (this/next hr)", nv, nws.get("safe", True),
                         unknown=nws_unknown))
 

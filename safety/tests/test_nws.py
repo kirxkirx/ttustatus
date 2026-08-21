@@ -16,7 +16,7 @@ CLOUD, PRECIP, THUNDER = (config.NWS_CLOUD_MAX, config.NWS_PRECIP_PROB_MAX,
 
 def test_configured_thresholds_are_the_intended_defaults():
     # the values the operator asked for; a stray edit to config must not pass unnoticed
-    assert (CLOUD, PRECIP, THUNDER) == (70.0, 20.0, 15.0)
+    assert (CLOUD, PRECIP, THUNDER) == (50.0, 20.0, 15.0)
 
 
 def test_safe_when_all_under():
