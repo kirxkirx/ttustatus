@@ -201,9 +201,18 @@ class GlmLightningPoller:
         lu = d.get("latch_until")
         self._latch_until = lu if isinstance(lu, (int, float)) and math.isfinite(lu) else None
         self._last_flash_ts = d.get("last_flash_ts")
+        # CLAMP a persisted expiry beyond one full cool-off: the clock is (or was) wrong
+        # (see the 2026-08 incident: a stale-RTC boot read an August latch as 227202 min).
+        max_until = time.time() + self.cfg.GLM_COOLOFF_HOURS * 3600
+        if self._latch_until is not None and self._latch_until > max_until + 60:
+            log.warning("persisted GLM latch expiry is %.1f days in the future — system "
+                        "clock is (or was) wrong; clamping to one full cool-off",
+                        (self._latch_until - time.time()) / 86400.0)
+            self._latch_until = max_until
+            self._latch_dirty = True
         if self._latch_until and self._latch_until > time.time():
             log.info("restored active GLM lightning latch (%d min remaining)",
-                     int((self._latch_until - time.time()) / 60))
+                     max(0, int((self._latch_until - time.time()) / 60)))
 
     def _save_latch(self) -> bool:
         try:
@@ -265,16 +274,36 @@ class GlmLightningPoller:
         if sun_alt is None or sun_alt >= self.cfg.GLM_POLL_SUN_BELOW_DEG:
             return None                        # daytime / unknown sun -> don't poll
         with self._lock:
-            due = (self._last_poll_ts is None
-                   or (now - self._last_poll_ts) >= self.cfg.GLM_POLL_INTERVAL)
+            elapsed = None if self._last_poll_ts is None else now - self._last_poll_ts
+            due = elapsed is None or elapsed < 0 or elapsed >= self.cfg.GLM_POLL_INTERVAL
         if due:
             return self.poll_now(now)
         return None
+
+    def clock_stepped(self, pre_now: float, post_now: float) -> None:
+        """Re-arm a latch the clock step would silently evaporate; force a re-poll
+        (the S3 prefixes are date-derived, so pre-step data came from the wrong day)."""
+        with self._lock:
+            lu = self._latch_until
+            if (lu is not None and math.isfinite(lu)
+                    and lu > pre_now and lu <= post_now):
+                self._latch_until = post_now + self.cfg.GLM_COOLOFF_HOURS * 3600
+                self._latch_dirty = True
+                log.warning("GLM latch re-armed across a clock step")
+            self._last_poll_ts = None
 
     def component(self, sun_alt, now=None):
         if now is None:
             now = time.time()
         with self._lock:
+            # self-heal a latch stretched by a backward clock step at check time
+            max_until = now + self.cfg.GLM_COOLOFF_HOURS * 3600
+            if (self._latch_until is not None and math.isfinite(self._latch_until)
+                    and self._latch_until > max_until + 60):
+                log.warning("GLM latch expiry beyond one full cool-off (clock step?) — "
+                            "clamping")
+                self._latch_until = max_until
+                self._latch_dirty = True
             latched = self._latch_until is not None and (
                 not math.isfinite(self._latch_until) or now < self._latch_until)
             remaining = (int(self._latch_until - now)

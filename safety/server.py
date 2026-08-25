@@ -41,7 +41,7 @@ def _fresh_sun(monitor, cfg):
 def run_page_once(cfg):
     """Run make_status_page.py as an isolated subprocess; kill the whole process tree
     if it hangs. Returns (rc, seconds); rc None = could not start / killed."""
-    start = time.time()
+    start = time.monotonic()
     try:
         proc = subprocess.Popen(
             [sys.executable, cfg.PAGE_SCRIPT],
@@ -61,11 +61,11 @@ def run_page_once(cfg):
         except Exception:
             pass
         proc.wait()
-        return None, time.time() - start
+        return None, time.monotonic() - start
     if proc.returncode != 0:
         tail = (out or b"")[-2000:].decode("utf-8", "replace")
         log.warning("status page run failed (rc=%s):\n%s", proc.returncode, tail)
-    return proc.returncode, time.time() - start
+    return proc.returncode, time.monotonic() - start
 
 
 def main(argv=None):
@@ -79,7 +79,7 @@ def main(argv=None):
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
     glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
     radar = RadarPoller(cfg, eventlog) if cfg.RADAR_ENABLED else None
-    conn = ConnectivityWatch(cfg, start_ts=time.time()) if cfg.CONN_ENABLED else None
+    conn = ConnectivityWatch(cfg) if cfg.CONN_ENABLED else None   # monotonic-internal
     monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn)
 
     for w in cfg.CONFIG_WARNINGS:
@@ -109,8 +109,30 @@ def main(argv=None):
     stop = threading.Event()
 
     def evaluator():
+        # Clock-step detector: wall time can STEP (NTP sync after a wrong-RTC boot — see
+        # the 2026-08 incident where a March-clock boot read August latches as "227329
+        # min left"); monotonic cannot. When the two disagree by more than 30 s between
+        # iterations, the wall clock jumped: say so loudly, and give every component a
+        # chance to re-arm evaporating latches and re-fetch data under the correct date.
+        last_wall, last_mono = time.time(), time.monotonic()
         while not stop.is_set():
             try:
+                wall, mono = time.time(), time.monotonic()
+                step = (wall - last_wall) - (mono - last_mono)
+                if abs(step) > 30.0:
+                    log.critical("SYSTEM CLOCK STEPPED by %+.0f s (%+.2f days) — NTP "
+                                 "sync or wrong RTC. Re-arming latches and re-polling "
+                                 "all layers under the corrected clock.",
+                                 step, step / 86400.0)
+                    eventlog.record("CLOCK-STEP", reason=f"{step:+.0f}s",
+                                    result="latches re-checked, all layers re-polled")
+                    for comp in (poller, nws, glm, radar):
+                        if comp is not None:
+                            try:
+                                comp.clock_stepped(last_wall, wall)
+                            except Exception:
+                                log.exception("clock_stepped failed for %r", comp)
+                last_wall, last_mono = wall, mono
                 monitor.evaluate()
             except Exception:
                 log.exception("evaluate failed")
@@ -154,7 +176,7 @@ def main(argv=None):
         # Probe internet reachability day and night so the "offline > 1 h" clock is accurate.
         while not stop.is_set():
             try:
-                conn.probe_once(time.time())
+                conn.probe_once()
             except Exception:
                 log.exception("connectivity probe failed")
             stop.wait(cfg.CONN_PROBE_INTERVAL)

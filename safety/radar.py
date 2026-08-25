@@ -377,10 +377,19 @@ class RadarPoller:
             with open(cfg.RADAR_LATCH_FILE, encoding="utf-8") as f:
                 lr = json.load(f).get("last_rain_ts")
             if isinstance(lr, (int, float)) and math.isfinite(lr):
+                if lr > time.time() + 60:
+                    # a detection timestamp in the future is impossible under a sane
+                    # clock (2026-08 incident: an August stamp read under a March-RTC
+                    # boot froze the radar for "158 days"); clamp to now — the freeze
+                    # then runs its normal window from here
+                    log.warning("persisted radar rain timestamp is %.1f days in the "
+                                "future — system clock is (or was) wrong; clamping",
+                                (lr - time.time()) / 86400.0)
+                    lr = time.time()
                 self._last_rain_ts = lr
-                if (time.time() - lr) < cfg.RADAR_LATCH_SEC:
+                if 0 <= (time.time() - lr) < cfg.RADAR_LATCH_SEC:
                     log.info("restored radar post-rain freeze (%d min old)",
-                             int((time.time() - lr) / 60))
+                             max(0, int((time.time() - lr) / 60)))
         except Exception:
             pass
 
@@ -467,11 +476,24 @@ class RadarPoller:
         if not deps_available():
             return None
         with self._lock:
-            due = (self._last_poll_ts is None
-                   or (now - self._last_poll_ts) >= self.cfg.RADAR_POLL_INTERVAL)
+            elapsed = None if self._last_poll_ts is None else now - self._last_poll_ts
+            due = elapsed is None or elapsed < 0 or elapsed >= self.cfg.RADAR_POLL_INTERVAL
         if due:
             return self.poll_now(now)
         return None
+
+    def clock_stepped(self, pre_now: float, post_now: float) -> None:
+        """Restart the freeze if the step would evaporate it, and force a re-poll —
+        the frame URL is date-derived, so pre-step frames came from the wrong day."""
+        with self._lock:
+            lr = self._last_rain_ts
+            if (lr is not None and 0 <= (pre_now - lr) < self.cfg.RADAR_LATCH_SEC
+                    and not (0 <= (post_now - lr) < self.cfg.RADAR_LATCH_SEC)):
+                self._last_rain_ts = post_now
+                self._save_rain_ts()
+                log.warning("radar post-rain freeze restarted across a clock step")
+            self._last_poll_ts = None
+            self._last_ok_ts = None         # wrong-clock frame must not read as fresh
 
     def component(self, sun_alt, now=None):
         if now is None:
@@ -487,6 +509,14 @@ class RadarPoller:
             # chase the radar edge. The window is bounded, so a genuinely departed cell
             # (or a blind feed) self-clears instead of sticking. It also covers an echo
             # inside the ring but over no WU station, where WU never latches at all.
+            # self-heal future-dated stamps at check time (backward clock step while
+            # running); a negative age must read as "just now", not as eternal freeze
+            if self._last_rain_ts is not None and self._last_rain_ts > now + 60:
+                log.warning("radar rain timestamp in the future (clock step?) — clamping")
+                self._last_rain_ts = now
+                self._save_rain_ts()
+            if self._last_ok_ts is not None and self._last_ok_ts > now + 60:
+                self._last_ok_ts = now      # never present old data as freshly fetched
             latched = (self._last_rain_ts is not None
                        and (now - self._last_rain_ts) < self.cfg.RADAR_LATCH_SEC)
             # Pillow absent => radar never really ran; never veto from an artificial state.

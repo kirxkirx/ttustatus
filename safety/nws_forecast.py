@@ -101,39 +101,57 @@ def fetch(cfg):
     except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
         return {"ok": False, "error": str(e)}
 
-    now = datetime.now(timezone.utc)
-    hour0 = now.replace(minute=0, second=0, microsecond=0)
-    maps = {k: _expand(p.get(prop)) for k, prop in WANTED.items()}
+    # Post-processing sits in its OWN try: a payload that is valid JSON but the wrong
+    # shape (or carries a malformed updateTime) must become a normal ok=False result,
+    # not an exception that escapes poll_now — that froze _latest at the last good
+    # forecast forever while retrying every 60 s.
+    try:
+        now = datetime.now(timezone.utc)
+        hour0 = now.replace(minute=0, second=0, microsecond=0)
+        maps = {k: _expand(p.get(prop)) for k, prop in WANTED.items()}
 
-    def at(h):
-        return {k: maps[k].get(h) for k in WANTED}
+        def at(h):
+            return {k: maps[k].get(h) for k in WANTED}
 
-    update = p.get("updateTime")
-    age_min = (now - _iso(update)).total_seconds() / 60.0 if update else None
+        update = p.get("updateTime")
+        age_min = (now - _iso(update)).total_seconds() / 60.0 if update else None
 
-    hours = []
-    for k in range(cfg.NWS_RENDER_HOURS):
-        h = hour0 + timedelta(hours=k)
-        row = at(h)
-        row["local"] = _local(h, cfg.LOCAL_TZ).strftime("%a %H:%M")
-        row["temp_f"] = None if row["temp_c"] is None else round(row["temp_c"] * 9 / 5 + 32)
-        hours.append(row)
+        hours = []
+        for k in range(cfg.NWS_RENDER_HOURS):
+            h = hour0 + timedelta(hours=k)
+            row = at(h)
+            row["local"] = _local(h, cfg.LOCAL_TZ).strftime("%a %H:%M")
+            row["temp_f"] = (None if row["temp_c"] is None
+                             else round(row["temp_c"] * 9 / 5 + 32))
+            hours.append(row)
 
-    return {
-        "ok": True, "error": None, "grid": label, "update_time": update,
-        "age_min": round(age_min, 1) if age_min is not None else None,
-        "now_hour": at(hour0),
-        "next_hour": at(hour0 + timedelta(hours=1)),
-        "hours": hours,
-    }
+        return {
+            "ok": True, "error": None, "grid": label, "update_time": update,
+            "age_min": round(age_min, 1) if age_min is not None else None,
+            "fetched_ts": time.time(),
+            "now_hour": at(hour0),
+            "next_hour": at(hour0 + timedelta(hours=1)),
+            "hours": hours,
+        }
+    except Exception as e:  # noqa: BLE001 — any malformed payload = unavailable
+        return {"ok": False, "error": f"malformed forecast payload: {e!r}"}
 
 
-def evaluate(result, cfg):
+def evaluate(result, cfg, now_ts=None):
     """Pure: decide safe + reasons from a fetch() result. 'available' False if none/stale."""
+    if now_ts is None:
+        now_ts = time.time()
     if not result or not result.get("ok"):
         return {"available": False, "safe": True, "reasons": [], "stale": True}
+    # The forecast must RE-AGE: age_min was computed at fetch time and never advanced,
+    # so a silenced poller kept presenting an old forecast as available forever.
+    fetched = result.get("fetched_ts")
+    if fetched is not None and (now_ts - fetched) > 2 * cfg.NWS_POLL_INTERVAL:
+        return {"available": False, "safe": True, "reasons": [], "stale": True}
     age = result.get("age_min")
-    if age is None or age > cfg.NWS_STALE_AFTER_MIN:
+    # negative beyond skew = the forecast is from "the future" = the clock is wrong;
+    # data selected under a wrong clock must not be presented as a current forecast
+    if age is None or age > cfg.NWS_STALE_AFTER_MIN or age < -2.0:
         return {"available": False, "safe": True, "reasons": [], "stale": True}
     checks = (
         ("cloud_cover_pct", cfg.NWS_CLOUD_MAX, "cloud cover"),
@@ -178,18 +196,27 @@ class NwsForecastPoller:
         if now_ts is None:
             now_ts = time.time()
         with self._lock:
-            due = (self._last_poll_ts is None
-                   or (now_ts - self._last_poll_ts) >= self.cfg.NWS_POLL_INTERVAL)
+            elapsed = None if self._last_poll_ts is None else now_ts - self._last_poll_ts
+            # elapsed < 0: the clock stepped backward past the last poll — poll now
+            # rather than stalling for the entire step
+            due = (elapsed is None or elapsed < 0
+                   or elapsed >= self.cfg.NWS_POLL_INTERVAL)
         if due:
             self.poll_now(now_ts)
+
+    def clock_stepped(self, pre_now: float, post_now: float) -> None:
+        with self._lock:
+            self._last_poll_ts = None       # re-fetch under the corrected clock
 
     def component(self, now=None):
         with self._lock:
             res = self._latest
-        ev = evaluate(res, self.cfg)
+        ev = evaluate(res, self.cfg, now)
         comp = {
             "safe": ev["safe"], "available": ev["available"], "stale": ev["stale"],
             "reasons": ev["reasons"],
+            # WHY it is unavailable, so the page can say more than "N/A"
+            "error": (res or {}).get("error"),
             "source": "NWS api.weather.gov gridpoint forecast",
             "thresholds": {"cloud_pct": self.cfg.NWS_CLOUD_MAX,
                            "precip_prob_pct": self.cfg.NWS_PRECIP_PROB_MAX,

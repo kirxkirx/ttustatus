@@ -82,6 +82,17 @@ class RainPoller:
             log.warning("latch file unreadable; arming a full latch (fail-safe)")
             return
         self._latch_until = _finite(d.get("latch_until"))
+        # CLAMP: latch_until is always written as now+RAIN_LATCH_HOURS, so a persisted
+        # value further in the future than one full latch means the clock is (or was)
+        # wrong — a Pi booting with a stale RTC read an August latch under a March clock
+        # as "227329 min left". Bound the damage to one full latch, loudly.
+        max_until = time.time() + self.cfg.RAIN_LATCH_HOURS * 3600
+        if self._latch_until is not None and self._latch_until > max_until + 60:
+            log.warning("persisted rain latch expiry is %.1f days in the future — the "
+                        "system clock is (or was) wrong; clamping to one full latch",
+                        (self._latch_until - time.time()) / 86400.0)
+            self._latch_until = max_until
+            self._latch_dirty = True
         self._last_rain_ts = d.get("last_rain_ts")
         if self._latch_until and self._latch_until > time.time():
             mins = int((self._latch_until - time.time()) / 60)
@@ -174,16 +185,43 @@ class RainPoller:
         if sun_alt is None or sun_alt >= self.cfg.RAIN_POLL_SUN_BELOW_DEG:
             return None
         with self._lock:
-            due = (self._last_poll_ts is None
-                   or (now - self._last_poll_ts) >= self.cfg.WU_POLL_INTERVAL)
+            # elapsed < 0 = the wall clock stepped backward past the last poll; treat as
+            # due, or polling would stall for the entire size of the step
+            elapsed = None if self._last_poll_ts is None else now - self._last_poll_ts
+            due = elapsed is None or elapsed < 0 or elapsed >= self.cfg.WU_POLL_INTERVAL
         if not due:
             return None
         return self.poll_now(now)
+
+    def clock_stepped(self, pre_now: float, post_now: float) -> None:
+        """The system clock stepped (NTP sync after a wrong-RTC boot). Re-arm a latch
+        that the step would silently evaporate: it was armed under the OLD clock, so in
+        real time the rain was recent regardless of what the clock said. Also force an
+        immediate re-poll so all data is re-fetched under the corrected clock."""
+        with self._lock:
+            lu = self._latch_until
+            if (lu is not None and math.isfinite(lu)
+                    and lu > pre_now and lu <= post_now):
+                self._latch_until = post_now + self.cfg.RAIN_LATCH_HOURS * 3600
+                self._latch_dirty = True
+                log.warning("rain latch re-armed across a clock step (it would have "
+                            "silently evaporated)")
+            self._last_poll_ts = None
 
     def component(self, sun_alt, now=None) -> dict:
         if now is None:
             now = time.time()
         with self._lock:
+            # Self-heal at check time too: a clock stepping backward while we run would
+            # otherwise stretch an armed latch to months (and nothing would ever rewrite
+            # the file, because all polling stalls with it).
+            max_until = now + self.cfg.RAIN_LATCH_HOURS * 3600
+            if (self._latch_until is not None and math.isfinite(self._latch_until)
+                    and self._latch_until > max_until + 60):
+                log.warning("rain latch expiry beyond one full latch (clock step?) — "
+                            "clamping")
+                self._latch_until = max_until
+                self._latch_dirty = True
             # A non-finite latch (should not happen; defensive) is treated as latched.
             latched = self._latch_until is not None and (
                 not math.isfinite(self._latch_until) or now < self._latch_until)
@@ -360,7 +398,7 @@ class SafetyMonitor:
 
         # Connectivity watchdog (loss of internet). HARD veto after the offline threshold.
         if self.conn is not None:
-            conn = self.conn.component(now)
+            conn = self.conn.component()      # its clock is monotonic-internal
         else:
             conn = conn_mod.unavailable_component(self.cfg)
         conn_safe = conn["safe"]

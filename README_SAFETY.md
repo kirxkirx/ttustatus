@@ -95,6 +95,36 @@ Quick manual test without systemd: `TTU_SAFETY_WU_KEY=<key> python3 safety_monit
 (the `run_*.sh` scripts remain as manual fallbacks; `run_safety_monitor.sh` sources
 `~/ttustatus.env` itself).
 
+## Clock robustness
+
+The Pi has no battery-backed RTC: after a power cut it boots with whatever time
+`fake-hwclock` last saved, which can be **months wrong** until NTP syncs (the 2026-08-25
+incident: a boot under a March clock read the persisted August latches as *"rain latch
+active (227329 min left)"*). The daemon defends itself:
+
+- **Persisted latch timestamps are clamped** at load *and* at every check: a rain latch
+  can never exceed one full `RAIN_LATCH_HOURS`, GLM one cool-off, the radar freeze one
+  `RADAR_LATCH_SEC` — whatever a wrong clock did, the worst case is one full latch
+  period, fail-safe, then normal operation.
+- A **clock step is detected** (wall vs monotonic drift > 30 s), logged CRITICAL, and
+  recorded as a `CLOCK-STEP` event. On a step every layer **re-polls immediately**
+  (GLM/radar fetch by date — data fetched under a wrong clock came from the wrong day),
+  and a latch that the step would silently *evaporate* (armed under the old clock,
+  "expired" under the new one) is **re-armed for its full duration** — the rain was
+  recent in real time regardless of what the clock said.
+- Pollers treat a **backward** step as "poll now" instead of stalling until the wall
+  clock catches up; the connectivity watchdog runs entirely on the monotonic clock, so
+  steps can neither fake a huge offline window nor neutralize it.
+- The NWS forecast **re-ages**: if the poller goes silent the forecast flips to
+  *unavailable* within two poll intervals instead of presenting frozen data forever, a
+  forecast dated in the future (wrong clock) is never presented as current, and the
+  page shows *why* it is unavailable (e.g. the TLS "certificate is not yet valid"
+  failures a wrong clock causes).
+
+None of this replaces NTP — until the clock syncs, date-derived data sources (GLM S3
+prefixes, MRMS frame URLs) still fetch the wrong day's data. It bounds the damage and
+makes the condition loud instead of silent.
+
 ## Connect from NINA
 
 Equipment → Safety Monitor → **ASCOM Alpaca**. Discovery (UDP 32227) should find

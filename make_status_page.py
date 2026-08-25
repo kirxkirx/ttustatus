@@ -2631,7 +2631,9 @@ def build_safety_tiles_html(comp, state_stale=False):
 
     if not nws.get("available"):
         nws_v = '<div class="v mono" style="font-size:15px">N/A</div>'
-        nws_s = safety_dot_html(True, unknown=True) + "forecast unavailable"
+        err = nws.get("error")
+        why = (" (%s)" % html.escape(str(err)[:60])) if err else ""
+        nws_s = safety_dot_html(True, unknown=True) + "forecast unavailable" + why
     else:
         nws_v = ('<div class="v mono" style="font-size:13px;line-height:1.4">'
                  'now %s<br>nxt %s</div>' % (_cpt(nws.get("now_hour")),

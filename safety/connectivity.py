@@ -34,19 +34,26 @@ def _reachable(url, timeout):
 
 
 class ConnectivityWatch:
+    """All internal timing is MONOTONIC: this watch holds no persisted state, and wall
+    time made it lie in both directions when NTP stepped the clock — a forward step
+    turned "last probe OK 30 s ago" into a spurious 160-day-offline hard veto, and a
+    backward step made offline_sec negative, neutralizing the watchdog for as long as
+    the step was big. time.monotonic() cannot step. Callers may still pass an explicit
+    `now` (tests drive time with it); the default is the monotonic clock."""
+
     def __init__(self, cfg, start_ts=None):
         self.cfg = cfg
         self._lock = threading.Lock()
         # grace: start the clock at daemon start, so a fresh daemon has a full window before
         # it could declare unsafe (matches "unreachable for an hour").
-        self._last_ok = start_ts if start_ts is not None else time.time()
+        self._last_ok = start_ts if start_ts is not None else time.monotonic()
         self._last_probe_ts = None
         self._online = True          # optimistic until the first probe result
 
     def probe_once(self, now=None):
         """Try each host; the first that answers marks us online. Returns True if reachable."""
         if now is None:
-            now = time.time()
+            now = time.monotonic()
         ok = False
         for url in self.cfg.CONN_PROBE_URLS:
             if _reachable(url, self.cfg.CONN_PROBE_TIMEOUT):
@@ -61,9 +68,9 @@ class ConnectivityWatch:
 
     def component(self, now=None):
         if now is None:
-            now = time.time()
+            now = time.monotonic()
         with self._lock:
-            offline_sec = now - self._last_ok
+            offline_sec = max(0.0, now - self._last_ok)
             online = self._online
             probed = self._last_probe_ts is not None
         offline_too_long = offline_sec > self.cfg.CONN_OFFLINE_UNSAFE_SEC

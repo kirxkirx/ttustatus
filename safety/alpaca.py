@@ -200,7 +200,9 @@ def _setup_html(monitor, cfg) -> str:
     nws = comp.get("nws")
     if nws:
         if not nws.get("available"):
-            nv = "unavailable / stale (not gating)"
+            err = nws.get("error")
+            nv = "unavailable / stale (not gating)" + (
+                " — %s" % str(err)[:60] if err else "")
             nws_unknown = True
         else:
             nws_unknown = False
