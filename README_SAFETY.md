@@ -158,13 +158,24 @@ one-time **symlinks into `/dev/shm`** — Debian's Apache/nginx/lighttpd follow 
 of the box; after a reboot they dangle for at most one regeneration cycle. Opt out with
 `TTU_SAFETY_RADAR_THUMB_SHM=0` / `TTU_STATUS_HTML_SHM=0`.
 
-OS-side checklist (run on the Pi): make sure the web server's **access log** is off or
-volatile for this vhost (a browser auto-refreshing the page writes a log line every
-90 s forever); bound journald (`/etc/systemd/journald.conf`: `SystemMaxUse=64M`,
-`SyncIntervalSec=5m`) while keeping `Storage=persistent` for reboot forensics; check
-swap is off or unused (`swapon --show`; `dphys-swapfile` defaults to a swapfile ON the
-SD); confirm `noatime` on the root mount (`findmnt -o OPTIONS /`); and find any
-remaining writers empirically with `sudo fatrace -f W` for a minute.
+OS-side checklist (run on the Pi): the web server's **access log** is the big one — on
+the observatory Pi, `fatrace -f W` showed Apache's access.log as essentially the only
+high-frequency SD writer left. Disable it (keep error.log, which writes rarely and is
+useful):
+```bash
+grep -Rn "CustomLog\|TransferLog" /etc/apache2/   # -R (not -r): *-enabled/ are symlinks
+sudo sed -i 's|^\([[:space:]]*CustomLog\)|#\1|' /etc/apache2/sites-available/000-default.conf
+sudo a2disconf other-vhosts-access-log
+sudo apachectl configtest && sudo systemctl reload apache2
+```
+(edit files in `sites-available/`, not the `sites-enabled/` symlinks — `sed -i` would
+silently replace a symlink with a regular file)
+Also: bound journald (`/etc/systemd/journald.conf`: `SystemMaxUse=64M`) while keeping
+`Storage=persistent` for reboot forensics; check swap (`swapon --show` — zram = RAM =
+good; a `dphys-swapfile` swapfile lives ON the SD); `sudo systemctl disable --now
+packagekit` on a headless Pi; confirm `noatime` on root (`findmnt -o OPTIONS /`); keep
+chrony's drift file (it makes the clock accurate quickly after reboot); and re-check
+empirically with `sudo fatrace -f W` for a minute.
 
 ## Connect from NINA
 
