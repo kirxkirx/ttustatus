@@ -175,7 +175,11 @@ Also: bound journald (`/etc/systemd/journald.conf`: `SystemMaxUse=64M`) while ke
 good; a `dphys-swapfile` swapfile lives ON the SD); `sudo systemctl disable --now
 packagekit` on a headless Pi; confirm `noatime` on root (`findmnt -o OPTIONS /`); keep
 chrony's drift file (it makes the clock accurate quickly after reboot); and re-check
-empirically with `sudo fatrace -f W` for a minute.
+empirically with `sudo fatrace -f W` for a minute. Optional, for maximum quiet — the two
+remaining once-a-day bursts: `sudo systemctl mask man-db.timer` (free on a headless box)
+and `sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer` (then run
+`apt update` manually before installing anything). Daily-burst volume is small; neither
+is required.
 
 ## Connect from NINA
 
