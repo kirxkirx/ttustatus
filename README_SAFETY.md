@@ -12,11 +12,13 @@ persistent Alpaca server and the rain poller live in a **separate long-running d
 `safety_monitor.py`. They share small JSON files:
 
 ```
-make_status_page.py  --writes-->  /tmp/safety_inputs.json   (sun altitude, humidity)
+make_status_page.py  --writes-->  /dev/shm/safety_inputs.json  (sun altitude, humidity)
 safety_monitor.py    --reads--/
-safety_monitor.py    --writes-->  /tmp/safety_state.json    (IsSafe + inputs + events)
+safety_monitor.py    --writes-->  /dev/shm/safety_state.json   (IsSafe + inputs + events)
 make_status_page.py  --reads--/   (renders the "Safety monitor" page section)
 ```
+(RAM-backed `/dev/shm`, deliberately: these files are rewritten every minute or two and
+must never wear the SD card; both are regenerated within seconds of a restart.)
 
 Durable files (survive reboot): `~/safety_latch.json` (the rain latch) and
 `~/safety_events.log` (the audit trail, also mirrored to stdout).
@@ -124,6 +126,45 @@ active (227329 min left)"*). The daemon defends itself:
 None of this replaces NTP — until the clock syncs, date-derived data sources (GLM S3
 prefixes, MRMS frame URLs) still fetch the wrong day's data. It bounds the damage and
 makes the condition loud instead of silent.
+
+**Pi ops — keep the boot clock close:** `fake-hwclock` is NOT installed on every image
+(it was absent on the observatory Pi — the 2026-08 incident's "March" boot time came from
+systemd-timesyncd's `/var/lib/systemd/timesync/clock`, which older systemd only rewrites
+on a *clean* shutdown, so a power cut restored the previous boot's date). Install it and
+add a frequent save:
+`sudo apt install fake-hwclock`, then
+`echo '*/10 * * * * root /sbin/fake-hwclock save >/dev/null 2>&1' | sudo tee
+/etc/cron.d/fake-hwclock-frequent`, and confirm `/etc/fake-hwclock.data` tracks
+`date -u`. (If saves ever stop, check for a read-only root / Overlay FS blocking writes
+to `/etc`.) The real fix is a DS3231 RTC module (`dtoverlay=i2c-rtc,ds3231`), which
+survives power cuts without any writable filesystem.
+
+## SD-card wear
+
+The Pi runs 24/7 from an SD card on imperfect power, so every recurring write matters
+(a brownout mid-write is how SD cards die). What goes where, by design:
+
+| Path | Written | Medium |
+|---|---|---|
+| `/dev/shm/safety_inputs.json`, `/dev/shm/safety_state.json`, page cache | every 60–90 s | RAM |
+| `/dev/shm/ttu_radar*.png` + `/dev/shm/status.html` (symlinked from `/var/www/html`) | every 90 s / 5 min | RAM |
+| `~/safety_latch.json`, `~/safety_glm_latch.json`, `~/safety_radar_latch.json` | only on rain/lightning events | SD (must survive reboot) |
+| `~/safety_events.log` (audit trail) | only on events | SD (its purpose) |
+| `~/.cache/ttu-radar/` basemap tiles | once ever | SD (avoids re-fetching Carto per boot) |
+
+The radar PNGs and the page were the big movers (~150–250 MB/day and ~30 MB/day of SD
+writes respectively before the symlink scheme; ~0 after). The web-root files become
+one-time **symlinks into `/dev/shm`** — Debian's Apache/nginx/lighttpd follow them out
+of the box; after a reboot they dangle for at most one regeneration cycle. Opt out with
+`TTU_SAFETY_RADAR_THUMB_SHM=0` / `TTU_STATUS_HTML_SHM=0`.
+
+OS-side checklist (run on the Pi): make sure the web server's **access log** is off or
+volatile for this vhost (a browser auto-refreshing the page writes a log line every
+90 s forever); bound journald (`/etc/systemd/journald.conf`: `SystemMaxUse=64M`,
+`SyncIntervalSec=5m`) while keeping `Storage=persistent` for reboot forensics; check
+swap is off or unused (`swapon --show`; `dphys-swapfile` defaults to a swapfile ON the
+SD); confirm `noatime` on the root mount (`findmnt -o OPTIONS /`); and find any
+remaining writers empirically with `sudo fatrace -f W` for a minute.
 
 ## Connect from NINA
 

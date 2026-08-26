@@ -27,10 +27,19 @@ from astropy.utils import iers
 
 IMAGE_FILE = "/var/www/html/snapshot.jpg"
 HTML_FILE = "/var/www/html/status.html"
+# Write the page into /dev/shm and leave a one-time symlink at HTML_FILE: the page is
+# rewritten every ~90 s (~1000 SD writes/day) on a Pi whose brownouts corrupt SD cards
+# mid-write. Debian's Apache/nginx/lighttpd follow symlinks by default. Set
+# TTU_STATUS_HTML_SHM=0 to write directly.
+HTML_VIA_SHM = (os.environ.get("TTU_STATUS_HTML_SHM", "1").strip().lower()
+                not in ("0", "false", "no")) and os.path.isdir("/dev/shm")
 
 # /dev/shm is a RAM tmpfs on Raspberry Pi OS — these transient files are rewritten every
 # cycle and must not wear the SD card (and must not survive a reboot looking "fresh").
 _SHM = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+if _SHM == "/tmp":
+    print("WARNING: /dev/shm not found — transient files fall back to /tmp, which is "
+          "ON THE SD CARD on Raspberry Pi OS")
 CACHE_FILE = _SHM + "/status_page_cache.json"
 
 # Camera processing runs on the RAM disk: the night pipeline writes GBs of DNG/TIFF
@@ -1613,17 +1622,34 @@ def parse_chrony_clients(out):
     return count
 
 
-def get_chrony_clients_count():
-    out = None
-    count = None
+# When sudoers does not allow it, the `sudo -n chronyc clients` fallback writes a
+# pam/authpriv line into the persistent journal on EVERY page run (~1000 lines/day of
+# pure noise on the SD). A denial leaves a marker in shm and the fallback is retried at
+# most once an hour — the client count is a display nicety, not safety data.
+SUDO_CHRONYC_DENIED_MARKER = _SHM + "/status_chronyc_sudo_denied"
 
+
+def get_chrony_clients_count():
     out = run_command(CHRONY_CLIENTS_CMD, CMD_TIMEOUT_SHORT)
     count = parse_chrony_clients(out)
     if count is not None:
         return count
 
+    try:
+        if (os.path.exists(SUDO_CHRONYC_DENIED_MARKER)
+                and time.time() - os.path.getmtime(SUDO_CHRONYC_DENIED_MARKER) < 3600):
+            return None                        # denied recently; don't spam authpriv
+    except OSError:
+        pass
     out = run_command(CHRONY_CLIENTS_SUDO_CMD, CMD_TIMEOUT_SHORT)
-    return parse_chrony_clients(out)
+    count = parse_chrony_clients(out)
+    if count is None:
+        try:
+            with open(SUDO_CHRONYC_DENIED_MARKER, "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
+    return count
 
 
 def get_ntp_info():
@@ -3064,10 +3090,33 @@ def write_html(
 
     # Atomic replace: a crash/power cut mid-write must never leave a half page behind
     # (matches every other writer in this file).
-    tmp_file = HTML_FILE + ".tmp"
+    out = _html_output_target()
+    tmp_file = out + ".tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
         f.write(page)
-    os.replace(tmp_file, HTML_FILE)
+    os.replace(tmp_file, out)
+
+
+def _html_output_target():
+    """Physical write target for the page: /dev/shm + a one-time symlink at HTML_FILE
+    (unless disabled), so the every-90-s rewrite never touches the SD card."""
+    if not HTML_VIA_SHM:
+        return HTML_FILE
+    real = os.path.join("/dev/shm", os.path.basename(HTML_FILE))
+    try:
+        if os.path.islink(HTML_FILE):
+            if os.readlink(HTML_FILE) != real:
+                os.remove(HTML_FILE)
+                os.symlink(real, HTML_FILE)
+        else:
+            if os.path.exists(HTML_FILE):
+                os.remove(HTML_FILE)               # replace the old regular file once
+            os.symlink(real, HTML_FILE)
+        return real
+    except OSError as e:
+        print(f"WARNING: cannot set up shm symlink for {HTML_FILE} ({e}); "
+              f"writing directly")
+        return HTML_FILE
 
 
 def main():

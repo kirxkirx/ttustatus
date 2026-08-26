@@ -12,7 +12,10 @@ WorkingDirectory=__REPO__
 EnvironmentFile=-/home/__USER__/ttustatus.env
 ExecStart=/usr/bin/python3 __REPO__/safety_monitor.py
 Restart=always
-RestartSec=5
+# 15 s (not 5): a crash loop at 5 s writes STARTUP/CONFIG event lines + journald bursts
+# ~700x/h to the SD card. Deliberately NO StartLimitBurst — a safety monitor must keep
+# retrying forever rather than end up permanently stopped.
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target

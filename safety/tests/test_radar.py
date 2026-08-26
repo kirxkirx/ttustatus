@@ -1,3 +1,4 @@
+import os
 import time
 
 import pytest
@@ -265,3 +266,28 @@ def test_confirmation_default_is_two_frames():
 def test_trigger_radius_default_is_thirty_km():
     # the operator-chosen ring; the map plot and both pages label themselves from it
     assert config.RADAR_TRIGGER_KM == 30.0
+
+
+def test_thumbnail_writes_go_to_shm_via_symlink(tmp_path, monkeypatch):
+    # The thumbnail pair is rewritten every poll (~150-250 MB/day) — it must land in
+    # RAM, with the web-root path as a one-time symlink the server can follow.
+    monkeypatch.setattr(config, "RADAR_THUMB_VIA_SHM", True, raising=False)
+    t = rd.Thumbnailer.__new__(rd.Thumbnailer)
+    t.cfg = config
+    t.thumb_path = str(tmp_path / "ttu_radar_test_shm.png")
+    out = t._output_target()
+    assert out == "/dev/shm/ttu_radar_test_shm.png"
+    assert os.path.islink(t.thumb_path) and os.readlink(t.thumb_path) == out
+    # idempotent: second call keeps the same link, and a stale regular file is replaced
+    assert t._output_target() == out
+    os.remove(t.thumb_path)
+    (tmp_path / "ttu_radar_test_shm.png").write_bytes(b"old regular file")
+    assert t._output_target() == out and os.path.islink(t.thumb_path)
+
+
+def test_thumbnail_shm_disabled_writes_directly(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "RADAR_THUMB_VIA_SHM", False, raising=False)
+    t = rd.Thumbnailer.__new__(rd.Thumbnailer)
+    t.cfg = config
+    t.thumb_path = str(tmp_path / "direct.png")
+    assert t._output_target() == t.thumb_path and not os.path.islink(t.thumb_path)

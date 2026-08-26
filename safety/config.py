@@ -184,6 +184,12 @@ RADAR_TILE_URL_DAY = _env_str(
     "TTU_SAFETY_RADAR_TILE_URL_DAY",
     "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png")  # OSM data, light theme
 RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
+# Write the thumbnails into /dev/shm and leave a one-time symlink at RADAR_THUMB_PATH:
+# the two PNGs are rewritten every poll (~150-250 MB/day) — the single largest SD write
+# of the whole stack, on a Pi whose brownouts corrupt SD cards mid-write. Apache, nginx
+# and lighttpd all follow symlinks out of the box on Debian. Set 0 to write directly.
+RADAR_THUMB_VIA_SHM = (_env_str("TTU_SAFETY_RADAR_THUMB_SHM", "1").strip().lower()
+                       not in ("0", "false", "no")) and os.path.isdir("/dev/shm")
 RADAR_ATTRIBUTION = "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS via IEM"
 # (Persistence note: the radar keeps its OWN post-rain freeze above — it does NOT rely on the
 # WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
@@ -228,6 +234,12 @@ CONN_PROBE_URLS = [
 # pre-reboot state can never be mistaken for fresh. make_status_page.py uses the same
 # paths — update both sides together when deploying this change.
 _SHM = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+if _SHM == "/tmp":
+    # On Raspberry Pi OS bookworm /tmp is ON THE SD CARD, so this fallback silently
+    # turns every per-minute state write into SD wear. It should never happen on a
+    # real Pi (/dev/shm always exists) — if it does, say so loudly.
+    CONFIG_WARNINGS.append("/dev/shm not found — transient state files fall back to "
+                           "/tmp, which is ON THE SD CARD on Raspberry Pi OS")
 INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", _SHM + "/safety_inputs.json")
 STATE_FILE = _env_str("TTU_SAFETY_STATE_FILE", _SHM + "/safety_state.json")
 # Heartbeat for the throttled state-file write (see monitor._write_state): unchanged state

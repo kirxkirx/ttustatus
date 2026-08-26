@@ -334,15 +334,41 @@ class Thumbnailer:
         d.text((8, 6), frame_txt, fill=self.colors["text"], font=_font(12),
                stroke_width=2, stroke_fill=stroke)
 
-        tmp = self.thumb_path + ".tmp"
+        out = self._output_target()
+        tmp = out + ".tmp"
         try:
-            os.makedirs(os.path.dirname(self.thumb_path) or ".", exist_ok=True)
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             im.save(tmp, format="PNG")     # .tmp ext -> must state the format
-            os.replace(tmp, self.thumb_path)
+            os.replace(tmp, out)
             return True
         except Exception:
-            log.exception("could not write radar thumbnail %s", self.thumb_path)
+            log.exception("could not write radar thumbnail %s", out)
             return False
+
+    def _output_target(self) -> str:
+        """Where the PNG is physically written. With RADAR_THUMB_VIA_SHM the bytes go
+        to /dev/shm (RAM) and thumb_path becomes a one-time SYMLINK to them — the web
+        server follows it, the page keeps its unchanged path, and the every-5-minutes
+        rewrite stops touching the SD card entirely. After a reboot the symlink dangles
+        for at most one poll; the page already shows 'not available yet' for that."""
+        if not getattr(self.cfg, "RADAR_THUMB_VIA_SHM", False):
+            return self.thumb_path
+        real = os.path.join("/dev/shm", os.path.basename(self.thumb_path))
+        try:
+            if os.path.islink(self.thumb_path):
+                if os.readlink(self.thumb_path) != real:
+                    os.remove(self.thumb_path)
+                    os.symlink(real, self.thumb_path)
+            else:
+                if os.path.exists(self.thumb_path):
+                    os.remove(self.thumb_path)      # replace the old regular file once
+                os.makedirs(os.path.dirname(self.thumb_path) or ".", exist_ok=True)
+                os.symlink(real, self.thumb_path)
+            return real
+        except Exception:
+            log.exception("cannot set up the shm symlink for %s — writing directly",
+                          self.thumb_path)
+            return self.thumb_path
 
 
 # ---- poller ----------------------------------------------------------------

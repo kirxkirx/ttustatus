@@ -205,3 +205,35 @@ def test_rain_tile_disabled_without_key():
                      "polling_active": False}}
     tiles = msp.build_safety_tiles_html(comp)
     assert "disabled" in tiles and "WU_API_KEY" in tiles
+
+
+def test_html_write_goes_to_shm_via_symlink(tmp_path, monkeypatch):
+    # the page is rewritten every ~90 s; the SD-card path must become a symlink to RAM
+    monkeypatch.setattr(msp, "HTML_VIA_SHM", True)
+    monkeypatch.setattr(msp, "HTML_FILE", str(tmp_path / "status_test_shm.html"))
+    out = msp._html_output_target()
+    assert out == "/dev/shm/status_test_shm.html"
+    assert os.path.islink(msp.HTML_FILE) and os.readlink(msp.HTML_FILE) == out
+    assert msp._html_output_target() == out          # idempotent
+    monkeypatch.setattr(msp, "HTML_VIA_SHM", False)
+    assert msp._html_output_target() == msp.HTML_FILE
+
+
+def test_sudo_chronyc_fallback_is_throttled(tmp_path, monkeypatch):
+    # a denied `sudo -n chronyc clients` writes an authpriv journal line per page run
+    # (~1000/day); after one denial the fallback must rest for an hour
+    marker = str(tmp_path / "denied_marker")
+    monkeypatch.setattr(msp, "SUDO_CHRONYC_DENIED_MARKER", marker)
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(cmd)
+        return None                                   # both plain and sudo fail
+    monkeypatch.setattr(msp, "run_command", fake_run)
+    monkeypatch.setattr(msp, "parse_chrony_clients", lambda out: None)
+    assert msp.get_chrony_clients_count() is None
+    assert msp.CHRONY_CLIENTS_SUDO_CMD in calls       # first run: sudo attempted once
+    calls.clear()
+    assert msp.get_chrony_clients_count() is None     # next run, marker fresh
+    assert msp.CHRONY_CLIENTS_SUDO_CMD not in calls, \
+        "sudo fallback retried within the hour despite a recorded denial"
