@@ -1,7 +1,7 @@
 import time
 
 from safety import config, wu_poll
-from safety.monitor import SafetyMonitor
+from safety.monitor import RainPoller, SafetyMonitor
 
 
 def test_safe_when_all_clear(env, write_inputs):
@@ -312,3 +312,44 @@ def test_rain_latch_default_is_one_hour():
     # the operator-chosen freeze time after the last WU station rain reading
     from safety import config as _cfg
     assert _cfg.RAIN_LATCH_HOURS == 1.0
+
+
+def test_unreliable_station_is_excluded_from_discovery(monkeypatch):
+    # KTXSHALL25 reports bogus precipitation (2026-08-29): a config blocklist must keep
+    # it out of the polled set so it can neither close nor hold open the dome.
+    from safety import config as _cfg
+    from safety import wu_poll as _wu
+    assert "KTXSHALL25" in _cfg.WU_EXCLUDE_STATIONS      # the current operator default
+    found = [("KTXLUBBO851", 0.1), ("KTXSHALL25", 11.0), ("KTXSHALL7", 0.6)]
+    monkeypatch.setattr(_wu, "discover_stations", lambda lat, lon: list(found))
+    p = RainPoller(_cfg, _NullEventLog())
+    p._ensure_stations(now=time.time())
+    ids = [s for s, d in p._stations]
+    assert "KTXSHALL25" not in ids, "excluded station still in the polled set"
+    assert "KTXLUBBO851" in ids and "KTXSHALL7" in ids   # the others survive
+    # the audit trail names the exclusion
+    ev = _NullEventLog.last_detail
+    assert ev and "excluded by config: KTXSHALL25" in ev
+
+
+def test_exclusion_is_case_insensitive_and_removable(monkeypatch):
+    from safety import config as _cfg
+    from safety import wu_poll as _wu
+    monkeypatch.setattr(_cfg, "WU_EXCLUDE_STATIONS", frozenset({"KTXSHALL25"}))
+    monkeypatch.setattr(_wu, "discover_stations",
+                        lambda lat, lon: [("ktxshall25", 11.0), ("KTXSHALL7", 0.6)])
+    p = RainPoller(_cfg, _NullEventLog())
+    p._ensure_stations(now=time.time())
+    assert [s for s, d in p._stations] == ["KTXSHALL7"]  # matched despite lowercase
+    # emptying the list (TTU_SAFETY_WU_EXCLUDE="") restores the station
+    monkeypatch.setattr(_cfg, "WU_EXCLUDE_STATIONS", frozenset())
+    p._stations_ts = 0.0                                 # force re-discovery
+    p._ensure_stations(now=time.time())
+    assert "ktxshall25" in [s for s, d in p._stations]
+
+
+class _NullEventLog:
+    last_detail = None
+
+    def record(self, action, **kw):
+        _NullEventLog.last_detail = kw.get("detail")

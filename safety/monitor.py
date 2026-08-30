@@ -141,6 +141,14 @@ class RainPoller:
         if dropped:
             log.warning("WU discovery: dropped %d station(s) beyond %g km", dropped,
                         self.cfg.WU_MAX_STATION_KM)
+        excluded = [s for s, d in near if s.upper() in self.cfg.WU_EXCLUDE_STATIONS]
+        if excluded:
+            # operator-maintained blocklist (TTU_SAFETY_WU_EXCLUDE): a station known to
+            # report bogus precipitation must not be able to close - or hold open - the
+            # dome. Loud on purpose, so the exclusion is never forgotten silently.
+            near = [(s, d) for s, d in near if s.upper() not in self.cfg.WU_EXCLUDE_STATIONS]
+            log.warning("WU discovery: EXCLUDED unreliable station(s) by config: %s",
+                        ", ".join(excluded))
         if not near:
             log.warning("WU discovery found NO stations within %g km of %s — "
                         "the rain layer has nothing to poll here",
@@ -150,7 +158,10 @@ class RainPoller:
             self._stations = near
             self._stations_ts = now
         names = ", ".join(f"{s} ({d:.1f}km)" for s, d in near)
-        self.log.record("WU-STATIONS", detail=f"{len(near)} nearest: {names}")
+        detail = f"{len(near)} nearest: {names}"
+        if excluded:
+            detail += f" (excluded by config: {', '.join(excluded)})"
+        self.log.record("WU-STATIONS", detail=detail)
 
     def poll_now(self, now=None) -> dict:
         """Poll WU once and update the latch. Returns the poll-result dict."""
