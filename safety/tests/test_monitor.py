@@ -319,7 +319,8 @@ def test_unreliable_station_is_excluded_from_discovery(monkeypatch):
     # it out of the polled set so it can neither close nor hold open the dome.
     from safety import config as _cfg
     from safety import wu_poll as _wu
-    assert "KTXSHALL25" in _cfg.WU_EXCLUDE_STATIONS      # the current operator default
+    # current operator defaults: one lying station, two dead ones (API-call savings)
+    assert {"KTXSHALL25", "KTXLUBBO680", "KTXSHALL23"} <= _cfg.WU_EXCLUDE_STATIONS
     found = [("KTXLUBBO851", 0.1), ("KTXSHALL25", 11.0), ("KTXSHALL7", 0.6)]
     monkeypatch.setattr(_wu, "discover_stations", lambda lat, lon: list(found))
     p = RainPoller(_cfg, _NullEventLog())
@@ -353,3 +354,76 @@ class _NullEventLog:
 
     def record(self, action, **kw):
         _NullEventLog.last_detail = kw.get("detail")
+
+
+def _poller_with_stations(monkeypatch, stations):
+    from safety import config as _cfg
+    p = RainPoller(_cfg, _NullEventLog())
+    p._stations = list(stations)
+    p._stations_ts = time.time()          # discovery fresh: no network in _ensure
+    monkeypatch.setattr(_cfg, "WU_API_KEY", "test-key", raising=False)
+    return p
+
+
+def test_dead_station_backs_off_and_revives(monkeypatch):
+    # After WU_BACKOFF_AFTER consecutive silent polls the station is probed only every
+    # WU_BACKOFF_RETRY_SEC; the first ANSWER restores full cadence automatically.
+    from safety import config as _cfg
+    from safety import wu_poll as _wu
+    p = _poller_with_stations(monkeypatch, [("KGOOD1", 1.0), ("KDEAD1", 5.0)])
+    monkeypatch.setattr(_cfg, "WU_BACKOFF_AFTER", 3)
+    monkeypatch.setattr(_cfg, "WU_BACKOFF_RETRY_SEC", 3600)
+    dead = {"KDEAD1"}
+    polled_log = []
+
+    def fake_poll(stations, max_age_min=None):
+        sids = [s for s, d in stations]
+        polled_log.append(sids)
+        results = [{"station": s, "state": "offline"} if s in dead
+                   else {"station": s, "state": "live", "precip_in_hr": 0.0, "age_min": 1}
+                   for s in sids]
+        return {"live": len([s for s in sids if s not in dead]), "total": len(sids),
+                "raining": [], "max_rate": 0.0, "results": results}
+    monkeypatch.setattr(_wu, "poll_stations", fake_poll)
+
+    for _ in range(3):                     # three silent polls -> backoff arms
+        r = p.poll_now()
+    assert r["total"] == 2                 # totals stay honest
+    r = p.poll_now()                       # 4th poll: dead station must be skipped
+    assert polled_log[-1] == ["KGOOD1"], "backed-off station was still polled"
+    assert {"station": "KDEAD1", "state": "backed-off"} in r["results"]
+    assert r["total"] == 2 and r["live"] == 1
+
+    # hourly revival probe: pretend the hour passed, and the station answers
+    p._backoff_until["KDEAD1"] = time.monotonic() - 1
+    dead.clear()
+    p.poll_now()
+    assert "KDEAD1" in polled_log[-1]      # probe happened
+    p.poll_now()
+    assert "KDEAD1" in polled_log[-1], "revived station did not resume full cadence"
+    assert _NullEventLog.last_detail and "answering again" in _NullEventLog.last_detail
+
+
+def test_stale_station_never_backs_off(monkeypatch):
+    # stale = responding with old data: alive, may freshen — keep polling it
+    from safety import config as _cfg
+    from safety import wu_poll as _wu
+    p = _poller_with_stations(monkeypatch, [("KSTALE1", 2.0)])
+    monkeypatch.setattr(_cfg, "WU_BACKOFF_AFTER", 2)
+    monkeypatch.setattr(_wu, "poll_stations", lambda st, max_age_min=None: {
+        "live": 0, "total": len(st), "raining": [], "max_rate": 0.0,
+        "results": [{"station": s, "state": "stale", "age_min": 90} for s, d in st]})
+    for _ in range(5):
+        p.poll_now()
+    assert p._backoff_until == {}, "a stale (responding) station was backed off"
+
+
+def test_discovery_refresh_prunes_backoff_state(monkeypatch):
+    from safety import wu_poll as _wu
+    p = _poller_with_stations(monkeypatch, [("KOLD1", 2.0)])
+    p._offline_streak["KOLD1"] = 99
+    p._backoff_until["KOLD1"] = time.monotonic() + 999
+    monkeypatch.setattr(_wu, "discover_stations", lambda lat, lon: [("KNEW1", 1.0)])
+    p._stations_ts = 0.0
+    p._ensure_stations(now=time.time())
+    assert p._offline_streak == {} and p._backoff_until == {}

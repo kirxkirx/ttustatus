@@ -60,6 +60,9 @@ class RainPoller:
         self._lock = threading.Lock()
         self._stations: list = []       # [(station_id, distance_km), ...]
         self._stations_ts = 0.0
+        # dead-station backoff (in-memory; a restart just re-probes everything once)
+        self._offline_streak: dict = {}   # sid -> consecutive 'offline' results
+        self._backoff_until: dict = {}    # sid -> monotonic ts of the next probe
         self._latch_until = None        # epoch when the rain latch expires
         self._last_rain_ts = None
         self._last_poll_ts = None
@@ -157,6 +160,9 @@ class RainPoller:
         with self._lock:
             self._stations = near
             self._stations_ts = now
+            keep = {s for s, d in near}
+            self._offline_streak = {k: v for k, v in self._offline_streak.items() if k in keep}
+            self._backoff_until = {k: v for k, v in self._backoff_until.items() if k in keep}
         names = ", ".join(f"{s} ({d:.1f}km)" for s, d in near)
         detail = f"{len(near)} nearest: {names}"
         if excluded:
@@ -168,9 +174,21 @@ class RainPoller:
         if now is None:
             now = time.time()
         self._ensure_stations(now)          # network I/O, outside the lock
+        mono = time.monotonic()
         with self._lock:
             stations = list(self._stations)
-        result = wu_poll.poll_stations(stations)
+            # dead-station backoff: skip stations that have been silent for
+            # WU_BACKOFF_AFTER consecutive polls, except when their hourly revival
+            # probe is due. Saves API calls on dead hardware; self-heals on answer.
+            active = [(s, d) for s, d in stations
+                      if self._backoff_until.get(s, 0) <= mono]
+            skipped = [(s, d) for s, d in stations
+                       if self._backoff_until.get(s, 0) > mono]
+        result = wu_poll.poll_stations(active)
+        self._update_backoff(result, mono)
+        for sid, _d in skipped:             # keep live/total honest on the page
+            result["results"].append({"station": sid, "state": "backed-off"})
+        result["total"] += len(skipped)
         with self._lock:
             self._last_poll_ts = now
             self._last_result = result
@@ -185,6 +203,33 @@ class RainPoller:
                     result=f"latch {self.cfg.RAIN_LATCH_HOURS:g}h",
                     live=f"{result['live']}/{result['total']}")
         return result
+
+    def _update_backoff(self, result, mono):
+        after = max(1, int(self.cfg.WU_BACKOFF_AFTER))
+        retry = float(self.cfg.WU_BACKOFF_RETRY_SEC)
+        with self._lock:
+            for r in result.get("results", []):
+                sid = r.get("station")
+                if r.get("state") == "offline":
+                    streak = self._offline_streak.get(sid, 0) + 1
+                    self._offline_streak[sid] = streak
+                    if streak == after:
+                        log.warning("WU station %s silent for %d consecutive polls — "
+                                    "backing off to one probe per %.0f min",
+                                    sid, streak, retry / 60.0)
+                        self.log.record("WU-BACKOFF", detail=f"{sid} silent for "
+                                        f"{streak} polls; probing every "
+                                        f"{retry / 60:.0f} min")
+                    if streak >= after:
+                        self._backoff_until[sid] = mono + retry
+                else:
+                    # any RESPONSE (live or stale) ends the backoff immediately
+                    if self._offline_streak.get(sid, 0) >= after:
+                        log.info("WU station %s is answering again — resuming normal "
+                                 "polling", sid)
+                        self.log.record("WU-REVIVED", detail=f"{sid} answering again")
+                    self._offline_streak.pop(sid, None)
+                    self._backoff_until.pop(sid, None)
 
     def maybe_poll(self, sun_alt, now=None):
         """Poll only if it's night (sun below the gate) and the interval has elapsed."""

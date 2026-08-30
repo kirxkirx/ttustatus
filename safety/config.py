@@ -82,11 +82,23 @@ else:
 GEOCODE_MISMATCH_KM = _env_float("TTU_SAFETY_GEO_MISMATCH_KM", 0.1)  # warn beyond ~100 m
 WU_MAX_STATION_KM = _env_float("TTU_SAFETY_WU_MAX_KM", 60.0)  # drop 'nearest' beyond this
 # Stations excluded from rain detection (comma-separated IDs, case-insensitive).
-# KTXSHALL25: excluded 2026-08-29 — unreliable data; remove when it behaves again.
+#   KTXSHALL25  (2026-08-29) LYING: reports precipitation under a radar-clear sky.
+#   KTXLUBBO680 (2026-08-29) DEAD since 2026-08-11; excluded to save API calls. NOTE
+#               it is the 3rd-closest station (3.7 km) — re-check now and then.
+#   KTXSHALL23  (2026-08-29) DEAD since 2026-07-27; excluded to save API calls.
+# Dead-station exclusions do NOT self-heal: if one comes back to life it stays excluded
+# until removed from this list (or via TTU_SAFETY_WU_EXCLUDE in the env).
 WU_EXCLUDE_STATIONS = frozenset(
     x.strip().upper()
-    for x in _env_str("TTU_SAFETY_WU_EXCLUDE", "KTXSHALL25").split(",") if x.strip())
+    for x in _env_str("TTU_SAFETY_WU_EXCLUDE",
+                      "KTXSHALL25,KTXLUBBO680,KTXSHALL23").split(",") if x.strip())
 WU_POLL_INTERVAL = _env_int("TTU_SAFETY_POLL_INTERVAL", 600)  # s between WU polls
+# Automatic dead-station backoff: after this many CONSECUTIVE no-response polls a
+# station is probed only every WU_BACKOFF_RETRY_SEC instead of every cycle (saves API
+# calls on dead hardware), and rejoins the full cadence by itself on the first answer —
+# unlike the manual WU_EXCLUDE_STATIONS list, this self-heals.
+WU_BACKOFF_AFTER = _env_int("TTU_SAFETY_WU_BACKOFF_AFTER", 6)       # ~1 h at night cadence
+WU_BACKOFF_RETRY_SEC = _env_int("TTU_SAFETY_WU_BACKOFF_RETRY", 3600)
 WU_DAILY_BUDGET = 1500          # PWS-owner cap (calls/day); informational only
 MAX_OBS_AGE_MIN = 30            # ignore a station reading older than this
 HTTP_TIMEOUT = 15               # s per WU request
