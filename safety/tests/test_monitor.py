@@ -319,8 +319,9 @@ def test_unreliable_station_is_excluded_from_discovery(monkeypatch):
     # it out of the polled set so it can neither close nor hold open the dome.
     from safety import config as _cfg
     from safety import wu_poll as _wu
-    # current operator defaults: one lying station, two dead ones (API-call savings)
-    assert {"KTXSHALL25", "KTXLUBBO680", "KTXSHALL23"} <= _cfg.WU_EXCLUDE_STATIONS
+    # the exclusion list is reserved for LYING stations; dead ones (KTXLUBBO680,
+    # KTXSHALL23, last seen 2026-08-11 / 2026-07-27) are handled by the backoff instead
+    assert _cfg.WU_EXCLUDE_STATIONS == {"KTXSHALL25"}
     found = [("KTXLUBBO851", 0.1), ("KTXSHALL25", 11.0), ("KTXSHALL7", 0.6)]
     monkeypatch.setattr(_wu, "discover_stations", lambda lat, lon: list(found))
     p = RainPoller(_cfg, _NullEventLog())
