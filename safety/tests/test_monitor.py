@@ -1,6 +1,7 @@
 import time
 
 from safety import config, wu_poll
+from safety import monitor as monitor_mod
 from safety.monitor import RainPoller, SafetyMonitor
 
 
@@ -428,3 +429,102 @@ def test_discovery_refresh_prunes_backoff_state(monkeypatch):
     p._stations_ts = 0.0
     p._ensure_stations(now=time.time())
     assert p._offline_streak == {} and p._backoff_until == {}
+
+
+# --- advertised Alpaca address (must never be loopback on a wildcard bind) ---------
+def _reset_ip_cache():
+    monitor_mod._ip_cache["ip"], monitor_mod._ip_cache["ts"] = None, 0.0
+
+
+def test_failed_ip_detection_is_not_cached(monkeypatch):
+    # THE BUG: the daemon starts before the network is up (Pi boot after a power cut),
+    # detection fails, and the old code cached 127.0.0.1 for the life of the process —
+    # the page advertised loopback for days. A failure must never be remembered.
+    _reset_ip_cache()
+    monkeypatch.setattr(monitor_mod.socket, "socket",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no route")))
+    assert monitor_mod._primary_ip() is None
+    assert monitor_mod._ip_cache["ip"] is None, "a failure was cached"
+
+    class _Sock:                               # the network comes up later
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return ("129.118.86.107", 51234)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(monitor_mod.socket, "socket", lambda *a, **k: _Sock())
+    assert monitor_mod._primary_ip() == "129.118.86.107", \
+        "the address did not self-correct once the network was up"
+
+
+def test_loopback_detection_is_never_cached_as_the_address(monkeypatch):
+    _reset_ip_cache()
+
+    class _Loop:
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return ("127.0.0.1", 1)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(monitor_mod.socket, "socket", lambda *a, **k: _Loop())
+    assert monitor_mod._primary_ip() is None and monitor_mod._ip_cache["ip"] is None
+
+
+def test_detected_address_is_refreshed_not_frozen(monkeypatch):
+    _reset_ip_cache()
+    current = ["10.0.0.5"]
+
+    class _S:
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return (current[0], 1)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(monitor_mod.socket, "socket", lambda *a, **k: _S())
+    t = 1000.0
+    assert monitor_mod._primary_ip(t) == "10.0.0.5"
+    current[0] = "10.0.0.9"                                  # DHCP moved us
+    assert monitor_mod._primary_ip(t + 10) == "10.0.0.5"     # still cached
+    assert monitor_mod._primary_ip(t + monitor_mod.IP_REFRESH_SEC + 1) == "10.0.0.9"
+
+
+def test_advertised_address_for_wildcard_and_explicit_binds(monkeypatch):
+    from safety import config as _cfg
+    _reset_ip_cache()
+
+    class _S:
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return ("129.118.86.107", 1)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(monitor_mod.socket, "socket", lambda *a, **k: _S())
+    monkeypatch.setattr(_cfg, "HTTP_HOST", "0.0.0.0")
+    assert monitor_mod.alpaca_address(_cfg) == "129.118.86.107"   # the LAN address
+    # an explicit bind is authoritative — including loopback, which is then the truth
+    monkeypatch.setattr(_cfg, "HTTP_HOST", "127.0.0.1")
+    assert monitor_mod.alpaca_address(_cfg) == "127.0.0.1"
+    monkeypatch.setattr(_cfg, "HTTP_HOST", "192.168.1.50")
+    assert monitor_mod.alpaca_address(_cfg) == "192.168.1.50"
+
+
+def test_advertised_address_falls_back_to_hostname_not_loopback(monkeypatch):
+    from safety import config as _cfg
+    _reset_ip_cache()
+    monkeypatch.setattr(monitor_mod.socket, "socket",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no route")))
+    monkeypatch.setattr(monitor_mod.socket, "gethostname", lambda: "ttu-pi")
+    monkeypatch.setattr(_cfg, "HTTP_HOST", "0.0.0.0")
+    assert monitor_mod.alpaca_address(_cfg) == "ttu-pi"   # never a bogus 127.0.0.1

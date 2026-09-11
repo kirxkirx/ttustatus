@@ -31,24 +31,53 @@ def _finite(x):
     return None
 
 
-_cached_ip = None
+# Detected LAN address, re-checked periodically. Never holds a failure (see _primary_ip).
+_ip_cache = {"ip": None, "ts": 0.0}
+IP_REFRESH_SEC = 300
 
 
-def _primary_ip():
-    """Best-effort primary outbound IPv4 of this host, for display on the status page."""
-    global _cached_ip
-    if _cached_ip:
-        return _cached_ip
-    ip = "127.0.0.1"
+def _primary_ip(now=None):
+    """Best-effort primary outbound IPv4 of this host, for display on the status page.
+
+    NEVER caches a failure. The daemon routinely starts before the network is up (a Pi
+    boot after a power cut), and caching the loopback fallback made the page advertise
+    127.0.0.1 — an address no other computer can use — for the whole life of the
+    process, long after the network came up. A successful detection is re-checked every
+    IP_REFRESH_SEC, so a DHCP change is picked up too.
+    """
+    now = time.time() if now is None else now
+    cached = _ip_cache["ip"]
+    if cached and (now - _ip_cache["ts"]) < IP_REFRESH_SEC:
+        return cached
+    ip = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))       # no packet sent; just picks the egress interface
-        ip = s.getsockname()[0]
-        s.close()
+        try:
+            s.connect(("8.8.8.8", 80))   # no packet sent; just picks the egress interface
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
     except OSError:
-        pass
-    _cached_ip = ip
-    return ip
+        ip = None
+    if ip and not ip.startswith("127."):
+        _ip_cache["ip"], _ip_cache["ts"] = ip, now
+        return ip
+    return cached          # keep the last good address; None until we ever had one
+
+
+def alpaca_address(cfg, now=None):
+    """The address to ADVERTISE for the Alpaca device on the status page.
+
+    An explicit, non-wildcard HTTP_HOST is authoritative — including 127.0.0.1, which
+    honestly means "reachable from this computer only". With the default wildcard bind
+    the server answers on every interface, so we show the detected LAN address: that is
+    the one NINA on another machine actually needs. Falls back to the hostname (usually
+    resolvable as <name>.local via mDNS) rather than lying about loopback.
+    """
+    host = (getattr(cfg, "HTTP_HOST", "") or "").strip()
+    if host and host not in ("0.0.0.0", "::", "*"):
+        return host
+    return _primary_ip(now) or socket.gethostname()
 
 
 class RainPoller:
@@ -470,7 +499,7 @@ class SafetyMonitor:
             "is_safe": is_safe,
             "connected": self.is_connected(),
             "alpaca": {
-                "address": _primary_ip(),
+                "address": alpaca_address(self.cfg, now),
                 "port": self.cfg.HTTP_PORT,
                 "device_number": self.cfg.DEVICE_NUMBER,
                 "name": self.cfg.SERVER_NAME,
