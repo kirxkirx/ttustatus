@@ -465,7 +465,6 @@ def _info_lines(info) -> list:
         else:
             lines.append("%s: %s" % (label, unknown(feed) or none))
 
-    listed("Earthquakes", info.get("quakes"), "quakes")
     smoke = info.get("smoke")
     lines.append("Smoke (NOAA HMS): %s" % (_item_text(smoke) if smoke
                                            else unknown("smoke") or "none reported"))
@@ -478,9 +477,6 @@ def _info_lines(info) -> list:
     lines.append("SPC Day-1 outlook: %s · mesoscale discussions on the map: %s"
                  % (outlook, unknown("spc_md") or len(mds)))
     listed("Storm reports", info.get("lsr"), "lsr")
-    sw = info.get("space_weather")
-    lines.append("Space weather: %s" % (_item_text(sw) if sw
-                                        else unknown("space_weather") or "unavailable"))
     return lines
 
 

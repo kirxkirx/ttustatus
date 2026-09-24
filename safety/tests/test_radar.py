@@ -350,7 +350,6 @@ LSRS = [("T", "TORNADO", 33.65, -102.1), ("C", "FUNNEL CLOUD", 33.59, -102.02),
         ("2", "DUST STORM", 33.76, -102.09), ("R", "RAIN", 33.73, -102.19),
         ("s", "SLEET", 33.52, -101.87), ("L", "LIGHTNING", 33.59, -101.93)]
 YELLOW_LAKE = (33.7954, -101.8267)  # WFIGS incident, 2026-03-01, 159 ac
-ANTON_QUAKE = (33.8077, -102.0692, 2.6)  # USGS: M2.6 8 km E of Anton, 2022-04-30
 
 
 def _alert(key, event, color, rank, geometry, vetoes=False):
@@ -383,12 +382,12 @@ def test_draw_order_info_first_then_watches_then_warnings_then_veto():
     svr = _alert("KLUB.SV.W.0218", "Severe Thunderstorm Warning", "#FFA500", 1, TOW_32)
     veto_hi = dict(TOR, rank=30)  # a vetoing alert goes last whatever its rank
     ovs = [veto_hi, svr, TOA,
-           {"kind": "quake", "key": "q", "mag": 2.6, "lat": 33.8, "lon": -102.07},
+           {"kind": "lsr", "key": "l", "typetext": "HAIL", "lat": 33.8, "lon": -102.07},
            {"kind": "smoke", "key": "s", "style": {"density": "Heavy"}, "geometry": HMS_LIGHT},
            {"kind": "smoke", "key": "s2", "style": {"density": "Light"}, "geometry": HMS_LIGHT},
            {"kind": "spc_md", "key": "md", "geometry": MD_2323}]
     got = [s["key"] for s in rd._prepare_overlays(config, ovs)]
-    assert got == ["s2", "s", "md", "q", TOA["key"], svr["key"], TOR["key"]]
+    assert got == ["s2", "s", "md", "l", TOA["key"], svr["key"], TOR["key"]]
     # without the veto, rank decides: the lower rank (warning) is painted on top
     got = [s["key"] for s in rd._prepare_overlays(config, [dict(TOR, vetoes=False), TOA])]
     assert got == [TOA["key"], TOR["key"]]
@@ -399,7 +398,7 @@ def test_malformed_overlays_are_skipped_not_fatal():
     nan = [[float("nan"), 33.7], [-101.9, 33.8], [-101.8, 33.7]]
     bad = [None, "alert", {"kind": "alert"}, {"kind": "nope", "geometry": TXZ035},
            {"kind": "alert", "geometry": {"type": "Polygon", "coordinates": [nan]}},
-           {"kind": "quake", "lat": "north", "lon": -101.9},
+           {"kind": "lsr", "lat": "north", "lon": -101.9},
            {"kind": "alert", "geometry": {"type": "Polygon", "coordinates": [[[-101.9]]]}}]
     specs = rd._prepare_overlays(config, bad + [good])
     assert [s["key"] for s in specs] == [good["key"]]
@@ -433,7 +432,7 @@ def test_hazards_are_never_drawn_green():
         assert not rd._is_green(rd._hex_rgb(ok)), ok
 
 
-def test_lsr_symbols_and_quake_magnitude_hints():
+def test_lsr_symbols():
     sym = {code: rd._lsr_symbol({"type": code}, {}) for code, *_ in LSRS}
     assert sym == {"T": "tornado", "C": "tornado", "2": "dust", "R": "flood",
                    "s": "winter", "L": "other"}
@@ -444,10 +443,6 @@ def test_lsr_symbols_and_quake_magnitude_hints():
     # hazard_feeds' kind wins; a style "symbol" is a shape name, not a report type
     assert rd._lsr_symbol({"lsr_kind": "rain", "typetext": "HAIL"}, {}) == "flood"
     assert rd._lsr_symbol({"typetext": "HAIL"}, {"symbol": "triangle"}) == "hail"
-    assert rd._quake_mag({"mag": 2.6}, {}) == 2.6
-    assert rd._quake_mag({}, {"magnitude": "4.1"}) == 4.1
-    assert rd._quake_mag({"label": "M3.2 34 km WSW of Ackerly"}, {}) == 3.2
-    assert rd._quake_mag({}, {}) is None
 
 
 # ---- the poller: redraw on overlay change, never refetch (fake maps, no PIL needed) ----
@@ -698,7 +693,7 @@ def test_no_overlays_is_pixel_identical_to_the_pre_hazards_map(tmp_path, offline
     _render(t)
     legacy = _legacy_render(t, _frame(), "MRMS 2025-06-06 00:30Z").tobytes()
     off_map = [FAR,
-               {"kind": "quake", "key": "ca", "mag": 2.68, "lat": 36.6, "lon": -119.33},
+               {"kind": "lsr", "key": "ca", "typetext": "HAIL", "lat": 36.6, "lon": -119.33},
                {"kind": "fire_perimeter", "key": "Mimms", "geometry": MIMMS},  # in NM
                {"kind": "spc_outlook", "key": "tstm", "label": "TSTM", "geometry": SPC_TSTM}]
     for ovs in (None, [], off_map):
@@ -810,12 +805,6 @@ def test_information_layers_are_drawn_on_both_themes(tmp_path, offline, theme):
     img = _render(t, [{"kind": "fire", "key": "Yellow Lake", "lat": YELLOW_LAKE[0],
                        "lon": YELLOW_LAKE[1]}])
     assert img.getpixel(_xy(t, *YELLOW_LAKE)) == rd.FIRE_RGB
-    # earthquake: an ink ring sized by magnitude, with a centre dot
-    lat, lon, mag = ANTON_QUAKE
-    img = _render(t, [{"kind": "quake", "key": "anton", "mag": mag, "lat": lat, "lon": lon}])
-    x, y = _xy(t, lat, lon)
-    r = int(3.0 + 2.2 * (mag - 2.0))
-    assert img.getpixel((x, y)) == ink and _near(img, (x + r, y), ink)
     # storm reports: monochrome ink symbols
     lsr = [{"kind": "lsr", "key": code, "type": code, "typetext": text, "lat": la, "lon": lo}
            for code, text, la, lo in LSRS]

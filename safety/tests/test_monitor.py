@@ -801,14 +801,13 @@ class _Weird:
 
 _INFO_PAYLOADS = [
     {"safe": False, "info_only": False, "enabled": True, "veto": [_veto()],
-     "reasons": ["M7.9 earthquake 5 km from the site"], "available": False,
+     "reasons": ["EF5 tornado 5 km from the site"], "available": False,
      "latched": True},
     {"safe": False},
-    {"quakes": [{"mag": 7.9, "place": "5 km E of Lubbock"}],
-     "smoke": {"density": "Heavy", "over_site": True},
+    {"smoke": {"density": "Heavy", "over_site": True},
      "spc": {"category": "HIGH", "label": "High Risk", "mds": [{"num": 1}]},
      "fires": [{"name": "Yellow Lake", "acres": 1e6}],
-     "lsr": [{"type": "TORNADO"}], "space_weather": {"kp": 9, "g": "G5"}},
+     "lsr": [{"type": "TORNADO"}]},
     {"when": datetime(2026, 9, 24, tzinfo=timezone.utc), "set": {1, 2}, "obj": _Weird()},
     None, [], "unsafe", 42, float("nan"),
     RuntimeError("feeds exploded"), ValueError("bad KML"),
@@ -848,10 +847,10 @@ def test_hazard_info_error_is_reported_not_raised(env, write_inputs):
 
 def test_component_is_detached_from_the_poller(env, write_inputs):
     write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
-    payload = {"quakes": [{"text": "M3.1 12 km E of Snyder"}]}
+    payload = {"lsr": [{"text": "HAIL 1.00 in · 12 E Snyder"}]}
     st = _mon(env, hazard_feeds=_StubHazards(payload)).evaluate()
-    payload["quakes"].append({"text": "mutated later by the poller thread"})
-    assert len(st["components"]["hazard_info"]["quakes"]) == 1
+    payload["lsr"].append({"text": "mutated later by the poller thread"})
+    assert len(st["components"]["hazard_info"]["lsr"]) == 1
 
 
 def test_broken_layer_is_logged_once_not_on_every_evaluation(env, write_inputs, caplog):
@@ -913,7 +912,6 @@ def test_hazard_config_defaults():
     assert c.HAZARD_LATCH_FILE.endswith("safety_hazard_latch.json")
     assert c.HAZARD_CACHE_DIR.endswith(".cache/ttu-hazards")
     assert c.HAZARD_FEEDS_POLL_SEC == 600
-    assert (c.HAZARD_QUAKE_RADIUS_KM, c.HAZARD_QUAKE_MIN_MAG) == (300.0, 2.5)
     assert c.HAZARD_LSR_HOURS == 24 and c.HAZARD_ALERT_FILL_ALPHA == 60
     assert c.HAZARD_AREA_STATES == "auto"
     # a warning issued ahead vetoes from 15 min before its onset (read by nws_alerts)

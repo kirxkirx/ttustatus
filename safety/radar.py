@@ -29,7 +29,7 @@ radar disabled.
 HAZARD OVERLAYS (display only): the thumbnails also show whatever the NWS-alerts and
 hazard-feeds pollers hand over through RadarPoller(overlay_sources=[...overlays]) — drawn
 over the radar and under the ring/crosshair/scale bars, information layers first (smoke,
-SPC outline and mesoscale discussions, wildfires, earthquakes, storm reports), then the
+SPC outline and mesoscale discussions, wildfires, storm reports), then the
 NWS alert areas, warnings over watches and a vetoing alert last with a thicker outline.
 Nothing drawn here feeds the verdict: the veto decision lives in nws_alerts.py. The last
 radar frame is kept (reprojected, ~1 MB per map), so a new warning re-renders the maps
@@ -388,7 +388,6 @@ def _font(sz):
 #                  "vetoes" (True = this alert holds the monitor UNSAFE: drawn last, thicker)
 #   smoke        : density Light/Medium/Heavy        ("density", in the dict or its "style")
 #   spc_outlook  : category MRGL/SLGT/ENH/MDT/HIGH   ("category"/"label"/"LABEL"/"DN")
-#   quake        : magnitude                         ("mag"/"magnitude", else "M3.1" in label)
 #   lsr          : report type, IEM code or text     ("type"/"typetext"/"label")
 #   spc_md, fire, fire_perimeter : geometry only
 # The reader is deliberately liberal (top level or "style", several spellings): a missing
@@ -416,7 +415,7 @@ KIND_RGB = {"warning": (208, 0, 0), "watch": (230, 184, 0), "advisory": (123, 10
 _STATEMENT_SUFFIXES = ("statement", "outlook", "alert", "message", "forecast", "emergency")
 # bottom -> top: information layers first, NWS alert areas last (contract C4)
 _OVERLAY_LAYER = {"smoke": 0, "spc_outlook": 1, "spc_md": 2, "fire_perimeter": 3,
-                  "fire": 4, "quake": 5, "lsr": 6, "alert": 7}
+                  "fire": 4, "lsr": 5, "alert": 6}
 _DENSITY_ORDER = {"light": 0, "medium": 1, "heavy": 2}
 _GREEN_WARNED: set = set()    # events already logged for a green colour (log once each)
 _BAD_WARNED: set = set()      # malformed overlays already logged (log once each)
@@ -605,16 +604,6 @@ def _spc_category(ov, style):
     return None
 
 
-def _quake_mag(ov, style):
-    m = _num(_hint(ov, style, "mag", "magnitude"))
-    if m is None:
-        label = _hint(ov, style, "label")
-        if isinstance(label, str):
-            hit = re.search(r"\bM\s?(\d+(?:\.\d+)?)", label)
-            m = float(hit.group(1)) if hit else None
-    return m
-
-
 def _smoke_density(ov, style):
     for v in (_hint(ov, style, "density"), _hint(ov, style, "label")):
         if isinstance(v, str):
@@ -699,8 +688,6 @@ def _overlay_spec(ov):
         if cat == "TSTM":
             return None               # general thunder: outlines are MRGL and above only
         spec["category"] = cat or "?"  # unreadable: still drawn (neutral colour), not lost
-    elif kind == "quake":
-        spec["mag"] = _quake_mag(ov, style)
     elif kind == "lsr":
         spec["symbol"] = _lsr_symbol(ov, style)
     return spec
@@ -1578,24 +1565,15 @@ class Thumbnailer:
         return -margin <= x <= self._ox + margin and -margin <= y <= self._oy + margin
 
     def _symbol(self, d, kind, x, y, spec):
-        """Point symbols. Fire incidents are orange-red triangles; earthquakes and storm
-        reports are drawn in the theme's ink over a halo, never in a hue — alert areas
-        already use most hues and the radar the rest, so any colour would collide."""
+        """Point symbols. Fire incidents are orange-red triangles; storm reports are
+        drawn in the theme's ink over a halo, never in a hue — alert areas already use
+        most hues and the radar the rest, so any colour would collide."""
         ink = self.colors["ink"] + (255,)
         halo = self.colors["stroke"] + (255,)
         if kind == "fire":
             side = 10.0
             d.polygon(_triangle(x, y, side + 2.0 * math.sqrt(3.0) * 1.5), fill=halo)
             d.polygon(_triangle(x, y, side), fill=FIRE_RGB + (255,))
-        elif kind == "quake":
-            mag = spec.get("mag")
-            mag = 2.5 if mag is None else mag
-            # radius grows with magnitude: M2.5 ~4 px, M4 ~7 px, M5 ~10 px (capped at 16)
-            r = max(3.0, min(16.0, 3.0 + 2.2 * (mag - 2.0)))
-            d.ellipse([x - r - 1, y - r - 1, x + r + 1, y + r + 1], outline=halo, width=4)
-            d.ellipse([x - r, y - r, x + r, y + r], outline=ink, width=2)
-            d.ellipse([x - 2.5, y - 2.5, x + 2.5, y + 2.5], fill=halo)
-            d.ellipse([x - 1.5, y - 1.5, x + 1.5, y + 1.5], fill=ink)
         elif kind == "lsr":
             sym = spec.get("symbol") or "other"
             if sym == "tornado":            # downward triangle (funnel)
@@ -1639,7 +1617,7 @@ class Thumbnailer:
         elif kind in ("fire_perimeter", "fire"):
             # a perimeter is an outline; a "fire" sent as a polygon is drawn the same way
             self._stroke_lines(d, self._outline_parts(geom), FIRE_RGB, INFO_OUTLINE_PX)
-        if kind in ("fire", "quake", "lsr"):
+        if kind in ("fire", "lsr"):
             for pos in _iter_points(geom):
                 x, y = self._px(pos)
                 if self._on_map(x, y, 18):

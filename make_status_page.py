@@ -3502,15 +3502,6 @@ def _hz_dist(d):
     return "%.0f km%s from the site" % (dist, (" " + brg) if brg else "")
 
 
-def _hz_quake_text(q):
-    mag = _hz_first(q, "mag", "magnitude")
-    head = ("M%.1f" % mag) if _hz_num(mag) else "M?"
-    place = _hz_str(q.get("place"), 120)
-    return _hz_join([html.escape(head + (" " + place if place else "")),
-                     html.escape(_hz_dist(q)),
-                     _hz_e(_hz_first(q, "time_local", "local", "time"), 40)])
-
-
 def _hz_fire_text(f):
     acres = _hz_first(f, "acres", "size_acres", "size_ac")
     cont = _hz_first(f, "contained_pct", "percent_contained", "containment_pct")
@@ -3574,27 +3565,6 @@ def _hz_spc_text(spc):
     return html.escape("%s at the site" % (label or cat))
 
 
-def _hz_sw_text(sw):
-    kp = _hz_first(sw, "kp", "kp_now")
-    kpmax = _hz_first(sw, "kp_max_24h", "kp_max")
-    scales = sw.get("scales") if isinstance(sw.get("scales"), dict) else {}
-    parts = []
-    if _hz_num(kp):
-        peak = (" (max %.1f in 24 h)" % kpmax) if _hz_num(kpmax) else ""
-        parts.append("Kp %.1f now%s" % (kp, peak))
-    sc = []
-    for k in ("G", "R", "S"):
-        v = _hz_first(scales, k, k.lower())
-        if v is None:
-            v = _hz_first(sw, k, k.lower())
-        if v is not None:
-            v = _hz_str(v, 4)
-            sc.append(v if v[:1].upper() == k else k + v)
-    if sc:
-        parts.append("NOAA scales " + " ".join(sc))
-    return html.escape(", ".join(parts))
-
-
 def _hz_unprefix(s, prefixes):
     """'SPC Day 1: Marginal Risk ...' -> 'Marginal Risk ...' under a row already labelled
     'SPC Day 1 outlook' (case-insensitive; the first matching prefix is removed)."""
@@ -3651,7 +3621,8 @@ def _hz_feed_status(feeds, names):
 # what an empty row means, text prefixes the row label already says). "where" is a key
 # of hazard_info, or "spc.mds". The first feed name is hazard_feeds.py's (FEEDS); the
 # others are tolerated spellings, and a feed the page cannot find degrades to "no current
-# data" (never to a false "nothing current").
+# data" (never to a false "nothing current"). Keys no row names (lists of feeds an older
+# daemon still published) are ignored.
 _HZ_INFO_ROWS = (
     ("Smoke", "smoke", ("smoke", "hms", "hms_smoke"), "NOAA HMS", _hz_smoke_text,
      "smoke analysed on the map", ()),
@@ -3664,10 +3635,6 @@ _HZ_INFO_ROWS = (
      _hz_lsr_text, "storm reports on the map", ()),
     ("Wildfires", "fires", ("fires", "wfigs", "fire_incidents", "wfigs_incidents"),
      "NIFC WFIGS", _hz_fire_text, "wildfire incidents", ()),
-    ("Earthquakes", "quakes", ("quakes", "earthquakes", "usgs"), "USGS", _hz_quake_text,
-     "earthquakes", ()),
-    ("Space weather", "space_weather", ("space_weather", "swpc", "spaceweather"),
-     "NOAA SWPC", _hz_sw_text, "space-weather status", ()),
 )
 
 
@@ -3704,13 +3671,11 @@ def _hz_info_html(info):
         if isinstance(raw, dict):
             # one-object feeds: shown when they say something — smoke over the site (now
             # or earlier today) or on the map; the SPC line (the daemon writes it only
-            # from a fresh outlook: a risk at the site, or none, or "no current outlook");
-            # the space-weather line
+            # from a fresh outlook: a risk at the site, or none, or "no current outlook")
             on_map = _hz_first(raw, "on_map", "in_box", "in_map")
             notable = bool(
-                where == "space_weather"
-                or (where == "spc" and (_hz_str(raw.get("category")) or on_map
-                                        or isinstance(raw.get("text"), str)))
+                (where == "spc" and (_hz_str(raw.get("category")) or on_map
+                                     or isinstance(raw.get("text"), str)))
                 or (where == "smoke" and (_hz_first(raw, "at_site", "over_site",
                                                     "site_in_smoke", "site_in_smoke_today")
                                           or on_map or _hz_first(raw, "count"))))
@@ -3798,7 +3763,6 @@ def _hz_map_key(alerts_on_map, info_layers):
                                    "drawn)"),
              "SPC mesoscale discussions": "mesoscale discussions: purple dashed outline",
              "Wildfires": "wildfires: orange-red triangles, perimeters in orange-red",
-             "Earthquakes": "earthquakes: rings sized by magnitude",
              "Storm reports": ("storm reports: &#9660; tornado, &#9679; hail, &#9632; wind, "
                                "&#9670; flood/rain, &#215; dust, + winter, "
                                "&#9675; other")}

@@ -37,10 +37,9 @@ to stdout).
 | NWS warning | a **Tornado / Dust Storm / High Wind Warning** (`TTU_SAFETY_HAZARD_VETO_EVENTS`) in effect **over the site** — NWS's point query, the warning's polygon, or one of the site's zones (TXZ035 / TXC303) — for the warning's whole duration, persisted | this daemon |
 
 The NWS forecast, GLM lightning, MRMS radar and connectivity layers are described in their
-own sections below. **Every other NWS alert and all the non-NWS hazard information** (USGS
-earthquakes, NOAA HMS smoke, NIFC wildfires, SPC outlook and mesoscale discussions, storm
-reports, space weather) is shown on the status page, `/setup` and the radar map but
-**never affects `IsSafe`**.
+own sections below. **Every other NWS alert and all the non-NWS hazard information** (NOAA
+HMS smoke, NIFC wildfires, SPC outlook and mesoscale discussions, storm reports) is shown
+on the status page, `/setup` and the radar map but **never affects `IsSafe`**.
 
 **Rain latch:** WU is polled only when the sun is **below 5°** (daytime = zero API
 calls). The **first** station reporting any rain trips UNSAFE immediately — no
@@ -287,7 +286,6 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_HAZARD_FILL_ALPHA` | `60` | map fill opacity of alert areas, 0-255 |
 | `TTU_SAFETY_HAZARD_FEEDS` | `1` | enable the information-only hazard feeds (`0` disables them) |
 | `TTU_SAFETY_HAZARD_FEEDS_POLL_SEC` | `600` | information-feed cadence (min 60; each feed also has its own minimum, see below) |
-| `TTU_SAFETY_HAZARD_QUAKE_KM` / `_QUAKE_MIN_MAG` | `300` / `2.5` | earthquakes listed within this radius and at or above this magnitude |
 | `TTU_SAFETY_HAZARD_LSR_HOURS` | `24` | storm-report look-back, hours (1-168) |
 
 Out-of-range hazard settings are corrected to the nearest allowed value, with a warning
@@ -409,12 +407,12 @@ the radar echoes and beneath the ring, crosshair and scale bars. First the infor
 layers: HMS smoke as a grey veil (more opaque where denser); the SPC Day-1 outlook as
 dashed outlines in SPC's colours for Marginal and above (Marginal in sand, never green;
 general thunder is not drawn); SPC mesoscale discussions as purple dashed outlines;
-wildfire perimeters and orange-red fire triangles; earthquakes as rings sized by
-magnitude; storm reports as small ink symbols (down-triangle tornado, dot hail, square
-wind, diamond flood/rain, x dust, + winter, small ring anything else). Then the NWS alert
-areas: filled at `TTU_SAFETY_HAZARD_FILL_ALPHA` (60/255) under a cased outline (a
-casing, then the alert colour), watches and advisories first, warnings on top, a
-vetoing warning last with a thicker outline. The casing is the theme's usual one (black
+wildfire perimeters and orange-red fire triangles; storm reports as small ink symbols
+(down-triangle tornado, dot hail, square wind, diamond flood/rain, x dust, + winter,
+small ring anything else). Then the NWS alert areas: filled at
+`TTU_SAFETY_HAZARD_FILL_ALPHA` (60/255) under a cased outline (a casing, then the alert
+colour), watches and advisories first, warnings on top, a vetoing warning last with a
+thicker outline. The casing is the theme's usual one (black
 at night, white by day, to separate a line from echoes of its own hue) unless the colour
 is itself close to the basemap — a pale Dust Storm Warning or Tornado Watch by day, a
 Flash Flood Warning's dark red at night — which gets the opposite ink instead: every
@@ -565,21 +563,22 @@ others). All are free with no key, and all state stays in RAM (no SD writes).
 
 | Feed | Source (attribution) | Every | Shown |
 |---|---|---|---|
-| Earthquakes | USGS real-time GeoJSON summary feed (past day; `2.5_day` for the default magnitude) | 10 min | M >= 2.5 within 300 km: time, magnitude, place, distance and direction. Those inside the map are drawn as rings sized by magnitude |
 | Smoke | NOAA/NESDIS Hazard Mapping System analyst smoke polygons (today's KML by UTC date, else yesterday's) | 30 min | whether the site is under smoke in the file's latest analysis (the latest window of the whole file, not just of the smoke near the site), the density (Light / Medium / Heavy) and time window; smoke over the site in an earlier window is reported as earlier. The latest analysis window's polygons are drawn as a grey veil |
 | Wildfires | NIFC WFIGS current incident locations and interagency perimeters | 10 min | wildfires (type WF) not out or contained, updated within 72 h, and discovered within 14 days or at least 1,000 acres, within 150 km (and anywhere on the map). Points as orange-red triangles, perimeters as outlines; a perimeter is shown with its listed incident, or on its own when it passes the same test (not out or 100 % contained, updated within 72 h) |
 | SPC Day 1 outlook | NOAA Storm Prediction Center categorical outlook | 10 min | the site's category and valid window; dashed outlines for Marginal and above |
 | SPC mesoscale discussions | NOAA SPC via the Iowa Environmental Mesonet (IEM) | 10 min | MDs in effect now that touch the map; purple dashed outlines |
 | Local storm reports | NWS Local Storm Reports via IEM | 10 min | the last 24 h on the map: type, magnitude, place, time, remark (up to 120 characters; corrections and duplicates folded in, IEM's "Corrects previous ..." note dropped); small ink symbols |
-| Space weather | NOAA Space Weather Prediction Center: planetary Kp and the NOAA R/S/G scales | 10 min | one line of text: Kp now and 24 h max, the scales now, the G forecast |
 
 Cadence: `TTU_SAFETY_HAZARD_FEEDS_POLL_SEC` (10 min), and never faster than each feed's
-own minimum (5 min for USGS and IEM, 10 min for the rest, 30 min for HMS, which is
-analysed a few times per day). A failed feed is retried after 5 min. Requests are small:
-radius and box filters run on the server, gzip is used where offered, and conditional
-GETs return a bodiless 304 when nothing changed. That is about 60 KB for the first round,
-then a few hundred bytes to a few KB per 10 min, plus 50-300 KB whenever the day's HMS
-file changes.
+own minimum (5 min for IEM, 10 min for the rest, 30 min for HMS, which is analysed a
+few times per day). At the defaults that is 32 requests an hour: 6 each for wildfire
+incidents, fire perimeters, the SPC outlook, mesoscale discussions and storm reports,
+and 2 for HMS (4 while today's file is not out yet and yesterday's is read). A failed
+feed is retried after 5 min. Requests are small: radius and box filters run on the
+server, gzip is used where offered, and conditional GETs return a bodiless 304 when
+nothing changed. The first round is under 10 KB on a quiet day plus the day's HMS file
+(50-300 KB; that server does not gzip it), then a few hundred bytes to a few KB per 10
+min, plus the HMS file again whenever it changes.
 
 Display rules. A feed silent for more than two of its intervals (plus 2 min; at least
 `TTU_SAFETY_HAZARD_STALE_SEC`) is shown as stale and its items are withheld: old
@@ -602,10 +601,9 @@ unavailable) / *off*. The section shows:
   on vetoing warnings, headline, issuing office, until when, and the full text and
   instructions in a fold-out; up to 25 per list, all of them drawn on the map;
 - **Other hazard information** (marked *information only*): smoke, SPC outlook and
-  mesoscale discussions, storm reports, wildfires, earthquakes and space weather, each
-  with its feed status and an *on map* mark for what the map shows, plus a key to the
-  map's hazard layers; a list the daemon caps at 20 items shows the real count and
-  "+N more not listed";
+  mesoscale discussions, storm reports and wildfires, each with its feed status and an
+  *on map* mark for what the map shows, plus a key to the map's hazard layers; a list
+  the daemon caps at 20 items shows the real count and "+N more not listed";
 - a sentence saying that only the configured veto events over the site affect the
   monitor.
 

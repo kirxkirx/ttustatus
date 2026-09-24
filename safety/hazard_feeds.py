@@ -1,26 +1,23 @@
-"""Hazard INFORMATION for the status page and the radar map (USGS, NOAA, NIFC, IEM).
+"""Hazard INFORMATION for the status page and the radar map (NOAA, NIFC, IEM).
 
 INFORMATION ONLY — nothing here ever influences IsSafe. component() always reports
 safe=True and info_only=True, and SafetyMonitor must never AND it into the verdict (a test
 enforces that). The only hazard veto is the handful of configured NWS warnings over the
-site (safety/nws_alerts.py). Everything in this module is context for the observer — an
-earthquake 150 km away, smoke aloft this afternoon, a grass fire on the horizon, the SPC
-risk for tonight, what storms actually did nearby, the geomagnetic state — and none of it
-says anything about the sky over the dome right now that the rain / radar / lightning /
-forecast layers do not measure more directly. So none of it may close the roof.
+site (safety/nws_alerts.py). Everything in this module is context for the observer —
+smoke aloft this afternoon, a grass fire on the horizon, the SPC risk for tonight, what
+storms actually did nearby — and none of it says anything about the sky over the dome
+right now that the rain / radar / lightning / forecast layers do not measure more
+directly. So none of it may close the roof.
 
 Feeds (all free, no key). Each is INDEPENDENT — its own ok / error / age, its own
 cadence — so one failing source never blanks the others:
 
-  quakes           USGS real-time GeoJSON summary feed (past day): M >= HAZARD_QUAKE_MIN_MAG
-                   within HAZARD_QUAKE_RADIUS_KM listed; those inside the map drawn
   smoke            NOAA HMS analyst smoke polygons: today's KML (UTC day), else yesterday's
   fires            NIFC WFIGS current wildland-fire incidents (points, radius query)
   fire_perimeters  NIFC WFIGS current interagency fire perimeters (map-box query)
   spc_outlook      SPC Day-1 categorical convective outlook (the site's category + outlines)
   spc_md           SPC mesoscale discussions in effect now (via IEM)
   lsr              NWS Local Storm Reports, last HAZARD_LSR_HOURS, inside the map (via IEM)
-  space_weather    NOAA SWPC planetary Kp + NOAA R/S/G scales (one line of text)
 
 Network discipline (the Pi): every request is small by construction — radius / bbox
 filtering is done SERVER-side, gzip is requested where offered, conditional GETs
@@ -61,9 +58,6 @@ except Exception:                      # pragma: no cover - zoneinfo is stdlib o
 log = logging.getLogger("ttu.safety.hazard_feeds")
 
 # ---- endpoints (all verified live 2026-09-24) -------------------------------------
-# USGS summary feeds are rebuilt every minute; the {level} feed is chosen from the
-# configured minimum magnitude (the smallest feed that still contains every wanted event).
-USGS_FEED = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/{level}_day.geojson"
 # One KML per UTC day, re-published as the analysts add polygons (daytime only).
 HMS_SMOKE_KML = ("https://satepsanone.nesdis.noaa.gov/pub/FIRE/web/HMS/Smoke_Polygons/KML/"
                  "{d:%Y}/{d:%m}/hms_smoke{d:%Y%m%d}.kml")
@@ -73,13 +67,11 @@ WFIGS_PERIMETERS = WFIGS + "/WFIGS_Interagency_Perimeters_Current/FeatureServer/
 SPC_DAY1_CAT = "https://www.spc.noaa.gov/products/outlook/day1otlk_cat.nolyr.geojson"
 IEM_SPC_MCD = "https://mesonet.agron.iastate.edu/api/1/nws/spc_mcd.geojson"
 IEM_LSR_BY_POINT = "https://mesonet.agron.iastate.edu/api/1/nws/lsrs_by_point.geojson"
-SWPC_KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
-SWPC_SCALES = "https://services.swpc.noaa.gov/products/noaa-scales.json"
 SPC_MD_PAGE = "https://www.spc.noaa.gov/products/md/{year}/md{num:04d}.html"
 
 # (the SPC mesoscale discussions come from IEM's copy, like the storm reports)
-SOURCE = ("USGS earthquakes · NOAA HMS smoke · NIFC WFIGS fires · NOAA SPC outlook · "
-          "SPC mesoscale discussions and NWS storm reports via IEM · NOAA SWPC")
+SOURCE = ("NOAA HMS smoke · NIFC WFIGS fires · NOAA SPC outlook · "
+          "SPC mesoscale discussions and NWS storm reports via IEM")
 INFO_NOTE = ("Information only: these feeds never affect the safety monitor — only the "
              "configured NWS warnings over the site do.")
 
@@ -94,9 +86,9 @@ MAX_ITEMS = 20                     # per displayed list: the state file and page
 FAIL_RETRY_SEC = 300
 # Per-feed MINIMUM cadence (s); the effective one is max(HAZARD_FEEDS_POLL_SEC, this).
 # HMS smoke is analysed a few times per day, in daylight only: 30 min is plenty (and the
-# poll is a conditional GET). USGS/IEM are courteous at 5 min; the rest at 10 min.
-FEED_MIN_INTERVAL = {"quakes": 300, "smoke": 1800, "fires": 600, "fire_perimeters": 600,
-                     "spc_outlook": 600, "spc_md": 300, "lsr": 300, "space_weather": 600}
+# poll is a conditional GET). IEM is courteous at 5 min; the rest at 10 min.
+FEED_MIN_INTERVAL = {"smoke": 1800, "fires": 600, "fire_perimeters": 600,
+                     "spc_outlook": 600, "spc_md": 300, "lsr": 300}
 # Wildfire incidents: WFIGS "current" does NOT mean burning — records discovered months
 # ago stay current while anybody edits them (the NM batch edits of 2026-09-22). Listed:
 # type WF, not out / contained / controlled / 100 %, updated in the last 72 h, and either
@@ -109,22 +101,19 @@ MD_LOOKBACK_H = 8                  # MDs issued this long ago can still be in ef
 LSR_MAX_KEEP = 200                 # reports kept per poll (a tornado outbreak is ~100)
 SMOKE_MAX_POLYS = 60               # smoke polygons kept per file (touching the map only)
 PERIMETER_MAX = 30
-QUAKE_MAX_KEEP = 100
 # Coverage (lonmin, latmin, lonmax, latmax). SPC, LSR and WFIGS are US products and HMS
 # covers North America: at a site outside, a feed says so instead of a false "nothing".
 CONUS = (-130.0, 20.0, -60.0, 55.0)
 NORTH_AMERICA = (-170.0, 5.0, -50.0, 80.0)
 
 FEEDS = (
-    # name, page label, attribution, coverage box (None = global)
-    ("quakes", "Earthquakes", "USGS real-time earthquake feed", None),
+    # name, page label, attribution, coverage box
     ("smoke", "Smoke (satellite analysis)", "NOAA/NESDIS Hazard Mapping System", NORTH_AMERICA),
     ("fires", "Wildfires", "NIFC WFIGS incident locations", CONUS),
     ("fire_perimeters", "Fire perimeters", "NIFC WFIGS interagency perimeters", CONUS),
     ("spc_outlook", "SPC Day 1 outlook", "NOAA Storm Prediction Center", CONUS),
     ("spc_md", "SPC mesoscale discussions", "NOAA Storm Prediction Center via IEM", CONUS),
     ("lsr", "Local storm reports", "NWS Local Storm Reports via IEM", CONUS),
-    ("space_weather", "Space weather", "NOAA Space Weather Prediction Center", None),
 )
 FEED_NAMES = tuple(f[0] for f in FEEDS)
 
@@ -149,7 +138,6 @@ SPC_DRAW_MIN_RANK = 2              # outlines for MRGL and above; TSTM is text o
 SMOKE_FILL = {"Light": ("#B4B4B4", 45), "Medium": ("#969696", 80), "Heavy": ("#787878", 115)}
 MD_COLOR = "#9370DB"                # as radar.MD_RGB draws it
 FIRE_COLOR = "#FF4500"
-QUAKE_COLOR = "#FFB300"
 # Local storm reports by kind: (symbol, colour). Tornado red, wind blue as on SPC's
 # report maps; hail light blue instead of SPC's green (never green); flood red like the
 # NWS flood products on this page.
@@ -162,9 +150,9 @@ LSR_KINDS = {
 }
 # Draw order hints: lower rank = drawn later (on top), the same convention as the NWS
 # alert overlays. Info layers bottom-up: smoke, SPC outlines, MDs, fire perimeters, fire
-# points, quakes, storm reports.
+# points, storm reports.
 RANK = {"smoke": 90, "spc_outlook": 80, "spc_md": 70, "fire_perimeter": 60, "fire": 50,
-        "quake": 40, "lsr": 30}
+        "lsr": 30}
 
 
 def _style(stroke=None, fill=None, fill_alpha=0, width=2, dash=False, symbol=None,
@@ -218,13 +206,13 @@ def _int(x):
 
 
 def _ms(x):
-    """ArcGIS / USGS epoch milliseconds -> epoch seconds (None if absent/garbage)."""
+    """ArcGIS epoch milliseconds -> epoch seconds (None if absent/garbage)."""
     v = _num(x)
     return v / 1000.0 if v is not None else None
 
 
 def _parse_iso(s):
-    """ISO-8601 -> epoch seconds; a naive stamp is UTC (IEM/SWPC write UTC without Z)."""
+    """ISO-8601 -> epoch seconds; a naive stamp is UTC (IEM writes UTC without Z)."""
     if not isinstance(s, str) or not s.strip():
         return None
     t = s.strip().replace(" ", "T")
@@ -512,61 +500,6 @@ def _get(url, ua, etag=None, last_modified=None, timeout=HTTP_TIMEOUT,
 
 # ---- parsers (pure: bytes + site/box -> compact records; site-dependent parts done
 # here, once per fetch; time-dependent filtering is done at view time) ---------------
-def _usgs_level(min_mag):
-    """The smallest USGS summary feed that still holds every event >= min_mag."""
-    if min_mag >= 4.5:
-        return "4.5"
-    if min_mag >= 2.5:
-        return "2.5"
-    if min_mag >= 1.0:
-        return "1.0"
-    return "all"
-
-
-def parse_quakes(body, site, box, radius_km, min_mag):
-    doc = _json(body)
-    feats = doc.get("features") if isinstance(doc, dict) else None
-    if not isinstance(feats, list):
-        raise ValueError("USGS feed: no 'features' list")
-    lat0, lon0 = site
-    out = []
-    for ft in feats:
-        if not isinstance(ft, dict):
-            continue
-        p = ft.get("properties") if isinstance(ft.get("properties"), dict) else {}
-        if p.get("type") not in (None, "earthquake"):
-            continue                      # quarry blasts / explosions are not earthquakes
-        mag = _num(p.get("mag"))
-        if mag is None or mag < min_mag:
-            continue
-        g = ft.get("geometry") if isinstance(ft.get("geometry"), dict) else {}
-        pt = _clean_point(g)
-        t = _ms(p.get("time"))
-        if pt is None or t is None:
-            continue
-        lon, lat = pt
-        dist = _haversine_km(lat0, lon0, lat, lon)
-        if dist > radius_km:
-            continue
-        coords = g.get("coordinates") or []
-        out.append({
-            "id": _clip(ft.get("id") or p.get("code") or f"{t:.0f}", 40),
-            "mag": round(mag, 1), "mag_type": _clip(p.get("magType"), 8),
-            "place": _clip(p.get("place"), 80) or "location n/a",
-            "time_ts": t, "lat": round(lat, 4), "lon": round(lon, 4),
-            "depth_km": _num(coords[2]) if len(coords) > 2 else None,
-            "dist_km": round(dist, 1), "bearing": _cardinal(_bearing(lat0, lon0, lat, lon)),
-            "on_map": _in_box(lon, lat, box),
-            "felt": int(_num(p.get("felt")) or 0),
-            "alert": _clip(p.get("alert"), 10) or None,       # PAGER green/yellow/...
-            "tsunami": bool(_num(p.get("tsunami"))),
-            "status": _clip(p.get("status"), 12),
-            "url": _clip(p.get("url"), 200) or None,
-        })
-    out.sort(key=lambda q: -q["time_ts"])
-    return out[:QUAKE_MAX_KEEP]
-
-
 _KML_REFUSE = re.compile(rb"<!\s*(DOCTYPE|ENTITY)", re.I)
 _HMS_TIME = re.compile(r"(Start|End)\s*Time:\s*(\d{7})\s*(\d{4})\s*UTC", re.I)
 _HMS_DENSITY = re.compile(r"Density:\s*(Light|Medium|Heavy)", re.I)
@@ -969,55 +902,6 @@ def parse_lsr(body, site, box):
     return kept[:LSR_MAX_KEEP]
 
 
-def parse_kp(body):
-    """noaa-planetary-k-index.json -> [(epoch, kp)] oldest first. Accepts the current
-    list-of-objects format and the older header-row + list-of-lists one."""
-    doc = _json(body)
-    if not isinstance(doc, list):
-        raise ValueError("SWPC Kp: not a list")
-    rows = []
-    if doc and isinstance(doc[0], list):
-        hdr = [str(h).strip().lower() for h in doc[0]]
-        if "time_tag" not in hdr or "kp" not in hdr:
-            raise ValueError("SWPC Kp: unexpected header row")
-        it, ik = hdr.index("time_tag"), hdr.index("kp")
-        for r in doc[1:]:
-            if isinstance(r, list) and len(r) > max(it, ik):
-                rows.append((_parse_iso(r[it]), _num(r[ik])))
-    else:
-        for r in doc:
-            if isinstance(r, dict):
-                rows.append((_parse_iso(r.get("time_tag")), _num(r.get("Kp", r.get("kp")))))
-    rows = sorted((t, k) for t, k in rows if t is not None and k is not None)
-    if not rows:
-        raise ValueError("SWPC Kp: no values")
-    return rows
-
-
-def _scale(block, key):
-    v = (block or {}).get(key) if isinstance(block, dict) else None
-    s = _num(v.get("Scale")) if isinstance(v, dict) else None
-    return int(s) if s is not None else None
-
-
-def parse_scales(body):
-    """noaa-scales.json -> {"now": {R,S,G}, "forecast": [{"date", "G"}...]}: key "0" is
-    the current state, "1".."3" the forecast for today and the next two days."""
-    doc = _json(body)
-    if not isinstance(doc, dict) or not isinstance(doc.get("0"), dict):
-        raise ValueError("SWPC scales: no current ('0') entry")
-    cur = doc["0"]
-    out = {"now": {k: _scale(cur, k) for k in ("R", "S", "G")},
-           "time_ts": _parse_iso(f"{cur.get('DateStamp')}T{cur.get('TimeStamp')}"),
-           "forecast": []}
-    for k in ("1", "2", "3"):
-        b = doc.get(k)
-        if isinstance(b, dict):
-            out["forecast"].append({"date": _clip(b.get("DateStamp"), 10),
-                                    "G": _scale(b, "G")})
-    return out
-
-
 # ---- the poller -------------------------------------------------------------------
 class _Feed:
     __slots__ = ("name", "label", "source", "coverage", "last_attempt", "last_ok",
@@ -1104,7 +988,7 @@ class HazardFeedsPoller:
         f = self._feeds[name]
         box = _site_box(self.cfg, site)
         try:
-            if f.coverage is not None and not _in_box(site[1], site[0], f.coverage):
+            if not _in_box(site[1], site[0], f.coverage):
                 raise ValueError(f"site {site[0]:.3f},{site[1]:.3f} is outside this "
                                  f"feed's coverage")
             doc = getattr(self, "_fetch_" + name)(f, now, site, box)
@@ -1152,13 +1036,6 @@ class HazardFeedsPoller:
         return doc
 
     # -- per-feed fetchers (network; poll thread only) ---------------------------
-    def _fetch_quakes(self, f, now, site, box):
-        radius = float(_cfgv(self.cfg, "HAZARD_QUAKE_RADIUS_KM", 300.0))
-        min_mag = float(_cfgv(self.cfg, "HAZARD_QUAKE_MIN_MAG", 2.5))
-        url = USGS_FEED.format(level=_usgs_level(min_mag))
-        return self._cond_fetch(f, url, lambda b: parse_quakes(b, site, box, radius, min_mag),
-                                (site, box, radius, min_mag))
-
     def _fetch_smoke(self, f, now, site, box):
         day = datetime.fromtimestamp(now, timezone.utc).date()
         accept = "application/vnd.google-earth.kml+xml, application/xml;q=0.9, */*;q=0.5"
@@ -1227,12 +1104,6 @@ class HazardFeedsPoller:
         _status, body, _e, _l = _get(url, self._ua())
         return parse_lsr(body, site, box)
 
-    def _fetch_space_weather(self, f, now, site, box):
-        kp = self._cond_fetch(f, SWPC_KP, parse_kp, "kp", accept="application/json")
-        scales = self._cond_fetch(f, SWPC_SCALES, parse_scales, "scales",
-                                  accept="application/json")
-        return {"kp": kp, "scales": scales}
-
     # -- views (cheap, time-dependent; called by the evaluator and radar threads) -------
     def _snapshot(self):
         with self._lock:
@@ -1271,43 +1142,13 @@ class HazardFeedsPoller:
         # totals = how many items each list would have WITHOUT the MAX_ITEMS display cap,
         # so the page can say "+N more" instead of passing the cap off as the count
         out = {"feeds": feeds, "overlays": [], "totals": {}}
-        self._view_quakes(out, docs.get("quakes"), tzname, now)
         self._view_smoke(out, docs.get("smoke"), tzname)
         self._view_fires(out, docs.get("fires"), docs.get("fire_perimeters"), tzname, now,
                          "fires" in docs, "fire_perimeters" in docs)
         self._view_spc(out, docs.get("spc_outlook"), docs.get("spc_md"), tzname, now,
                        "spc_outlook" in docs)
         self._view_lsr(out, docs.get("lsr"), tzname, now)
-        self._view_space_weather(out, docs.get("space_weather"), tzname, now)
         return out
-
-    def _view_quakes(self, out, doc, tzname, now):
-        items = []
-        for q in (doc or [])[:MAX_ITEMS]:
-            when = _fmt_time(q["time_ts"], tzname, now)
-            flags = []
-            if q["felt"]:
-                flags.append(f"felt reports: {q['felt']}")
-            if q["alert"]:
-                flags.append(f"PAGER {q['alert']}")
-            if q["tsunami"]:
-                flags.append("tsunami flag")
-            text = (f"M{q['mag']:.1f} · {q['place']} · {when} · "
-                    f"{q['dist_km']:.0f} km {q['bearing']} of the site")
-            if flags:
-                text += " · " + ", ".join(flags)
-            items.append(dict(q, time_local=when, text=text))
-        out["quakes"] = items
-        out["feeds"]["quakes"]["count"] = out["totals"]["quakes"] = len(doc or [])
-        for q in doc or []:
-            if not q["on_map"]:
-                continue
-            size = int(max(4, min(14, round(3 + 2.5 * (q["mag"] - 2.5)))))
-            out["overlays"].append({
-                "kind": "quake", "key": f"quake:{q['id']}",
-                "geometry": _point_geometry(q["lon"], q["lat"]),
-                "label": f"M{q['mag']:.1f}", "mag": q["mag"], "rank": RANK["quake"],
-                "style": _style(stroke=QUAKE_COLOR, width=2, symbol="circle", size=size)})
 
     def _view_smoke(self, out, doc, tzname):
         if doc is None:
@@ -1546,41 +1387,6 @@ class HazardFeedsPoller:
                 "typetext": r["type"], "rank": RANK["lsr"],
                 "style": _style(fill=color, width=1, symbol=symbol, size=5)})
 
-    def _view_space_weather(self, out, doc, tzname, now):
-        if doc is None:
-            out["space_weather"] = None
-            return
-        kp_rows, scales = doc["kp"], doc["scales"]
-        t_last, kp_now = kp_rows[-1]
-        kp_max = max(k for t, k in kp_rows if t >= t_last - 24 * 3600)
-        r_now, s_now, g_now = (scales["now"].get(k) for k in ("R", "S", "G"))
-        fc = [x for x in scales["forecast"] if x["G"] is not None]
-        g_fc = max(fc, key=lambda x: x["G"]) if fc else None
-
-        def lvl(v):
-            return "?" if v is None else str(v)
-
-        text = f"Kp {kp_now:.1f} (24 h max {kp_max:.1f})"
-        if now - t_last > 12 * 3600:
-            # SWPC publishes a new 3-hourly value all the time: an old one is a stuck feed
-            text += f" — latest value from {_fmt_time(t_last, tzname, now)}"
-        text += f" · NOAA scales now R{lvl(r_now)} S{lvl(s_now)} G{lvl(g_now)}"
-        if g_fc is not None and g_fc["G"] > 0:
-            text += f" · geomagnetic storm G{g_fc['G']} forecast ({g_fc['date']})"
-        flags = []
-        if max(g_now or 0, g_fc["G"] if g_fc else 0) >= 3:
-            flags.append("G3+ geomagnetic storm: aurora / airglow may brighten the sky")
-        if (r_now or 0) >= 3:
-            flags.append("R3+ radio blackout: HF radio / GNSS degraded")
-        if (s_now or 0) >= 3:
-            flags.append("S3+ solar radiation storm")
-        out["space_weather"] = {
-            "kp_now": round(kp_now, 2), "kp_time_local": _fmt_time(t_last, tzname, now),
-            "kp_max_24h": round(kp_max, 2), "r_now": r_now, "s_now": s_now, "g_now": g_now,
-            "g_forecast_max": g_fc["G"] if g_fc else None, "flags": flags,
-            "text": text + ("" if not flags else " · " + "; ".join(flags))}
-        out["feeds"]["space_weather"]["count"] = 1
-
     # -- public views ----------------------------------------------------------
     def component(self, now=None):
         """The hazard-information component for the state file. ALWAYS safe: this layer
@@ -1591,9 +1397,8 @@ class HazardFeedsPoller:
         return {
             "safe": True, "info_only": True, "enabled": _enabled(self.cfg),
             "available": any(f["ok"] for f in v["feeds"].values()),
-            "feeds": v["feeds"], "quakes": v["quakes"], "smoke": v["smoke"],
-            "fires": v["fires"], "spc": v["spc"], "lsr": v["lsr"],
-            "space_weather": v["space_weather"], "totals": v["totals"],
+            "feeds": v["feeds"], "smoke": v["smoke"], "fires": v["fires"],
+            "spc": v["spc"], "lsr": v["lsr"], "totals": v["totals"],
             "on_map": len(v["overlays"]), "source": SOURCE, "note": INFO_NOTE,
         }
 
@@ -1664,10 +1469,10 @@ def unavailable_component(cfg):
              for name, label, src, _cov in FEEDS}
     return {
         "safe": True, "info_only": True, "enabled": False, "available": False,
-        "feeds": feeds, "quakes": [], "smoke": None, "fires": [],
+        "feeds": feeds, "smoke": None, "fires": [],
         "spc": {"ok": False, "category": None, "label": "unavailable", "text": None,
                 "color": None, "valid_local": None, "expire_local": None,
                 "issue_local": None, "on_map": [], "mds": []},
-        "lsr": [], "space_weather": None, "totals": {}, "on_map": 0,
+        "lsr": [], "totals": {}, "on_map": 0,
         "source": SOURCE + " (disabled)", "note": INFO_NOTE,
     }

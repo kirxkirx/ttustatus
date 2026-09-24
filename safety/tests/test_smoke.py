@@ -130,10 +130,10 @@ def test_hazards_section_and_tile_render():
                     "end_local": "Fri 07:00 CDT"}],
         "point_age_s": 30, "area_age_s": 60, "error": None}
     st["components"]["hazard_info"] = {"safe": True, "info_only": True, "enabled": True,
-                                       "feeds": {"quakes": {"ok": True, "age_s": 60}},
-                                       "quakes": [], "smoke": None, "fires": [],
+                                       "feeds": {"lsr": {"ok": True, "age_s": 60}},
+                                       "smoke": None, "fires": [],
                                        "spc": {"category": None, "label": "", "mds": []},
-                                       "lsr": [], "space_weather": None}
+                                       "lsr": []}
     card = msp.build_safety_html(st)
     assert "NWS warnings" in card and "no veto warning at the site" in card
     hz = msp.build_hazards_html(st)

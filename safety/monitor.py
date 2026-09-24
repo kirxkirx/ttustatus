@@ -8,8 +8,8 @@ Design rules:
   * WU is only polled when the sun is below RAIN_POLL_SUN_BELOW_DEG (saves API calls).
   * NWS alerts: ONLY the configured HAZARD_VETO_EVENTS in effect OVER THE SITE veto (for
     the life of the warning); every other alert, and all the non-NWS hazard information
-    (quakes, smoke, fires, SPC, storm reports, space weather), is display-only and is
-    never read by the IsSafe decision.
+    (smoke, fires, SPC, storm reports), is display-only and is never read by the IsSafe
+    decision.
 """
 from __future__ import annotations
 
@@ -109,9 +109,9 @@ def _hazard_info_unavailable(cfg, error=None, enabled=False):
             log.exception("hazard_feeds.unavailable_component failed")
     if not isinstance(comp, dict):
         comp = {"safe": True, "info_only": True, "enabled": False, "feeds": {},
-                "quakes": [], "smoke": None, "fires": [],
+                "smoke": None, "fires": [],
                 "spc": {"category": None, "label": "", "mds": []},
-                "lsr": [], "space_weather": None, "error": None,
+                "lsr": [], "error": None,
                 "source": "hazard information feeds (unavailable)"}
     if enabled:
         comp["enabled"] = True
@@ -652,9 +652,9 @@ class SafetyMonitor:
             reasons.append("NWS hazard layer reports unsafe%s"
                            % (" (%s)" % str(err)[:120] if err else ""))
 
-        # Hazard INFORMATION (quakes, smoke, fires, SPC, storm reports, space weather) is
-        # shown on the page and the map and is NEVER part of the decision: it is fetched
-        # for the state file only, and deliberately not referenced below (tests pin this).
+        # Hazard INFORMATION (smoke, fires, SPC, storm reports) is shown on the page and
+        # the map and is NEVER part of the decision: it is fetched for the state file
+        # only, and deliberately not referenced below (tests pin this).
         hazard_info = self._hazard_info_component(now)
 
         is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe

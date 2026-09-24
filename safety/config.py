@@ -414,9 +414,9 @@ RADAR_ATTRIBUTION = "Radar: NOAA/NSSL MRMS via IEM"
 #    whole life of the warning, persisted across restarts like the other latches. It is
 #    released early only when FRESH point AND area queries both say the warning is gone;
 #    a feed outage holds it to the warning's own end time, never longer.
-#  * HAZARD INFORMATION (USGS quakes, NOAA HMS smoke, NIFC fires, SPC outlook and
-#    mesoscale discussions, local storm reports, space weather) is INFORMATION ONLY: shown
-#    on the page and the map, never part of IsSafe.
+#  * HAZARD INFORMATION (NOAA HMS smoke, NIFC fires, SPC outlook and mesoscale
+#    discussions, local storm reports) is INFORMATION ONLY: shown on the page and the
+#    map, never part of IsSafe.
 # With no veto held, an unreachable alert feed is "unavailable" and does not veto on its
 # own — like the forecast and radar layers; the connectivity watchdog covers total loss.
 HAZARDS_ENABLED = _env_str("TTU_SAFETY_HAZARDS", "1").strip().lower() not in ("0", "false", "no")
@@ -580,12 +580,6 @@ HAZARD_FEEDS_ENABLED = (_env_str("TTU_SAFETY_HAZARD_FEEDS", "1").strip().lower()
 # day); a feed whose own cadence is slower is polled at that cadence instead.
 HAZARD_FEEDS_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_FEEDS_POLL_SEC",
                                _env_int("TTU_SAFETY_HAZARD_FEEDS_POLL_SEC", 600), 60)
-# Earthquakes listed within this radius and at or above this magnitude. 300 km reaches
-# the induced-seismicity cluster near Snyder/Ackerly (125-175 km), where nearly all the
-# nearby events occur — well outside the map, so these are mostly text.
-HAZARD_QUAKE_RADIUS_KM = _clamp("TTU_SAFETY_HAZARD_QUAKE_KM",
-                                _env_float("TTU_SAFETY_HAZARD_QUAKE_KM", 300.0), 1.0)
-HAZARD_QUAKE_MIN_MAG = _env_float("TTU_SAFETY_HAZARD_QUAKE_MIN_MAG", 2.5)
 # NWS Local Storm Reports (via IEM) from the last this-many hours, within the map.
 HAZARD_LSR_HOURS = _clamp("TTU_SAFETY_HAZARD_LSR_HOURS",
                           _env_int("TTU_SAFETY_HAZARD_LSR_HOURS", 24), 1, 168)

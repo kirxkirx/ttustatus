@@ -4,8 +4,8 @@ the NWS-warnings safety tile, from hand-built safety-state dicts.
 Fixtures are trimmed from REAL payloads fetched with curl on 2026-09-24: NWS Lubbock's
 TO.W.0033 of 2025-06-05 (a confirmed PDS tornado over Reese Center — the at-site veto
 case, IEM text), api.weather.gov Flood Watch / Flash Flood / Dust Storm Warning features,
-USGS, IEM LSR / SPC MD and SWPC records, and a live hazard_feeds component. Only the
-fields the page reads are kept; times are re-based on "now".
+IEM LSR / SPC MD records, and a live hazard_feeds component. Only the fields the page
+reads are kept; times are re-based on "now".
 """
 import os
 import re
@@ -133,8 +133,7 @@ def _hazards(now, veto=True, at_site=None, nearby=None, **kw):
 
 def _feeds(**override):
     feeds = {n: {"ok": True, "error": None, "age_s": 180, "count": 0}
-             for n in ("quakes", "smoke", "fires", "fire_perimeters", "spc_outlook",
-                       "spc_md", "lsr", "space_weather")}
+             for n in ("smoke", "fires", "fire_perimeters", "spc_outlook", "spc_md", "lsr")}
     feeds.update(override)
     return feeds
 
@@ -142,13 +141,6 @@ def _feeds(**override):
 def _hazard_info():
     return {
         "safe": True, "info_only": True, "enabled": True, "feeds": _feeds(),
-        # USGS 2.5_month, within 300 km: one pre-formatted item, one raw-field item
-        "quakes": [
-            {"text": "M3.9 23 km NW of Westbrook, Texas · 156 km SE · Thu 12:15 CDT",
-             "on_map": False},
-            {"mag": 3.6, "place": "26 km SW of Garden City, Texas", "distance_km": 227.0,
-             "bearing": "S", "time_local": "Sat 09:46 CDT", "on_map": False},
-        ],
         # HMS 2026-09-22: Light smoke over the site in the afternoon analysis
         "smoke": {"at_site": True, "density": "Light", "window": "17:00-23:00 UTC",
                   "count": 2, "on_map": True},
@@ -162,9 +154,6 @@ def _hazard_info():
                  "unit": "INCH", "city": "5 W Justiceburg", "county": "Garza",
                  "distance_km": 88.0, "bearing": "SE", "remark": "Quarter to ping pong "
                  "ball sized hail.", "on_map": True}],
-        # SWPC 2026-09-24: Kp 3.67 (max 4.33), R0 S0 G0
-        "space_weather": {"kp": 3.67, "kp_max_24h": 4.33,
-                          "scales": {"G": 0, "R": 0, "S": 0}},
     }
 
 
@@ -471,38 +460,28 @@ def test_info_section_rows_and_map_key():
             "&middot; watch probability 5%") in txt
     assert ("Storm reports: Wed 18:12 CDT &middot; HAIL 1.5 INCH &middot; 5 W Justiceburg "
             "&middot; 88 km SE from the site") in txt
-    assert "M3.9 23 km NW of Westbrook, Texas" in txt            # pre-formatted item
-    assert "M3.6 26 km SW of Garden City, Texas &middot; 227 km S from the site" in txt
-    assert "Earthquakes (2)" in txt
-    assert "Space weather: Kp 3.7 now (max 4.3 in 24 h), NOAA scales G0 R0 S0" in txt
     # each row carries its feed status; empty-but-fresh feeds are folded into one line
-    assert "USGS &middot; updated 3 min ago" in h
+    assert "NOAA HMS &middot; updated 3 min ago" in h
     assert "None current: wildfire incidents (NIFC WFIGS)." in txt
     # items inside the map box are marked, and the map key names what is drawn
     assert h.count('<span class="hz-chip">on map</span>') == 4    # smoke, SPC, MD, LSR
     assert "On the radar map:" in h and "smoke: a grey veil" in h
-    assert "storm reports: &#9660; tornado" in h and "earthquakes:" not in h
-    assert "Feed status (8 feeds)" in h
+    assert "storm reports: &#9660; tornado" in h and "wildfires:" not in h
+    assert "Feed status (6 feeds)" in h
     assert h.index("On the radar map:") < h.index("Feed status")
 
 
 def _live_feeds_component():
     # safety/hazard_feeds.py HazardFeedsPoller.component() output from a live poll on
     # 2026-09-24 ~12:00 CDT (trimmed): site in SPC TSTM with a MRGL outline on the map,
-    # one HMS smoke area on the map, a felt M3.6 in the TexNet cluster, Kp 3.7.
+    # one HMS smoke area on the map.
     feeds = {n: {"ok": True, "error": None, "age_s": 3, "count": c, "label": n,
                  "source": "(feed attribution)", "interval_s": 600}
-             for n, c in (("quakes", 1), ("smoke", 1), ("fires", 0), ("fire_perimeters", 0),
-                          ("spc_outlook", 1), ("spc_md", 0), ("lsr", 0),
-                          ("space_weather", 1))}
+             for n, c in (("smoke", 1), ("fires", 0), ("fire_perimeters", 0),
+                          ("spc_outlook", 1), ("spc_md", 0), ("lsr", 0))}
     return {
         "safe": True, "info_only": True, "enabled": True, "available": True,
         "feeds": feeds,
-        "quakes": [{"id": "tx2026suygvy", "mag": 3.6, "place": "32 km SW of Garden City, "
-                    "Texas", "dist_km": 231.8, "bearing": "S", "on_map": False, "felt": 1,
-                    "alert": "green", "time_local": "Thu 03:36 CDT",
-                    "text": "M3.6 · 32 km SW of Garden City, Texas · Thu 03:36 CDT · 232 km "
-                            "S of the site · felt reports: 1, PAGER green"}],
         "smoke": {"file_date": "2026-09-24", "site_in_smoke": False,
                   "site_in_smoke_today": False, "density": None, "on_map": 1,
                   "latest_window": "07:00–10:00 CDT (12:00–15:00 UTC)",
@@ -516,13 +495,9 @@ def _live_feeds_component():
                         "Thu 11:30 CDT – Fri 07:00 CDT",
                 "color": "#9E9E9E", "on_map": ["MRGL"], "mds": []},
         "lsr": [],
-        "space_weather": {"kp_now": 3.67, "kp_max_24h": 4.33, "r_now": 0, "s_now": 0,
-                          "g_now": 0, "g_forecast_max": 1, "flags": [],
-                          "text": "Kp 3.7 (24 h max 4.3) · NOAA scales now R0 S0 G0 · "
-                                  "geomagnetic storm G1 forecast (2026-09-24)"},
         "on_map": 2,
-        "source": ("USGS earthquakes · NOAA HMS smoke · NIFC WFIGS fires · NOAA SPC outlook "
-                   "and mesoscale discussions · NWS storm reports via IEM · NOAA SWPC"),
+        "source": ("NOAA HMS smoke · NIFC WFIGS fires · NOAA SPC outlook · "
+                   "SPC mesoscale discussions and NWS storm reports via IEM"),
     }
 
 
@@ -539,13 +514,10 @@ def test_info_section_with_the_hazard_feeds_component():
     assert '<span class="hz-chip">on map: MRGL</span>' in h
     assert "Smoke: No smoke over the site · 1 smoke area on the map" in txt
     assert "aloft), not surface air quality" in txt                   # the HMS caveat
-    assert "M3.6 · 32 km SW of Garden City, Texas" in txt and "felt reports: 1" in txt
-    assert "Space weather: Kp 3.7 (24 h max 4.3)" in txt
     assert ("None current: SPC mesoscale discussions on the map (NOAA SPC via IEM), storm reports "
             "on the map (NWS LSR via IEM), wildfire incidents (NIFC WFIGS).") in txt
-    assert "Sources: USGS earthquakes" in txt
-    # quakes are 230 km out: listed, but no "on map" chip and no map-key entry for them
-    assert h.count("hz-chip\">on map") == 2 and "earthquakes: rings" not in h
+    assert "Sources: NOAA HMS smoke · NIFC WFIGS fires" in txt
+    assert h.count("hz-chip\">on map") == 2                           # smoke, SPC
     assert "SPC outlook: dashed outlines" in h and "smoke: a grey veil" in h
 
 
@@ -554,15 +526,16 @@ def test_failed_or_unknown_feed_never_says_none():
     info = _hazard_info()
     info["feeds"] = _feeds(fires={"ok": False, "error": "HTTP Error 503", "age_s": None,
                                   "count": 0},
-                           quakes={"ok": True, "error": None, "age_s": 99999, "count": 0})
-    info["quakes"] = []
-    del info["feeds"]["lsr"]                            # a feed the page cannot find
+                           lsr={"ok": True, "error": None, "age_s": 99999, "count": 0})
     info["lsr"] = []
+    del info["feeds"]["spc_md"]                         # a feed the page cannot find
+    info["spc"]["mds"] = []
     txt = _text(msp.build_hazards_html(_state(now, info=info)))
     assert "None current" not in txt or "wildfire" not in txt.split("None current")[1]
     assert "wildfire incidents (NIFC WFIGS, unavailable: HTTP Error 503)" in txt
-    assert "earthquakes (USGS, no recent update (27.8 h ago))" in txt
-    assert "storm reports on the map (NWS LSR via IEM, status unknown)" in txt
+    assert "storm reports on the map (NWS LSR via IEM, no recent update (27.8 h ago))" in txt
+    assert ("SPC mesoscale discussions on the map (NOAA SPC via IEM, status unknown)"
+            in txt)
 
 
 def test_last_known_items_of_a_failed_feed_are_labelled():
@@ -579,7 +552,7 @@ def test_information_never_renders_unsafe_or_veto():
     now = time.time()
     info = _hazard_info()
     info["safe"] = False
-    info["quakes"].append({"text": "M5.2 Range Hill TX", "on_map": True})
+    info["lsr"].append({"text": "TORNADO · 2 N Range Hill TX", "on_map": True})
     hz = _hazards(now, veto=False, at_site=[], nearby=[])
     st = _state(now, hz, info)
     h = msp.build_hazards_html(st)
@@ -590,6 +563,28 @@ def test_information_never_renders_unsafe_or_veto():
     # hazard_info alone (no NWS component) never produces a tile either
     assert "NWS warnings" not in msp.build_safety_tiles_html(
         _state(now, info=info)["components"])
+
+
+def test_older_daemon_state_with_retired_feeds_renders():
+    # a state file written by a daemon that still polled the USGS earthquake and NOAA
+    # SWPC space-weather feeds (the page is updated before the daemon restarts): their
+    # lists are ignored, no row or map-key entry, and everything else renders as usual
+    now = time.time()
+    info = _hazard_info()
+    info["feeds"].update(quakes={"ok": True, "error": None, "age_s": 180, "count": 1},
+                         space_weather={"ok": True, "error": None, "age_s": 180,
+                                        "count": 1})
+    info["quakes"] = [{"text": "M3.6 · 32 km SW of Garden City, Texas", "on_map": True}]
+    info["space_weather"] = {"text": "Kp 3.7 (24 h max 4.3) · NOAA scales now R0 S0 G0"}
+    info["totals"] = {"quakes": 1}
+    h = msp.build_hazards_html(_state(now, _hazards(now, veto=False), info))
+    txt = _text(h)
+    assert "Garden City" not in txt and "Kp 3.7" not in txt
+    assert "Earthquakes" not in txt and "Space weather" not in txt
+    assert "Smoke: Light smoke over the site (17:00-23:00 UTC)" in txt
+    assert h.count('<span class="hz-chip">on map</span>') == 4    # smoke, SPC, MD, LSR
+    # (the folded-away feed-status list shows whatever feeds the daemon reports)
+    assert "Feed status (8 feeds)" in h
 
 
 def test_info_feeds_off_and_nws_off_texts():
@@ -618,17 +613,15 @@ def test_hostile_text_is_escaped_everywhere():
     hz["veto_events"] = [EVIL]
     hz["error"] = EVIL
     info = _hazard_info()
-    info["quakes"] = [{"text": EVIL, "on_map": True},
-                      {"mag": 3.0, "place": EVIL, "time_local": EVIL, "bearing": EVIL,
-                       "distance_km": 12}]
     info["smoke"] = {"at_site": True, "density": EVIL, "window": EVIL}
     info["spc"] = {"category": EVIL, "label": EVIL,
                    "mds": [{"num": EVIL, "concerning": EVIL, "expire_local": EVIL,
                             "watch_confidence": EVIL}]}
-    info["lsr"] = [{"type": EVIL, "magnitude": EVIL, "unit": EVIL, "city": EVIL,
+    info["lsr"] = [{"text": EVIL, "on_map": True},
+                   {"type": EVIL, "magnitude": EVIL, "unit": EVIL, "city": EVIL,
                     "remark": EVIL, "time_local": EVIL}]
-    info["fires"] = [{"name": EVIL, "acres": 12, "county": EVIL, "updated_local": EVIL}]
-    info["space_weather"] = {"kp": 2.0, "scales": {"G": EVIL, "R": 0, "S": 0}}
+    info["fires"] = [{"name": EVIL, "acres": 12, "county": EVIL, "updated_local": EVIL,
+                      "bearing": EVIL, "distance_km": 12}]
     info["feeds"] = {EVIL: {"ok": False, "error": EVIL, "age_s": 5, "count": 1}}
     st = _state(now, hz, info)
     out = msp.build_hazards_html(st) + msp.build_safety_tiles_html(st["components"])
@@ -750,9 +743,9 @@ def test_malformed_state_never_crashes(tmp_path, monkeypatch):
                                 "ends": [], "threat": {}}, None],
                    "nearby": "x", "counts": {"at_site": float("nan"), "nearby": "3"},
                    "point_age_s": "x", "area_age_s": float("inf")},
-                   "hazard_info": {"feeds": [], "quakes": {"x": 1}, "smoke": [],
+                   "hazard_info": {"feeds": [], "fires": {"x": 1}, "smoke": [],
                                    "spc": "x", "lsr": [None, 3, {"on_map": [1, None]}],
-                                   "space_weather": {"scales": []}}}}):
+                                   "totals": {"lsr": "many"}}}}):
         msp.build_hazards_html(st)                       # must not raise
         comp = st.get("components") if isinstance(st, dict) else None
         if isinstance(comp, dict):

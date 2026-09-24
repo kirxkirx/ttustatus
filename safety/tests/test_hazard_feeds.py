@@ -14,25 +14,6 @@ import pytest
 
 from safety import hazard_feeds as hf
 
-# USGS 2.5_day (2026-09-24, trimmed) + real FDSN events: Spearman M5.0 (256 km) and the M2.6 8 km E of Anton (2022, inside the map)
-QUAKES_JSON = (
-    '{"type":"FeatureCollection","metadata":{"title":"USGS Magnitude 2.5+ Earthquakes, Past D'
-    'ay","count":4},"features":[{"type":"Feature","id":"tx2026suygvy","geometry":{"type":"Poi'
-    'nt","coordinates":[-101.742,31.671,5.542]},"properties":{"mag":3.6,"place":"32 km SW of '
-    'Garden City, Texas","time":1790238968785,"type":"earthquake","felt":1,"alert":"green","t'
-    'sunami":0,"status":"reviewed","magType":"ml"}},{"type":"Feature","id":"aka2026sykywt","g'
-    'eometry":{"type":"Point","coordinates":[-146.42,61.445,16.2]},"properties":{"mag":2.7,"p'
-    'lace":"35 km N of Valdez, Alaska","time":1790260432979,"type":"earthquake","felt":null,"'
-    'alert":null,"tsunami":0,"status":"automatic","magType":"ml"}},{"type":"Feature","id":"tx'
-    '2026ojlaky","geometry":{"type":"Point","coordinates":[-100.976,35.902,5.6885]},"properti'
-    'es":{"mag":5,"place":"38 km SSE of Spearman, Texas","time":1784802103909,"type":"earthqu'
-    'ake","felt":499,"alert":"green","tsunami":0,"status":"reviewed","magType":"ml"}},{"type"'
-    ':"Feature","id":"tx2022ijsv","geometry":{"type":"Point","coordinates":[-102.0691857,33.8'
-    '0767822,2.127563477]},"properties":{"mag":2.6,"place":"8 km E of Anton, Texas","time":16'
-    '51291304920,"type":"earthquake","felt":1,"alert":null,"tsunami":0,"status":"reviewed","m'
-    'agType":"ml"}}]}'
-)
-
 # HMS smoke KML 2026-09-22 (decimated): the 12-15Z polygon over the site, the latest (20-23:30Z) one touching the map, one over Cuba (from 2026-09-24, re-dated
 # 12-15Z of the same day: one HMS file holds one day's analyses)
 SMOKE_KML = (
@@ -230,31 +211,6 @@ LSR_JSON = (
     '"},"geometry":{"type":"Point","coordinates":[-102.17,33.59]}}]}'
 )
 
-# SWPC noaa-planetary-k-index.json (2026-09-24, last 8 rows)
-KP_JSON = (
-    '[{"time_tag":"2026-09-23T15:00:00","Kp":0.67,"a_running":3,"station_count":8},{"time_tag'
-    '":"2026-09-23T18:00:00","Kp":1.67,"a_running":6,"station_count":8},{"time_tag":"2026-09-'
-    '23T21:00:00","Kp":1.67,"a_running":6,"station_count":8},{"time_tag":"2026-09-24T00:00:00'
-    '","Kp":3.0,"a_running":15,"station_count":8},{"time_tag":"2026-09-24T03:00:00","Kp":2.33'
-    ',"a_running":9,"station_count":8},{"time_tag":"2026-09-24T06:00:00","Kp":3.0,"a_running"'
-    ':15,"station_count":8},{"time_tag":"2026-09-24T09:00:00","Kp":4.33,"a_running":32,"stati'
-    'on_count":8},{"time_tag":"2026-09-24T12:00:00","Kp":3.67,"a_running":22,"station_count":'
-    '8}]'
-)
-
-# SWPC noaa-scales.json (2026-09-24)
-SCALES_JSON = (
-    '{"0":{"DateStamp":"2026-09-24","TimeStamp":"17:34:00","R":{"Scale":"0","Text":"none","Mi'
-    'norProb":null,"MajorProb":null},"S":{"Scale":"0","Text":"none","Prob":null},"G":{"Scale"'
-    ':"0","Text":"none"}},"1":{"DateStamp":"2026-09-24","TimeStamp":"17:34:00","R":{"Scale":n'
-    'ull,"Text":null,"MinorProb":"20","MajorProb":"1"},"S":{"Scale":null,"Text":null,"Prob":"'
-    '1"},"G":{"Scale":"1","Text":"minor"}},"2":{"DateStamp":"2026-09-25","TimeStamp":"00:00:0'
-    '0","R":{"Scale":null,"Text":null,"MinorProb":"20","MajorProb":"1"},"S":{"Scale":null,"Te'
-    'xt":null,"Prob":"1"},"G":{"Scale":"0","Text":"none"}},"3":{"DateStamp":"2026-09-26","Tim'
-    'eStamp":"00:00:00","R":{"Scale":null,"Text":null,"MinorProb":"20","MajorProb":"1"},"S":{'
-    '"Scale":null,"Text":null,"Prob":"1"},"G":{"Scale":"0","Text":"none"}}}'
-)
-
 
 def _ts(*a):
     return datetime(*a, tzinfo=timezone.utc).timestamp()
@@ -267,8 +223,7 @@ BOX = (SITE[1] - 1, SITE[0] - 1, SITE[1] + 1, SITE[0] + 1)
 
 def _cfg(**kw):
     c = dict(GEOCODE=SITE, RADAR_THUMB_HALF_DEG=1.0, HAZARD_FEEDS_ENABLED=True,
-             HAZARD_FEEDS_POLL_SEC=600, HAZARD_STALE_AFTER_SEC=600,
-             HAZARD_QUAKE_RADIUS_KM=300.0, HAZARD_QUAKE_MIN_MAG=2.5, HAZARD_LSR_HOURS=24,
+             HAZARD_FEEDS_POLL_SEC=600, HAZARD_STALE_AFTER_SEC=600, HAZARD_LSR_HOURS=24,
              LOCAL_TZ="America/Chicago", NWS_USER_AGENT="ttu-test")
     c.update(kw)
     return SimpleNamespace(**c)
@@ -289,12 +244,10 @@ def _burning(now, names=("Yellow Lake", "Leon")):
 
 def _routes(now=T0, **over):
     r = dict(over)                     # overrides first: the first matching fragment wins
-    for k, v in (("hms_smoke", SMOKE_KML.encode()), ("summary/2.5_day", QUAKES_JSON.encode()),
-                 ("WFIGS_Incident", _burning(now)),
+    for k, v in (("hms_smoke", SMOKE_KML.encode()), ("WFIGS_Incident", _burning(now)),
                  ("WFIGS_Interagency", PERIMETERS_JSON.encode()),
                  ("day1otlk", SPC_20250605_JSON.encode()), ("spc_mcd", MCD_JSON.encode()),
-                 ("lsrs_by_point", LSR_JSON.encode()), ("planetary-k-index", KP_JSON.encode()),
-                 ("noaa-scales", SCALES_JSON.encode())):
+                 ("lsrs_by_point", LSR_JSON.encode())):
         r.setdefault(k, v)
     return r
 
@@ -366,22 +319,6 @@ def test_monitor_never_ands_hazard_info(env, write_inputs):
 
 
 # ---- per-feed parsing and views ----------------------------------------------------
-def test_quakes_radius_magnitude_and_map(monkeypatch):
-    qs = hf.parse_quakes(QUAKES_JSON.encode(), SITE, BOX, 300.0, 2.5)
-    assert [q["id"] for q in qs] == ["tx2026suygvy", "tx2026ojlaky", "tx2022ijsv"]  # no AK
-    anton = qs[-1]
-    assert anton["on_map"] and anton["dist_km"] < 15 and anton["bearing"] == "NW"
-    assert [q["id"] for q in hf.parse_quakes(QUAKES_JSON.encode(), SITE, BOX, 300.0, 3.0)] \
-        == ["tx2026suygvy", "tx2026ojlaky"]
-    assert [hf._usgs_level(m) for m in (1.0, 2.5, 3.0, 4.5, 0.5)] == \
-        ["1.0", "2.5", "2.5", "4.5", "all"]
-    p = _poller(monkeypatch)
-    c = p.component(T0)
-    assert "felt reports: 1, PAGER green" in c["quakes"][0]["text"]
-    ov = [o for o in p.overlays(T0) if o["kind"] == "quake"]
-    assert [o["label"] for o in ov] == ["M2.6"]      # only the one inside the map
-
-
 def test_smoke_falls_back_to_yesterday_and_reports_the_site(monkeypatch):
     calls = []
     now = _ts(2026, 9, 23, 3, 0)                     # local evening: no 09-23 file yet
@@ -471,7 +408,7 @@ def _is_green(hexcol):
 def test_hazards_are_never_drawn_green(monkeypatch):
     cols = [c for _r, _n, s, f in hf.SPC_CATEGORIES.values() for c in (s, f)]
     cols += [c for _s, c in hf.LSR_KINDS.values()] + [c for c, _a in hf.SMOKE_FILL.values()]
-    cols += [hf.MD_COLOR, hf.FIRE_COLOR, hf.QUAKE_COLOR]
+    cols += [hf.MD_COLOR, hf.FIRE_COLOR]
     p = _poller(monkeypatch)
     for o in p.overlays(T0):
         cols += [v for v in (o["style"]["stroke"], o["style"]["fill"]) if v]
@@ -549,7 +486,6 @@ def test_totals_count_what_the_display_cap_hides(monkeypatch):
     assert len(c["lsr"]) == hf.MAX_ITEMS
     assert c["totals"]["lsr"] == c["feeds"]["lsr"]["count"] == 35
     assert len([o for o in p.overlays(T0) if o["kind"] == "lsr"]) == 35
-    assert c["totals"]["quakes"] == c["feeds"]["quakes"]["count"] == len(c["quakes"])
     assert c["totals"]["fires"] == len(c["fires"])
 
 
@@ -596,30 +532,16 @@ def test_attribution_credits_iem_for_the_mesoscale_discussions():
     assert "mesoscale discussions and NWS storm reports via IEM" in hf.SOURCE
 
 
-def test_space_weather_line_and_legacy_kp_format(monkeypatch):
-    now = _ts(2026, 9, 24, 18, 0)
-    p = _poller(monkeypatch, now=now)
-    sw = p.component(now)["space_weather"]
-    assert sw["kp_now"] == 3.67 and sw["kp_max_24h"] == 4.33 and sw["g_now"] == 0
-    assert sw["text"].startswith("Kp 3.7 (24 h max 4.3) · NOAA scales now R0 S0 G0")
-    assert "G1 forecast" in sw["text"] and sw["flags"] == []
-    p.poll_now(now + 2 * 86400)                     # SWPC stuck on 09-24's last value
-    assert "latest value from" in p.component(now + 2 * 86400)["space_weather"]["text"]
-    legacy = [["time_tag", "Kp", "a_running", "station_count"],
-              ["2026-09-24 12:00:00.000", "3.67", "22", "8"]]
-    assert hf.parse_kp(json.dumps(legacy)) == [(_ts(2026, 9, 24, 12), 3.67)]
-
-
 # ---- robustness: independence, conditional GETs, staleness, cadence, clock ---------
 def test_feeds_are_independent(monkeypatch):
-    p = _poller(monkeypatch, **{"summary/2.5_day": urllib.error.URLError("down"),
-                                "day1otlk": b"<html>maintenance</html>"})
+    p = _poller(monkeypatch, lsrs_by_point=urllib.error.URLError("down"),
+                day1otlk=b"<html>maintenance</html>")
     f = p.component(T0)["feeds"]
-    assert not f["quakes"]["ok"] and "down" in f["quakes"]["error"]
+    assert not f["lsr"]["ok"] and "down" in f["lsr"]["error"]
     assert not f["spc_outlook"]["ok"] and f["spc_outlook"]["error"]
-    assert all(f[n]["ok"] for n in hf.FEED_NAMES if n not in ("quakes", "spc_outlook"))
+    assert all(f[n]["ok"] for n in hf.FEED_NAMES if n not in ("lsr", "spc_outlook"))
     c = p.component(T0)
-    assert c["quakes"] == [] and c["spc"]["category"] is None and c["spc"]["mds"]
+    assert c["lsr"] == [] and c["spc"]["category"] is None and c["spc"]["mds"]
 
 
 def test_conditional_get_reuses_the_parsed_copy(monkeypatch):
@@ -627,7 +549,7 @@ def test_conditional_get_reuses_the_parsed_copy(monkeypatch):
     p = _poller(monkeypatch, calls=calls)
     before = p.component(T0)["spc"]["category"]
     calls.clear()
-    _install(monkeypatch, _routes(day1otlk=304, **{"summary/2.5_day": 304}), calls)
+    _install(monkeypatch, _routes(day1otlk=304), calls)
     p.poll_now(T0 + 700)
     sent = {u.split("?")[0].rsplit("/", 1)[-1]: (e, lm) for u, e, lm in calls}
     assert sent["day1otlk_cat.nolyr.geojson"] == ('"v1"', "Thu, 24 Sep 2026 17:00:00 GMT")
@@ -643,18 +565,18 @@ def test_stale_feed_is_withheld_not_shown_as_current(monkeypatch):
     late = T0 + p._stale_after("lsr") + 1
     c = p.component(late)
     assert not c["feeds"]["lsr"]["ok"] and c["feeds"]["lsr"]["error"].startswith("stale")
-    assert c["lsr"] == [] and c["quakes"] == [] and c["spc"]["category"] is None
+    assert c["lsr"] == [] and c["spc"]["category"] is None
     assert c["smoke"] is not None                    # smoke's cadence (30 min) is slower
     assert p.component(T0 + 10 * 3600)["available"] is False
     assert p.overlays(T0 + 10 * 3600) == []
 
 
 def test_cadence_retry_and_backward_clock(monkeypatch):
-    _install(monkeypatch, _routes(**{"summary/2.5_day": urllib.error.URLError("x")}))
+    _install(monkeypatch, _routes(day1otlk=urllib.error.URLError("x")))
     p = hf.HazardFeedsPoller(_cfg())
     assert set(p.maybe_poll(T0)) == set(hf.FEED_NAMES)   # first call: everything
     assert p.maybe_poll(T0 + 60) is None
-    assert set(p.maybe_poll(T0 + hf.FAIL_RETRY_SEC)) == {"quakes"}   # failed: retry soon
+    assert set(p.maybe_poll(T0 + hf.FAIL_RETRY_SEC)) == {"spc_outlook"}   # failed: retry soon
     polled = p.maybe_poll(T0 + 601)
     assert polled and "smoke" not in polled          # HMS: 30 min cadence
     assert "smoke" in p.maybe_poll(T0 + 1801)
@@ -680,9 +602,9 @@ def test_site_change_and_coverage(monkeypatch):
     calls = []
     q = _poller(monkeypatch, cfg=_cfg(GEOCODE=(48.14, 11.58)), calls=calls)   # Munich
     f = q.component(T0)["feeds"]
-    assert f["quakes"]["ok"] and f["space_weather"]["ok"]
-    assert "coverage" in f["lsr"]["error"] and "coverage" in f["spc_outlook"]["error"]
-    assert not any("lsrs_by_point" in u or "day1otlk" in u for u, _e, _l in calls)
+    # every feed is a US or North American product: each one says so, none is requested
+    assert all("coverage" in f[n]["error"] for n in hf.FEED_NAMES)
+    assert calls == [] and not q.component(T0)["available"]
 
 
 def test_disabled_polls_nothing(monkeypatch):
@@ -697,7 +619,7 @@ def test_disabled_polls_nothing(monkeypatch):
 def test_overlays_are_well_formed_and_bounded(monkeypatch):
     p = _poller(monkeypatch)
     ov = p.overlays(T0)
-    kinds = {"quake", "smoke", "fire", "fire_perimeter", "spc_outlook", "spc_md", "lsr"}
+    kinds = {"smoke", "fire", "fire_perimeter", "spc_outlook", "spc_md", "lsr"}
     assert {o["kind"] for o in ov} == kinds
     assert len({o["key"] for o in ov}) == len(ov)
     for o in ov:
@@ -706,11 +628,6 @@ def test_overlays_are_well_formed_and_bounded(monkeypatch):
         assert set(o["style"]) == {"stroke", "fill", "fill_alpha", "width", "dash",
                                    "symbol", "size"}
     assert [o["key"] for o in p.overlays(T0)] == [o["key"] for o in ov]   # stable keys
-    many = json.loads(QUAKES_JSON)
-    many["features"] = [dict(many["features"][0], id=f"q{i}") for i in range(60)]
-    _install(monkeypatch, _routes(**{"summary/2.5_day": json.dumps(many).encode()}))
-    p.poll_now(T0)
-    assert len(p.component(T0)["quakes"]) == hf.MAX_ITEMS
 
 
 # ---- HTTP helper -------------------------------------------------------------------

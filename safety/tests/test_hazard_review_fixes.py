@@ -70,7 +70,7 @@ def test_setup_never_says_none_for_failed_or_disabled_layers():
     for name in info["feeds"]:
         info["feeds"][name] = {"ok": False, "error": "network: offline", "age_s": None,
                                "count": 0}
-    info.update(quakes=[], fires=[], lsr=[], smoke=None, space_weather=None)
+    info.update(fires=[], lsr=[], smoke=None)
     h = _setup(down, info)
     assert "none" not in h.replace("none configured", "")
     assert "unknown" in h and "no current data" in h
@@ -86,7 +86,7 @@ def test_setup_lists_fresh_empty_data_as_none_and_credits_sources():
     hz = _hazards(now, veto=False, at_site=[], nearby=[], point_fresh=True,
                   area_fresh=True)
     info = _hazard_info()
-    info.update(source="USGS earthquakes · NOAA HMS smoke")
+    info.update(source="NOAA HMS smoke · NIFC WFIGS fires")
     h = _setup(hz, info)
     assert "NWS alerts at the site</h3><p>none</p>" in h
-    assert "Sources:" in h and "api.weather.gov" in h and "USGS earthquakes" in h
+    assert "Sources:" in h and "api.weather.gov" in h and "NIFC WFIGS fires" in h

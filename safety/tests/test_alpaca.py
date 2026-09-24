@@ -116,13 +116,12 @@ def _view(event, color, vetoes=False, threat=None, headline=None):
 
 def _info(**kw):
     d = {"safe": True, "info_only": True, "enabled": True,
-         "feeds": {"usgs": {"ok": True, "error": None, "age_s": 120, "count": 1},
+         "feeds": {"wfigs": {"ok": True, "error": None, "age_s": 120, "count": 1},
                    "hms_smoke": {"ok": False, "error": "HTTP Error 404", "age_s": None,
                                  "count": 0}},
-         "quakes": [{"text": "M3.1 · 12 km E of Snyder · 140 km"}],
          "smoke": {"text": "Light smoke over the site (17-23 UTC)"},
          "fires": [], "spc": {"category": "MRGL", "label": "Marginal risk", "mds": []},
-         "lsr": [], "space_weather": {"text": "Kp 3 (max 24 h: 4) · G0 R0 S0"}}
+         "lsr": [{"text": "HAIL 1.00 in · 12 E Snyder · 140 km"}]}
     d.update(kw)
     return d
 
@@ -133,7 +132,7 @@ def test_setup_shows_the_veto_and_escapes_everything(tmp_path, monkeypatch):
                      headline=_TOR_VETO["headline"])]
     nearby = [_view("Flood Watch", 'red" onmouseover="x')]      # invalid colour
     mon.hazards = _Stub(_hz(veto=[_TOR_VETO], at_site=at_site, nearby=nearby))
-    mon.hazard_feeds = _Stub(_info(quakes=[{"text": "<b>M3.1</b>"}]))
+    mon.hazard_feeds = _Stub(_info(lsr=[{"text": "<b>HAIL</b>"}]))
     page = c.get("/setup").get_data(as_text=True)
     assert "UNSAFE" in page
     assert "VETO — Tornado Warning over the site until 18:45 CDT" in page
@@ -141,7 +140,7 @@ def test_setup_shows_the_veto_and_escapes_everything(tmp_path, monkeypatch):
     assert "TORNADO EMERGENCY" in page and "background:#FF0000" in page
     assert "<script>" not in page and "&lt;script&gt;" in page
     assert "onmouseover" not in page                   # an invalid colour never reaches CSS
-    assert "<b>M3.1</b>" not in page and "&lt;b&gt;M3.1&lt;/b&gt;" in page
+    assert "<b>HAIL</b>" not in page and "&lt;b&gt;HAIL&lt;/b&gt;" in page
     assert "NWS alerts at the site" in page and "NWS alerts nearby (on the map)" in page
     assert "information only" in page
     assert "Tornado Warning, Dust Storm Warning, High Wind Warning" in page
@@ -183,10 +182,9 @@ def test_setup_hazard_rows_when_unavailable_or_disabled(tmp_path, monkeypatch):
 def test_setup_survives_oddly_shaped_hazard_info(tmp_path, monkeypatch):
     c, mon = _client(tmp_path, monkeypatch)
     mon.hazards = _Stub(_hz(at_site=["not a dict", _view("Wind Advisory", "#D2B48C")]))
-    mon.hazard_feeds = _Stub(_info(feeds={"usgs": "?", 3: None}, quakes="many",
+    mon.hazard_feeds = _Stub(_info(feeds={"wfigs": "?", 3: None},
                                    fires=[{"acres": 12, "flag": True}, "Yellow Lake"],
-                                   spc=["MRGL"], lsr=[{}] * 9, smoke=["x"],
-                                   space_weather=7))
+                                   spc=["MRGL"], lsr=[{}] * 9, smoke=["x"]))
     r = c.get("/setup")
     assert r.status_code == 200
     page = r.get_data(as_text=True)
@@ -198,10 +196,12 @@ def test_setup_survives_oddly_shaped_hazard_info(tmp_path, monkeypatch):
     odd = dict(_hz(nearby=[_view("Dust Advisory", "#BDB76B\n")]), counts=[1],
                veto_events="Tornado Warning")
     mon.hazards = _Stub(odd)
+    mon.hazard_feeds = _Stub(_info(fires="many"))           # not a list: never "none"
     r = c.get("/setup")
     assert r.status_code == 200
     page = r.get_data(as_text=True)
     assert "(veto: Tornado Warning)" in page and "Dust Advisory" in page
+    assert "Wildfires: no current data (status unknown)" in page
     assert "#BDB76B" not in page                    # not a strict #RRGGBB: no swatch
 
 

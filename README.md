@@ -13,10 +13,10 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    **internet-loss watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca
    SafetyMonitor** so NINA can react (park/close on unsafe). The status page shows the
    monitor's state, endpoint, inputs, radar map, and log, plus a **Hazards** section:
-   every active NWS alert on the map, and information-only earthquakes, smoke, wildfires,
-   SPC outlook and mesoscale discussions, storm reports and space weather, also drawn on
-   the radar map. Only those three (configurable) warnings can close the roof; everything
-   else is shown, never gated on.
+   every active NWS alert on the map, and information-only smoke, wildfires, SPC outlook
+   and mesoscale discussions and storm reports, also drawn on the radar map. Only those
+   three (configurable) warnings can close the roof; everything else is shown, never
+   gated on.
 
 Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
 **[README_SAFETY.md](README_SAFETY.md)** for the full design and reference.
@@ -79,7 +79,7 @@ safety_monitor.py        Alpaca SafetyMonitor daemon entry point
 run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd)
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
-  hazard_feeds.py        information-only hazard feeds (USGS, HMS, NIFC, SPC, LSR, SWPC)
+  hazard_feeds.py        information-only hazard feeds (HMS, NIFC, SPC, LSR)
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
 ttustatus.env.example    template for the secrets file (WU key, User-Agent contact, CARTO key)
 ```

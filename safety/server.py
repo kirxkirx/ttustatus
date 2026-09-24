@@ -7,8 +7,8 @@ Threads:
   * nws-poller   — every ~60 s: if the interval elapsed, pull the NWS gridpoint forecast.
   * hazard-alerts — every ~10 s: if due, the NWS active-alerts point query (the warning
                    veto, every HAZARD_POINT_POLL_SEC) and area query (map + list).
-  * hazard-feeds — every ~60 s: if due, the INFORMATION-ONLY hazard feeds (quakes, smoke,
-                   fires, SPC, storm reports, space weather).
+  * hazard-feeds — every ~60 s: if due, the INFORMATION-ONLY hazard feeds (smoke, fires,
+                   SPC, storm reports).
   * discovery    — UDP responder so NINA can auto-find us.
   * main thread  — waitress serving the Alpaca HTTP API.
 """
@@ -156,7 +156,7 @@ def main(argv=None):
     glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
     layer_errors = {}
     hazards, hazard_info = build_hazard_layers(cfg, eventlog, layer_errors)
-    # The radar map draws the hazard layers (alert areas, smoke, fires, quakes, ...) over
+    # The radar map draws the hazard layers (alert areas, smoke, fires, ...) over
     # the radar image; the pollers hand it their overlays() as zero-arg callables.
     sources = overlay_sources(hazards, hazard_info)
     radar = (RadarPoller(cfg, eventlog, overlay_sources=sources or None)
