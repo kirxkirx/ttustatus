@@ -117,6 +117,35 @@ def test_radar_section_renders():
     assert msp.build_radar_html({"components": {"radar": {"enabled": False}}}) == ""
 
 
+def test_hazards_section_and_tile_render():
+    # a daemon publishing the two hazard components: the safety card gains the NWS-warnings
+    # tile, the radar blurb points at the Hazards key, and the section renders
+    st = _safe_state()
+    st["components"]["hazards"] = {
+        "safe": True, "enabled": True, "available": True,
+        "veto_events": ["Tornado Warning", "Dust Storm Warning", "High Wind Warning"],
+        "veto": [], "at_site": [], "counts": {"at_site": 0, "nearby": 1},
+        "nearby": [{"key": "KAMA.FA.A.0002", "event": "Flood Watch", "kind": "watch",
+                    "color": "#E53935", "sender": "NWS Amarillo TX", "vetoes": False,
+                    "end_local": "Fri 07:00 CDT"}],
+        "point_age_s": 30, "area_age_s": 60, "error": None}
+    st["components"]["hazard_info"] = {"safe": True, "info_only": True, "enabled": True,
+                                       "feeds": {"quakes": {"ok": True, "age_s": 60}},
+                                       "quakes": [], "smoke": None, "fires": [],
+                                       "spc": {"category": None, "label": "", "mds": []},
+                                       "lsr": [], "space_weather": None}
+    card = msp.build_safety_html(st)
+    assert "NWS warnings" in card and "no veto warning at the site" in card
+    hz = msp.build_hazards_html(st)
+    assert "Hazards (NWS alerts" in hz and "Flood Watch" in hz and "#E53935" in hz
+    assert "NWS alerts nearby (on the map) (1)" in hz and "Other hazard information" in hz
+    st["components"]["radar"] = {"trigger_km": 30, "enabled": True, "available": True}
+    assert "Hazards</b> section below" in msp.build_radar_html(st)
+    # an older daemon (no hazard components): nothing new appears, nothing breaks
+    old = _safe_state()
+    assert msp.build_hazards_html(old) == "" and "NWS warnings" not in msp.build_safety_html(old)
+
+
 def test_camera_disabled_no_capture_no_error_state(monkeypatch):
     # camera off (default): no subprocess may run, and "disabled" must not read as an error
     monkeypatch.setattr(msp, "CAMERA_ENABLED", False)

@@ -8,10 +8,15 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    snapshot (disabled by default; `TTU_STATUS_CAMERA=1` re-enables it).
 2. **Alpaca SafetyMonitor** (`safety_monitor.py` + `safety/`) — a small always-on daemon
    that aggregates **sun altitude**, **humidity**, **Weather Underground rain**, the
-   **NWS forecast**, **GOES GLM lightning**, **MRMS radar** and an **internet-loss
-   watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca SafetyMonitor**
-   so NINA can react (park/close on unsafe). The status page shows the monitor's state,
-   endpoint, inputs, radar map, and log.
+   **NWS forecast**, **GOES GLM lightning**, **MRMS radar**, **NWS warnings** (a Tornado,
+   Dust Storm or High Wind Warning over the site, for the warning's duration) and an
+   **internet-loss watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca
+   SafetyMonitor** so NINA can react (park/close on unsafe). The status page shows the
+   monitor's state, endpoint, inputs, radar map, and log, plus a **Hazards** section:
+   every active NWS alert on the map, and information-only earthquakes, smoke, wildfires,
+   SPC outlook and mesoscale discussions, storm reports and space weather, also drawn on
+   the radar map. Only those three (configurable) warnings can close the roof; everything
+   else is shown, never gated on.
 
 Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
 **[README_SAFETY.md](README_SAFETY.md)** for the full design and reference.
@@ -53,7 +58,12 @@ DNG/TIFF intermediates (GBs per cycle) are created in `/dev/shm`, converted and
 averaged in batches with deletion as it goes, and ImageMagick's pixel-cache spill is
 pointed there too — if the RAM disk is too small for the RAW pipeline, capture
 degrades cleanly to JPEG-only stacking. The remaining regular SD writes are the page
-itself, the final snapshot, and the radar thumbnails (two ~80 KB PNGs per 5 min). Consider `logrotate` (or a
+itself, the final snapshot, and the radar thumbnails (two ~80 KB PNGs per 5 min, plus a
+redraw when the hazard overlays change; like the page, they go to `/dev/shm` behind a
+symlink by default — see README_SAFETY.md). The NWS-warning latch
+(`~/safety_hazard_latch.json`) is written only when a vetoing warning starts, changes or
+ends; NWS zone outlines are cached once per zone in `~/.cache/ttu-hazards/`; the hazard
+information feeds keep everything in RAM. Consider `logrotate` (or a
 size cap) for `~/statuspage.log` and `~/safety_monitor.log` if you use the shell
 launchers.
 
@@ -65,6 +75,8 @@ run_status_page.sh       manual fallback loop for the status page (normally not 
 safety_monitor.py        Alpaca SafetyMonitor daemon entry point
 run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd)
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
+  nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
+  hazard_feeds.py        information-only hazard feeds (USGS, HMS, NIFC, SPC, LSR, SWPC)
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
 ttustatus.env.example    template for the secrets file (WU API key)
 ```

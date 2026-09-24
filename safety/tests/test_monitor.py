@@ -1,4 +1,11 @@
+import json
+import logging
+import re
 import time
+import types
+from datetime import datetime, timezone
+
+import pytest
 
 from safety import config, wu_poll
 from safety import monitor as monitor_mod
@@ -528,3 +535,436 @@ def test_advertised_address_falls_back_to_hostname_not_loopback(monkeypatch):
     monkeypatch.setattr(monitor_mod.socket, "gethostname", lambda: "ttu-pi")
     monkeypatch.setattr(_cfg, "HTTP_HOST", "0.0.0.0")
     assert monitor_mod.alpaca_address(_cfg) == "ttu-pi"   # never a bogus 127.0.0.1
+
+
+# --- NWS hazards: the narrow warning veto, and hazard INFORMATION (never gates) -----
+# The owner's rule: a Tornado / Dust Storm / High Wind Warning OVER THE SITE makes the
+# monitor unsafe for the life of the warning; everything else is information only.
+
+class _StubHazards:
+    """Stands in for NwsAlertsPoller / HazardFeedsPoller: returns (or raises) whatever the
+    test puts in .comp, and records the `now` it was asked about."""
+
+    def __init__(self, comp):
+        self.comp = comp
+        self.calls = []
+
+    def component(self, now=None):
+        self.calls.append(now)
+        if isinstance(self.comp, BaseException):
+            raise self.comp
+        return self.comp
+
+
+_VETO_EVENTS = ["Tornado Warning", "Dust Storm Warning", "High Wind Warning"]
+
+
+def _veto(event="Tornado Warning", key="KLUB.TO.W.0012", end_ts=None, source="both",
+          sender="NWS Lubbock TX", end_local="18:45 CDT"):
+    return {"key": key, "event": event, "headline": f"{event} issued by {sender}",
+            "sender": sender, "end_ts": time.time() + 1800 if end_ts is None else end_ts,
+            "end_local": end_local, "first_seen_ts": time.time() - 60, "source": source}
+
+
+def _alert(event, vetoes=False, color="#FF0000"):
+    return {"key": f"KLUB.{event[:2].upper()}.1", "event": event, "kind": "warning",
+            "severity": "Severe", "urgency": "Immediate", "headline": f"{event} for Lubbock",
+            "nws_headline": None, "sender": "NWS Lubbock TX", "area_desc": "Lubbock",
+            "onset": None, "ends": None, "expires": None, "end_local": "20:00 CDT",
+            "color": color, "threat": None, "vetoes": vetoes, "geometry_source": "zones",
+            "description": "", "instruction": ""}
+
+
+def _hazards_comp(veto=(), available=True, safe=None, at_site=(), nearby=()):
+    veto, at_site, nearby = list(veto), list(at_site), list(nearby)
+    return {"safe": (not veto) if safe is None else safe, "enabled": True,
+            "available": available, "veto_events": list(_VETO_EVENTS), "veto": veto,
+            "at_site": at_site, "nearby": nearby,
+            "counts": {"at_site": len(at_site), "nearby": len(nearby)},
+            "point_age_s": 20, "area_age_s": 70, "error": None,
+            "source": "NWS api.weather.gov active alerts"}
+
+
+def _mon(env, hazards=None, hazard_feeds=None):
+    return SafetyMonitor(env["cfg"], env["log"], env["poller"],
+                         hazards=hazards, hazard_feeds=hazard_feeds)
+
+
+_REASON_RE = re.compile(r"^NWS Tornado Warning in effect for the site until "
+                        r"(\w{3} )?\d\d:\d\d C[SD]T \(NWS Lubbock TX\)$")
+
+
+def test_hazard_veto_makes_unsafe_with_reason(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    hz = _StubHazards(_hazards_comp(veto=[_veto()]))
+    st = _mon(env, hazards=hz).evaluate()
+    assert st["is_safe"] is False
+    assert any(_REASON_RE.match(r) for r in st["reasons"]), st["reasons"]
+    assert st["components"]["hazards"]["veto"][0]["event"] == "Tornado Warning"
+    assert hz.calls and abs(hz.calls[-1] - time.time()) < 5      # asked about "now"
+
+
+@pytest.mark.parametrize("event", _VETO_EVENTS)
+def test_each_default_veto_event_vetoes(env, write_inputs, event):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env, hazards=_StubHazards(_hazards_comp(veto=[_veto(event=event)]))).evaluate()
+    assert st["is_safe"] is False
+    assert any(r.startswith(f"NWS {event} in effect for the site until ")
+               for r in st["reasons"])
+
+
+def test_veto_holds_even_when_page_inputs_are_fine_and_feed_unavailable(env, write_inputs):
+    # a held (latched) veto is in force whether or not the feed is currently fresh
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    comp = _hazards_comp(veto=[_veto(source="latched")], available=False)
+    st = _mon(env, hazards=_StubHazards(comp)).evaluate()
+    assert st["is_safe"] is False
+    assert any("held to its end time" in r for r in st["reasons"])
+
+
+def test_veto_reason_text_matches_the_contract_example(env):
+    # 2026-06-05 23:00Z = 18:00 CDT; the warning ends 23:45Z = 18:45 CDT
+    now = datetime(2026, 6, 5, 23, 0, tzinfo=timezone.utc).timestamp()
+    end = datetime(2026, 6, 5, 23, 45, tzinfo=timezone.utc).timestamp()
+    v = _veto(end_ts=end, end_local="ignored when end_ts is usable")
+    assert monitor_mod.hazard_veto_reason(v, env["cfg"], now) == \
+        "NWS Tornado Warning in effect for the site until 18:45 CDT (NWS Lubbock TX)"
+
+
+def test_veto_reason_names_the_weekday_when_the_end_is_not_today(env):
+    now = datetime(2026, 1, 21, 3, 0, tzinfo=timezone.utc).timestamp()     # Tue 21:00 CST
+    end = datetime(2026, 1, 21, 15, 0, tzinfo=timezone.utc).timestamp()    # Wed 09:00 CST
+    v = _veto(event="High Wind Warning", end_ts=end)
+    assert monitor_mod.hazard_veto_reason(v, env["cfg"], now) == \
+        "NWS High Wind Warning in effect for the site until Wed 09:00 CST (NWS Lubbock TX)"
+
+
+def test_veto_reason_without_a_usable_end_time(env):
+    cfg, now = env["cfg"], time.time()
+    v = _veto(end_ts=float("nan"), end_local="7:15 PM CDT")
+    assert monitor_mod.hazard_veto_reason(v, cfg, now).endswith(
+        "until 7:15 PM CDT (NWS Lubbock TX)")
+    v = dict(_veto(), end_ts=None, end_local=None, sender=None)
+    assert monitor_mod.hazard_veto_reason(v, cfg, now) == \
+        "NWS Tornado Warning in effect for the site (no end time given)"
+    v = dict(_veto(), end_ts=1e300)                               # absurd -> fall back
+    assert "until 18:45 CDT" in monitor_mod.hazard_veto_reason(v, cfg, now)
+
+
+def test_non_veto_alerts_at_the_site_never_gate(env, write_inputs):
+    # Red Flag / Severe Thunderstorm / Flood Warning over the site: shown, not a veto
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    at_site = [_alert("Red Flag Warning"), _alert("Severe Thunderstorm Warning"),
+               _alert("Flash Flood Warning")]
+    nearby = [_alert("Tornado Warning", color="#FF0000")]      # a tornado 60 km away
+    st = _mon(env, hazards=_StubHazards(_hazards_comp(at_site=at_site,
+                                                      nearby=nearby))).evaluate()
+    assert st["is_safe"] is True and st["reasons"] == []
+    assert st["components"]["hazards"]["counts"] == {"at_site": 3, "nearby": 1}
+
+
+def test_hazards_unavailable_does_not_veto(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    comp = _hazards_comp(available=False)
+    comp["error"] = "HTTP Error 503"
+    st = _mon(env, hazards=_StubHazards(comp)).evaluate()
+    assert st["is_safe"] is True
+    assert st["components"]["hazards"]["available"] is False
+
+
+def test_no_hazards_poller_is_safe_and_reports_unavailable(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env).evaluate()
+    hz, info = st["components"]["hazards"], st["components"]["hazard_info"]
+    assert st["is_safe"] is True
+    assert hz["safe"] is True and hz["available"] is False and hz["veto"] == []
+    assert info["safe"] is True and info["info_only"] is True
+
+
+def test_veto_entry_vetoes_even_if_the_safe_flag_disagrees(env, write_inputs):
+    # fail-safe: either signal vetoes
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env, hazards=_StubHazards(_hazards_comp(veto=[_veto()], safe=True))).evaluate()
+    assert st["is_safe"] is False and any(_REASON_RE.match(r) for r in st["reasons"])
+    comp = _hazards_comp(safe=False)
+    comp["error"] = "point query says so"
+    st = _mon(env, hazards=_StubHazards(comp)).evaluate()
+    assert st["is_safe"] is False
+    assert any(r.startswith("NWS hazard layer reports unsafe") for r in st["reasons"])
+
+
+def test_unreadable_veto_entry_still_vetoes(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env, hazards=_StubHazards(_hazards_comp(veto=["TO.W"], safe=False))).evaluate()
+    assert st["is_safe"] is False
+    assert any("unreadable veto entry" in r for r in st["reasons"])
+
+
+def test_broken_hazard_layer_never_releases_a_held_veto(env, write_inputs):
+    # A bug in the code that REPORTS a tornado warning must not reopen the dome: the
+    # vetoes last reported are carried forward to their own end time.
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    hz = _StubHazards(_hazards_comp(veto=[_veto(end_ts=time.time() + 900)]))
+    m = _mon(env, hazards=hz)
+    assert m.evaluate()["is_safe"] is False
+    for broken in (RuntimeError("boom"), None, ["not", "a", "dict"],
+                   {"safe": "yes", "veto": []}, {"safe": True, "veto": "TO.W"}):
+        hz.comp = broken
+        st = m.evaluate()
+        assert st["is_safe"] is False, broken
+        assert st["components"]["hazards"]["veto"][0]["source"] == "latched"
+        assert "hazard layer error" in st["components"]["hazards"]["error"]
+        assert any("held to its end time" in r for r in st["reasons"])
+
+
+def test_carried_veto_runs_out_at_its_end_time(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    hz = _StubHazards(_hazards_comp(veto=[_veto(end_ts=time.time() - 1)]))
+    m = _mon(env, hazards=hz)
+    m.evaluate()
+    hz.comp = RuntimeError("boom")
+    st = m.evaluate()
+    assert st["is_safe"] is True                   # ended: nothing to carry
+    assert st["components"]["hazards"]["available"] is False
+
+
+def test_carried_veto_without_end_time_is_bounded(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    v = dict(_veto(), end_ts=None)
+    m = _mon(env, hazards=_StubHazards(_hazards_comp(veto=[v])))
+    m.evaluate()
+    now = time.time()
+    m.hazards.comp = RuntimeError("boom")
+    assert m._held_vetoes(now + 60) != []
+    assert m._held_vetoes(now + monitor_mod.HAZARD_NO_END_HOLD_SEC + 60) == []
+
+
+def test_broken_hazard_layer_without_prior_veto_is_unavailable_not_unsafe(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env, hazards=_StubHazards(RuntimeError("boom"))).evaluate()
+    assert st["is_safe"] is True
+    hz = st["components"]["hazards"]
+    assert hz["enabled"] is True and hz["available"] is False and "boom" in hz["error"]
+
+
+def test_veto_released_when_the_layer_reports_it_gone(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    hz = _StubHazards(_hazards_comp(veto=[_veto()]))
+    m = _mon(env, hazards=hz)
+    assert m.evaluate()["is_safe"] is False
+    hz.comp = _hazards_comp()                      # cancelled / expired, fresh data
+    assert m.evaluate()["is_safe"] is True
+    hz.comp = RuntimeError("boom")                 # nothing held any more
+    assert m.evaluate()["is_safe"] is True
+
+
+def test_veto_is_written_to_the_state_file(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    _mon(env, hazards=_StubHazards(_hazards_comp(veto=[_veto()]))).evaluate()
+    with open(env["cfg"].STATE_FILE, encoding="utf-8") as f:
+        st = json.load(f)
+    assert st["is_safe"] is False
+    assert st["components"]["hazards"]["veto"][0]["key"] == "KLUB.TO.W.0012"
+    assert st["components"]["hazard_info"]["info_only"] is True
+
+
+def test_state_is_rewritten_at_once_when_the_veto_set_changes(env, write_inputs, monkeypatch):
+    # SD-wear throttle: unchanged state is written only on the heartbeat — but a change in
+    # WHICH warnings veto (or an extension of one) must be written immediately, even when
+    # the reason text reads the same.
+    monkeypatch.setattr(env["cfg"], "STATE_WRITE_HEARTBEAT_SEC", 10 ** 6)
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    end = time.time() + 1800
+    hz = _StubHazards(_hazards_comp(veto=[_veto(key="KLUB.TO.W.0012", end_ts=end)]))
+    m = _mon(env, hazards=hz)
+    writes = []
+    monkeypatch.setattr(m, "_write_state", lambda state: writes.append(state))
+    m.evaluate()
+    m.evaluate()
+    assert len(writes) == 1                        # unchanged -> throttled
+    reasons = writes[0]["reasons"]
+    hz.comp = _hazards_comp(veto=[_veto(key="KLUB.TO.W.0013", end_ts=end)])
+    m.evaluate()
+    assert len(writes) == 2, "a new vetoing warning was not written at once"
+    assert writes[1]["reasons"] == reasons         # ...although the reasons read the same
+    hz.comp = _hazards_comp(veto=[_veto(key="KLUB.TO.W.0013", end_ts=end + 0.5)])
+    m.evaluate()
+    assert len(writes) == 3, "an extended warning was not written at once"
+    m.evaluate()
+    assert len(writes) == 3
+
+
+# --- hazard INFORMATION never influences IsSafe --------------------------------------
+class _Weird:
+    pass
+
+
+_INFO_PAYLOADS = [
+    {"safe": False, "info_only": False, "enabled": True, "veto": [_veto()],
+     "reasons": ["M7.9 earthquake 5 km from the site"], "available": False,
+     "latched": True},
+    {"safe": False},
+    {"quakes": [{"mag": 7.9, "place": "5 km E of Lubbock"}],
+     "smoke": {"density": "Heavy", "over_site": True},
+     "spc": {"category": "HIGH", "label": "High Risk", "mds": [{"num": 1}]},
+     "fires": [{"name": "Yellow Lake", "acres": 1e6}],
+     "lsr": [{"type": "TORNADO"}], "space_weather": {"kp": 9, "g": "G5"}},
+    {"when": datetime(2026, 9, 24, tzinfo=timezone.utc), "set": {1, 2}, "obj": _Weird()},
+    None, [], "unsafe", 42, float("nan"),
+    RuntimeError("feeds exploded"), ValueError("bad KML"),
+]
+
+
+@pytest.mark.parametrize("payload", _INFO_PAYLOADS,
+                         ids=[f"payload{i}" for i in range(len(_INFO_PAYLOADS))])
+@pytest.mark.parametrize("sun", [-10.0, 12.0])            # a safe and an unsafe baseline
+def test_hazard_info_never_changes_is_safe(env, write_inputs, payload, sun):
+    write_inputs(env["cfg"], sun=sun, humidity=40.0)
+    base = _mon(env).evaluate()
+    info = _StubHazards(payload)
+    st = _mon(env, hazard_feeds=info).evaluate()           # must not raise
+    assert info.calls, "the info component was not consulted at all"
+    assert st["is_safe"] is base["is_safe"]
+    assert st["reasons"] == base["reasons"]
+    comp = st["components"]["hazard_info"]
+    assert comp["safe"] is True and comp["info_only"] is True
+    with open(env["cfg"].STATE_FILE, encoding="utf-8") as f:
+        assert json.load(f)["is_safe"] is base["is_safe"]   # state file still written
+
+
+def test_hazard_info_cannot_mask_a_real_veto_either(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env, hazards=_StubHazards(_hazards_comp(veto=[_veto()])),
+              hazard_feeds=_StubHazards({"safe": True, "veto": []})).evaluate()
+    assert st["is_safe"] is False
+
+
+def test_hazard_info_error_is_reported_not_raised(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env, hazard_feeds=_StubHazards(RuntimeError("feeds exploded"))).evaluate()
+    comp = st["components"]["hazard_info"]
+    assert comp["enabled"] is True and "feeds exploded" in comp["error"]
+
+
+def test_component_is_detached_from_the_poller(env, write_inputs):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    payload = {"quakes": [{"text": "M3.1 12 km E of Snyder"}]}
+    st = _mon(env, hazard_feeds=_StubHazards(payload)).evaluate()
+    payload["quakes"].append({"text": "mutated later by the poller thread"})
+    assert len(st["components"]["hazard_info"]["quakes"]) == 1
+
+
+def test_broken_layer_is_logged_once_not_on_every_evaluation(env, write_inputs, caplog):
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    m = _mon(env, hazards=_StubHazards(RuntimeError("boom")),
+             hazard_feeds=_StubHazards(RuntimeError("bang")))
+    with caplog.at_level(logging.ERROR, logger="ttu.safety.monitor"):
+        for _ in range(5):
+            m.evaluate()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("hazards component failed" in x for x in msgs) == 1
+    assert sum("hazard_info component failed" in x for x in msgs) == 1
+
+
+def test_missing_hazard_modules_degrade_to_unavailable(env, write_inputs, monkeypatch):
+    # a partial deploy (or a syntax slip) in a hazard module must not stop the daemon
+    monkeypatch.setattr(monitor_mod, "nws_alerts", None)
+    monkeypatch.setattr(monitor_mod, "NWS_ALERTS_IMPORT_ERROR", "SyntaxError: bad")
+    monkeypatch.setattr(monitor_mod, "hazard_feeds", None)
+    monkeypatch.setattr(monitor_mod, "HAZARD_FEEDS_IMPORT_ERROR", "ImportError: gone")
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env).evaluate()
+    assert st["is_safe"] is True
+    hz, info = st["components"]["hazards"], st["components"]["hazard_info"]
+    assert "failed to import" in hz["error"] and hz["veto"] == []
+    assert hz["veto_events"] == list(env["cfg"].HAZARD_VETO_EVENTS)
+    assert "failed to import" in info["error"] and info["info_only"] is True
+
+
+def test_import_layer_reports_why_instead_of_raising():
+    mod, err = monitor_mod._import_layer("no_such_hazard_module")
+    assert mod is None and err.startswith("ModuleNotFoundError")
+    mod, err = monitor_mod._import_layer("nws_forecast")
+    assert mod is not None and err is None
+
+
+def test_unavailable_component_of_a_buggy_module_is_replaced(env, write_inputs, monkeypatch):
+    class _Buggy:
+        @staticmethod
+        def unavailable_component(cfg):
+            raise KeyError("HAZARD_SOMETHING")
+    monkeypatch.setattr(monitor_mod, "nws_alerts", _Buggy)
+    monkeypatch.setattr(monitor_mod, "hazard_feeds", _Buggy)
+    write_inputs(env["cfg"], sun=-10.0, humidity=40.0)
+    st = _mon(env).evaluate()
+    assert st["is_safe"] is True
+    assert st["components"]["hazards"]["available"] is False
+    assert st["components"]["hazard_info"]["info_only"] is True
+
+
+# --- hazard configuration (C1) -----------------------------------------------------
+def test_hazard_config_defaults():
+    from safety import config as c
+    assert c.HAZARDS_ENABLED is True and c.HAZARD_FEEDS_ENABLED is True
+    assert c.HAZARD_VETO_EVENTS == ("Tornado Warning", "Dust Storm Warning",
+                                    "High Wind Warning")
+    assert (c.HAZARD_POINT_POLL_SEC, c.HAZARD_AREA_POLL_SEC, c.HAZARD_STALE_AFTER_SEC) == \
+        (60, 120, 600)
+    assert c.HAZARD_LATCH_FILE.endswith("safety_hazard_latch.json")
+    assert c.HAZARD_CACHE_DIR.endswith(".cache/ttu-hazards")
+    assert c.HAZARD_FEEDS_POLL_SEC == 600
+    assert (c.HAZARD_QUAKE_RADIUS_KM, c.HAZARD_QUAKE_MIN_MAG) == (300.0, 2.5)
+    assert c.HAZARD_LSR_HOURS == 24 and c.HAZARD_ALERT_FILL_ALPHA == 60
+    assert c.HAZARD_AREA_STATES == "auto"
+    # a warning issued ahead vetoes from 15 min before its onset (read by nws_alerts)
+    from safety import nws_alerts
+    assert c.HAZARD_VETO_ONSET_LEAD_SEC == nws_alerts.ONSET_LEAD_SEC == 900
+    assert nws_alerts.NwsAlertsPoller._onset_lead(types.SimpleNamespace(cfg=c)) == 900.0
+    # the defaults are spelled exactly as NWS spells them (a typo would never veto)
+    assert all(e.lower() in c.NWS_EVENT_NAMES for e in c.HAZARD_VETO_EVENTS)
+
+
+def test_veto_event_list_parsing_is_case_insensitive_and_warns_on_typos(monkeypatch):
+    from safety import config as c
+    monkeypatch.setattr(c, "CONFIG_WARNINGS", [])
+    assert c._parse_event_names(" tornado  WARNING,Tornado Warning,, dust storm warning ") \
+        == ("Tornado Warning", "Dust Storm Warning")
+    assert c.CONFIG_WARNINGS == []
+    assert c._parse_event_names("Tornado Warnign") == ("Tornado Warnign",)   # kept...
+    assert len(c.CONFIG_WARNINGS) == 1 and "Tornado Warnign" in c.CONFIG_WARNINGS[0]
+    assert c._parse_event_names("") == ()                                   # display-only
+    # legacy names are known too (old configs keep working without a warning)
+    monkeypatch.setattr(c, "CONFIG_WARNINGS", [])
+    assert c._parse_event_names("excessive heat warning") == ("Excessive Heat Warning",)
+    assert c.CONFIG_WARNINGS == []
+
+
+def test_area_states_and_range_parsing(monkeypatch):
+    from safety import config as c
+    monkeypatch.setattr(c, "CONFIG_WARNINGS", [])
+    assert c._parse_states("auto") == "auto" and c._parse_states(" ") == "auto"
+    assert c._parse_states("tx, nm,TX") == "TX,NM"
+    assert c.CONFIG_WARNINGS == []
+    assert c._parse_states("Texas") == "auto" and len(c.CONFIG_WARNINGS) == 1
+    assert c._clamp("X", 60, 0, 255) == 60
+    assert c._clamp("X", 900, 0, 255) == 255 and c._clamp("X", 5, 30) == 30
+    assert len(c.CONFIG_WARNINGS) == 3
+
+
+def test_stale_time_is_kept_above_the_slower_alert_query():
+    # a stale time below the area cadence would blank the map and the nearby list (and
+    # forbid every early release) for part of each area-poll cycle; and one bad state code
+    # is dropped instead of making api.weather.gov reject every area query
+    import os
+    import subprocess
+    import sys
+    env = dict(os.environ, TTU_SAFETY_HAZARD_AREA_POLL_SEC="900",
+               TTU_SAFETY_HAZARD_AREA_STATES="TX,NW")
+    out = subprocess.run(
+        [sys.executable, "-c", "from safety import config as c; "
+         "print(c.HAZARD_STALE_AFTER_SEC, c.HAZARD_AREA_STATES); "
+         "print('|'.join(c.CONFIG_WARNINGS))"],
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        env=env, capture_output=True, text=True, check=True).stdout.splitlines()
+    assert out[0] == "1800 TX"
+    assert "TTU_SAFETY_HAZARD_STALE_SEC=600" in out[1] and "NW" in out[1]

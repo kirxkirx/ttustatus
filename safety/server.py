@@ -5,6 +5,10 @@ Threads:
   * rain-poller  — every ~30 s: if it's night (sun below the gate) and the interval has
                    elapsed, poll Weather Underground and update the 3-hour latch.
   * nws-poller   — every ~60 s: if the interval elapsed, pull the NWS gridpoint forecast.
+  * hazard-alerts — every ~10 s: if due, the NWS active-alerts point query (the warning
+                   veto, every HAZARD_POINT_POLL_SEC) and area query (map + list).
+  * hazard-feeds — every ~60 s: if due, the INFORMATION-ONLY hazard feeds (quakes, smoke,
+                   fires, SPC, storm reports, space weather).
   * discovery    — UDP responder so NINA can auto-find us.
   * main thread  — waitress serving the Alpaca HTTP API.
 """
@@ -22,7 +26,8 @@ from . import config, discovery, glm_lightning, radar as radar_mod
 from .alpaca import create_app
 from .connectivity import ConnectivityWatch
 from .eventlog import EventLog
-from .monitor import RainPoller, SafetyMonitor
+from .monitor import (HAZARD_FEEDS_IMPORT_ERROR, NWS_ALERTS_IMPORT_ERROR, RainPoller,
+                      SafetyMonitor, hazard_feeds, nws_alerts)
 from .nws_forecast import NwsForecastPoller
 from .glm_lightning import GlmLightningPoller
 from .radar import RadarPoller
@@ -68,6 +73,77 @@ def run_page_once(cfg):
     return proc.returncode, time.monotonic() - start
 
 
+# Loop wake-ups. The hazard-alerts loop only asks the poller what is due (point query
+# every HAZARD_POINT_POLL_SEC, area query every HAZARD_AREA_POLL_SEC), so waking often is
+# free and a new warning over the site is seen within about one point-poll interval.
+HAZARD_LOOP_WAKE_SEC = 10
+HAZARD_FEEDS_LOOP_WAKE_SEC = 60
+# The radar loop also carries the hazard overlays: RadarPoller.maybe_poll re-renders the
+# last MRMS frame (no refetch) when the overlay set changes, so with overlays it wakes
+# every 20 s — a new warning reaches the map about a minute after the alert poll sees
+# it. Without overlays, nothing but the 5-min poll is due and 60 s is plenty.
+RADAR_LOOP_WAKE_SEC = 60
+RADAR_LOOP_WAKE_OVERLAYS_SEC = 20
+
+
+def _start_thread(target, name):
+    """Start one of the daemon's background loops (a seam the tests replace)."""
+    t = threading.Thread(target=target, name=name, daemon=True)
+    t.start()
+    return t
+
+
+def _make_layer(module, import_error, cls_name, args, label, eventlog, consequence,
+                errors=None, name=None):
+    """Instantiate one hazard poller, or report LOUDLY why not and return None.
+
+    A layer that cannot be created (its module failed to import, its constructor raised)
+    is left out and then reads as 'unavailable' — exactly like an unreachable feed —
+    instead of taking the whole daemon down with it: the rain, sun, humidity, lightning
+    and radar layers must keep protecting the dome regardless. The reason also goes into
+    ``errors[name]``, for SafetyMonitor to publish: an enabled layer that failed to start
+    must not look like one switched off on purpose."""
+    try:
+        if module is None:
+            raise ImportError(import_error or "module missing")
+        return getattr(module, cls_name)(*args)
+    except Exception as e:
+        log.error("%s layer could not be created (%s: %s) — %s", label,
+                  type(e).__name__, e, consequence, exc_info=True)
+        eventlog.record("CONFIG", reason=f"{label} layer failed: {type(e).__name__}: {e}",
+                        result=consequence)
+        if errors is not None and name:
+            errors[name] = f"{type(e).__name__}: {e}"
+        return None
+
+
+def build_hazard_layers(cfg, eventlog, errors=None):
+    """(hazards, hazard_info): the NWS-alerts poller — the narrow warning veto — and the
+    INFORMATION-ONLY hazard-feeds poller, each created only when enabled (else None).
+    ``errors`` (a dict), if given, receives {"hazards" / "hazard_info": why} for an
+    enabled layer that could not be created."""
+    hazards = hazard_info = None
+    if cfg.HAZARDS_ENABLED:
+        hazards = _make_layer(
+            nws_alerts, NWS_ALERTS_IMPORT_ERROR, "NwsAlertsPoller", (cfg, eventlog),
+            "NWS alerts", eventlog,
+            "NWS warnings layer DISABLED — no veto for %s"
+            % (", ".join(cfg.HAZARD_VETO_EVENTS) or "any event"), errors, "hazards")
+    if cfg.HAZARD_FEEDS_ENABLED:
+        hazard_info = _make_layer(
+            hazard_feeds, HAZARD_FEEDS_IMPORT_ERROR, "HazardFeedsPoller", (cfg,),
+            "hazard information", eventlog,
+            "hazard information feeds disabled (information only; IsSafe unaffected)",
+            errors, "hazard_info")
+    return hazards, hazard_info
+
+
+def overlay_sources(*layers):
+    """The zero-arg overlay callables the radar map draws (each layer's overlays())."""
+    return [layer.overlays for layer in layers
+            if layer is not None and callable(getattr(layer, "overlays", None))]
+
+
 def main(argv=None):
     logging.basicConfig(
         level=logging.INFO,
@@ -78,16 +154,35 @@ def main(argv=None):
     poller = RainPoller(cfg, eventlog)
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
     glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
-    radar = RadarPoller(cfg, eventlog) if cfg.RADAR_ENABLED else None
+    layer_errors = {}
+    hazards, hazard_info = build_hazard_layers(cfg, eventlog, layer_errors)
+    # The radar map draws the hazard layers (alert areas, smoke, fires, quakes, ...) over
+    # the radar image; the pollers hand it their overlays() as zero-arg callables.
+    sources = overlay_sources(hazards, hazard_info)
+    radar = (RadarPoller(cfg, eventlog, overlay_sources=sources or None)
+             if cfg.RADAR_ENABLED else None)
     conn = ConnectivityWatch(cfg) if cfg.CONN_ENABLED else None   # monotonic-internal
-    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn)
+    monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn,
+                            hazards=hazards, hazard_feeds=hazard_info,
+                            hazards_error=layer_errors.get("hazards"),
+                            hazard_feeds_error=layer_errors.get("hazard_info"))
 
     for w in cfg.CONFIG_WARNINGS:
         log.warning("CONFIG: %s", w)
-        eventlog.record("CONFIG", reason=w, result="using default")
+        # each message says what is used instead (default, clamped value, kept name)
+        eventlog.record("CONFIG", reason=w, result="check configuration")
     eventlog.record("STARTUP", detail=f"{cfg.SERVER_NAME} v{cfg.DRIVER_VERSION}",
                     result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}",
                     site=f"{cfg.GEOCODE[0]},{cfg.GEOCODE[1]} ({cfg.GEOCODE_SOURCE})")
+    if hazards is not None:
+        if cfg.HAZARD_VETO_EVENTS:
+            log.info("NWS alerts: UNSAFE while any of [%s] is in effect over the site; "
+                     "every other alert is display-only", ", ".join(cfg.HAZARD_VETO_EVENTS))
+        else:
+            log.warning("TTU_SAFETY_HAZARD_VETO_EVENTS is empty — NWS alerts are "
+                        "DISPLAY-ONLY; no warning can veto observing")
+            eventlog.record("CONFIG", reason="no hazard veto events configured",
+                            result="NWS alerts display-only")
     if not cfg.GEOCODE_FROM_ENV:
         log.warning("site coordinates not set via TTU_SAFETY_LAT/LON — will adopt the "
                     "GPS fix from the status page (current default: %s)", cfg.GEOCODE)
@@ -126,7 +221,7 @@ def main(argv=None):
                                  step, step / 86400.0)
                     eventlog.record("CLOCK-STEP", reason=f"{step:+.0f}s",
                                     result="latches re-checked, all layers re-polled")
-                    for comp in (poller, nws, glm, radar):
+                    for comp in (poller, nws, glm, radar, hazards, hazard_info):
                         if comp is not None:
                             try:
                                 comp.clock_stepped(last_wall, wall)
@@ -165,12 +260,32 @@ def main(argv=None):
 
     def radar_loop():
         # Own thread: the slow tile/radar fetch + thumbnail render never blocks refresh.
+        wake = RADAR_LOOP_WAKE_OVERLAYS_SEC if sources else RADAR_LOOP_WAKE_SEC
         while not stop.is_set():
             try:
                 radar.maybe_poll(_fresh_sun(monitor, cfg), time.time())
             except Exception:
                 log.exception("radar poll failed")
-            stop.wait(60)
+            stop.wait(wake)
+
+    def hazards_loop():
+        # Own thread: the NWS point/area queries and the one-time zone-shape fetches never
+        # block the evaluator or HTTP; maybe_poll decides which query is due.
+        while not stop.is_set():
+            try:
+                hazards.maybe_poll(time.time())
+            except Exception:
+                log.exception("NWS alerts poll failed")
+            stop.wait(HAZARD_LOOP_WAKE_SEC)
+
+    def hazard_feeds_loop():
+        # INFORMATION ONLY, in its own thread: a slow or hung feed delays nothing else.
+        while not stop.is_set():
+            try:
+                hazard_info.maybe_poll(time.time())
+            except Exception:
+                log.exception("hazard feeds poll failed")
+            stop.wait(HAZARD_FEEDS_LOOP_WAKE_SEC)
 
     def conn_loop():
         # Probe internet reachability day and night so the "offline > 1 h" clock is accurate.
@@ -192,26 +307,35 @@ def main(argv=None):
                 elapsed = 0.0
             stop.wait(max(1.0, cfg.PAGE_INTERVAL - elapsed))
 
-    threading.Thread(target=evaluator, name="evaluator", daemon=True).start()
-    threading.Thread(target=rain_loop, name="rain-poller", daemon=True).start()
+    _start_thread(evaluator, "evaluator")
+    _start_thread(rain_loop, "rain-poller")
     if nws is not None:
-        threading.Thread(target=nws_loop, name="nws-poller", daemon=True).start()
+        _start_thread(nws_loop, "nws-poller")
     else:
         log.warning("NWS forecast component disabled (TTU_SAFETY_NWS=0)")
     if glm is not None:
-        threading.Thread(target=glm_loop, name="glm-poller", daemon=True).start()
+        _start_thread(glm_loop, "glm-poller")
     else:
         log.warning("GLM lightning component disabled (TTU_SAFETY_GLM=0)")
     if radar is not None:
-        threading.Thread(target=radar_loop, name="radar-poller", daemon=True).start()
+        _start_thread(radar_loop, "radar-poller")
     else:
         log.warning("MRMS radar component disabled (TTU_SAFETY_RADAR=0)")
+    if hazards is not None:
+        _start_thread(hazards_loop, "hazard-alerts")
+    elif not cfg.HAZARDS_ENABLED:      # (a failed layer was already reported loudly)
+        log.warning("NWS alerts layer disabled (TTU_SAFETY_HAZARDS=0) — no veto for %s",
+                    ", ".join(cfg.HAZARD_VETO_EVENTS) or "any event")
+    if hazard_info is not None:
+        _start_thread(hazard_feeds_loop, "hazard-feeds")
+    elif not cfg.HAZARD_FEEDS_ENABLED:
+        log.warning("hazard information feeds disabled (TTU_SAFETY_HAZARD_FEEDS=0)")
     if conn is not None:
-        threading.Thread(target=conn_loop, name="conn-probe", daemon=True).start()
+        _start_thread(conn_loop, "conn-probe")
     else:
         log.warning("connectivity watchdog disabled (TTU_SAFETY_CONN=0)")
     if cfg.PAGE_ENABLED:
-        threading.Thread(target=page_loop, name="page-runner", daemon=True).start()
+        _start_thread(page_loop, "page-runner")
         log.info("status page runner: %s every %ds", cfg.PAGE_SCRIPT, cfg.PAGE_INTERVAL)
     else:
         log.warning("status page runner disabled (TTU_SAFETY_PAGE=0)")

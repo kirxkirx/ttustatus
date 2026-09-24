@@ -6,9 +6,14 @@ Design rules:
   * Rain trips on the FIRST detection by ANY station (no confirmation), and stays unsafe
     for RAIN_LATCH_HOURS after the last rain seen (the latch is persisted to disk).
   * WU is only polled when the sun is below RAIN_POLL_SUN_BELOW_DEG (saves API calls).
+  * NWS alerts: ONLY the configured HAZARD_VETO_EVENTS in effect OVER THE SITE veto (for
+    the life of the warning); every other alert, and all the non-NWS hazard information
+    (quakes, smoke, fires, SPC, storm reports, space weather), is display-only and is
+    never read by the IsSafe decision.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import math
@@ -17,6 +22,7 @@ import socket
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 
 from . import (connectivity as conn_mod, glm_lightning, nws_forecast,
                radar as radar_mod, wu_poll)
@@ -24,11 +30,129 @@ from . import (connectivity as conn_mod, glm_lightning, nws_forecast,
 log = logging.getLogger("ttu.safety.monitor")
 
 
+def _import_layer(name):
+    """Import one of the two hazard modules defensively: (module, None) or (None, why).
+
+    Both are stdlib-only, so on a sane deploy this never fails. But hazard_feeds is
+    INFORMATION ONLY, and nws_alerts already fails to "unavailable" by design — so a broken
+    or missing file (a partial git pull, a syntax slip) must degrade exactly like an
+    unreachable feed, never stop the daemon that serves IsSafe for rain, sun, humidity and
+    lightning. server.main() reports a failed import LOUDLY (log + CONFIG event)."""
+    try:
+        return importlib.import_module("." + name, __package__), None
+    except Exception as e:  # noqa: BLE001 — anything at import time = layer absent
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+nws_alerts, NWS_ALERTS_IMPORT_ERROR = _import_layer("nws_alerts")
+hazard_feeds, HAZARD_FEEDS_IMPORT_ERROR = _import_layer("hazard_feeds")
+
+# When the hazard layer itself breaks, the vetoes it last reported are carried forward
+# (see SafetyMonitor._held_vetoes); one that gave no end time is held this long after its
+# last report — the same bound the NWS-alerts poller applies to such a warning.
+HAZARD_NO_END_HOLD_SEC = 3600
+# A broken layer's traceback is logged when the error changes, else at most this often:
+# evaluate() runs on every Alpaca poll, and the journal lives on the SD card.
+COMPONENT_ERROR_LOG_SEC = 600
+
+
 def _finite(x):
     """Return x if it is a finite real number, else None (so callers fail safe)."""
     if isinstance(x, (int, float)) and math.isfinite(x):
         return x
     return None
+
+
+def _json_clean(obj):
+    """A deep, JSON-safe, detached copy of a component dict. The state file, /status and
+    the status page all serialize the components; one stray datetime or set inside a
+    hazard poller's output must not be able to stop the state file from being written
+    (the page would then show the whole monitor as OFFLINE)."""
+    return json.loads(json.dumps(obj, default=str))
+
+
+def _import_note(err):
+    return None if err is None else "module failed to import (%s)" % err
+
+
+def _hazards_unavailable(cfg, error=None, enabled=False):
+    """The 'hazards' component when the NWS-alerts layer is off, absent or broken: never a
+    veto of its own (SafetyMonitor carries an already-held veto forward separately)."""
+    comp = None
+    if nws_alerts is not None:
+        try:
+            comp = dict(nws_alerts.unavailable_component(cfg))
+        except Exception:
+            log.exception("nws_alerts.unavailable_component failed")
+    if not isinstance(comp, dict):
+        comp = {"safe": True, "enabled": False, "available": False,
+                "veto_events": list(getattr(cfg, "HAZARD_VETO_EVENTS", ())),
+                "veto": [], "at_site": [], "nearby": [],
+                "counts": {"at_site": 0, "nearby": 0},
+                "point_age_s": None, "area_age_s": None, "error": None,
+                "source": "NWS api.weather.gov active alerts (unavailable)"}
+    comp.update(safe=True, available=False, veto=[])
+    if enabled:
+        comp["enabled"] = True
+    if error:
+        comp["error"] = error
+    return comp
+
+
+def _hazard_info_unavailable(cfg, error=None, enabled=False):
+    """The 'hazard_info' component when the information feeds are off, absent or broken."""
+    comp = None
+    if hazard_feeds is not None:
+        try:
+            comp = dict(hazard_feeds.unavailable_component(cfg))
+        except Exception:
+            log.exception("hazard_feeds.unavailable_component failed")
+    if not isinstance(comp, dict):
+        comp = {"safe": True, "info_only": True, "enabled": False, "feeds": {},
+                "quakes": [], "smoke": None, "fires": [],
+                "spc": {"category": None, "label": "", "mds": []},
+                "lsr": [], "space_weather": None, "error": None,
+                "source": "hazard information feeds (unavailable)"}
+    if enabled:
+        comp["enabled"] = True
+    if error:
+        comp["error"] = error
+    return comp
+
+
+def _until_text(v, cfg, now):
+    """' until 18:45 CDT' (weekday added when the end is not today, local time)."""
+    end_ts = _finite(v.get("end_ts"))
+    if end_ts is not None:
+        try:
+            end = nws_forecast._local(datetime.fromtimestamp(end_ts, timezone.utc),
+                                      cfg.LOCAL_TZ)
+            today = nws_forecast._local(datetime.fromtimestamp(now, timezone.utc),
+                                        cfg.LOCAL_TZ).date()
+            return " until " + end.strftime("%H:%M %Z" if end.date() == today
+                                            else "%a %H:%M %Z")
+        except (OverflowError, OSError, ValueError):
+            pass                    # absurd timestamp: fall back to the poller's text
+    if v.get("end_local"):
+        return " until %s" % " ".join(str(v["end_local"]).split())
+    return " (no end time given)"
+
+
+def hazard_veto_reason(v, cfg, now) -> str:
+    """One IsSafe reason per vetoing warning, e.g.
+    'NWS Tornado Warning in effect for the site until 18:45 CDT (NWS Lubbock TX)'."""
+    if not isinstance(v, dict):
+        return "NWS warning in effect for the site (unreadable veto entry — failing safe)"
+    event = " ".join(str(v.get("event") or "").split()) or "warning"
+    text = "NWS %s in effect for the site%s" % (event, _until_text(v, cfg, now))
+    notes = []
+    if v.get("sender"):
+        notes.append(" ".join(str(v["sender"]).split()))
+    if v.get("source") == "latched":
+        notes.append("held to its end time — not re-confirmed by a fresh NWS query")
+    if notes:
+        text += " (%s)" % "; ".join(notes)
+    return text
 
 
 # Detected LAN address, re-checked periodically. Never holds a failure (see _primary_ip).
@@ -336,7 +460,8 @@ class SafetyMonitor:
     """Aggregates the inputs into IsSafe and publishes state for the status page."""
 
     def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None, radar=None,
-                 conn=None):
+                 conn=None, hazards=None, hazard_feeds=None, hazards_error=None,
+                 hazard_feeds_error=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
@@ -344,6 +469,17 @@ class SafetyMonitor:
         self.glm = glm                  # GlmLightningPoller or None
         self.radar = radar              # RadarPoller or None
         self.conn = conn                # ConnectivityWatch or None
+        self.hazards = hazards          # NwsAlertsPoller or None (the narrow warning veto)
+        self.hazard_feeds = hazard_feeds  # HazardFeedsPoller or None (INFORMATION ONLY)
+        # Why an ENABLED hazard layer is absent (its constructor raised; server.main passes
+        # it): the state file then says so — "failed to start, no veto" — instead of
+        # looking like a layer switched off on purpose (TTU_SAFETY_HAZARDS=0).
+        self.hazards_error = hazards_error
+        self.hazard_feeds_error = hazard_feeds_error
+        # the vetoes the hazard layer last reported, and when (see _held_vetoes)
+        self._last_veto: list = []
+        self._last_veto_ts = None
+        self._comp_err_logged: dict = {}   # component name -> (message, monotonic ts)
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()   # serialize whole evaluations
         self._connected = False
@@ -491,8 +627,31 @@ class SafetyMonitor:
             reasons.append("no internet — online services unreachable for %d min "
                            "(failing safe)" % conn.get("offline_min", 0))
 
+        # NWS warnings OVER THE SITE. Only the configured veto events (Tornado / Dust
+        # Storm / High Wind Warning by default) can veto, each for the life of the warning
+        # (the poller persists it); every other alert is display-only. With no veto held
+        # an unavailable feed does not veto on its own, like the forecast and radar layers
+        # (the connectivity watchdog covers a total outage). Independent of page inputs.
+        hazards = self._hazards_component(now)
+        veto = hazards["veto"]
+        # Fail-safe: EITHER signal vetoes — a listed veto entry makes the layer unsafe even
+        # if its flag disagrees, and an explicit safe=False is honoured with no entries.
+        hazards_safe = bool(hazards["safe"]) and not veto
+        if veto:
+            reasons.extend(hazard_veto_reason(v, self.cfg, now) for v in veto)
+        elif not hazards_safe:
+            err = hazards.get("error")
+            reasons.append("NWS hazard layer reports unsafe%s"
+                           % (" (%s)" % str(err)[:120] if err else ""))
+
+        # Hazard INFORMATION (quakes, smoke, fires, SPC, storm reports, space weather) is
+        # shown on the page and the map and is NEVER part of the decision: it is fetched
+        # for the state file only, and deliberately not referenced below (tests pin this).
+        hazard_info = self._hazard_info_component(now)
+
         is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe
-                       and glm_safe and radar_safe and conn_safe and not stale)
+                       and glm_safe and radar_safe and conn_safe and hazards_safe
+                       and not stale)
 
         state = {
             "ts": now,
@@ -523,6 +682,8 @@ class SafetyMonitor:
                 "glm": glm,
                 "radar": radar,
                 "connectivity": conn,
+                "hazards": hazards,
+                "hazard_info": hazard_info,     # information only (never gates)
             },
             "events_tail": [self._fmt_event(e) for e in self.log.recent(12)],
         }
@@ -533,15 +694,109 @@ class SafetyMonitor:
         self._maybe_write_state(state, now)
         return state
 
+    # -- hazard layers ---------------------------------------------------------
+    def _hazards_component(self, now) -> dict:
+        """The NWS-alerts component, validated. A malformed result or an exception is
+        'unavailable' — but never a RELEASE: the vetoes last reported stay in force until
+        their own end time (see _held_vetoes)."""
+        if self.hazards is None:
+            if self.hazards_error:
+                # enabled, but it could not be created: say so (and that nothing can veto)
+                return _hazards_unavailable(
+                    self.cfg, enabled=True,
+                    error="NWS alerts layer failed to start (%s) — no warning veto; see "
+                          "the log" % str(self.hazards_error)[:160])
+            return _hazards_unavailable(self.cfg, error=_import_note(NWS_ALERTS_IMPORT_ERROR))
+        try:
+            comp = self.hazards.component(now)
+            if (not isinstance(comp, dict) or not isinstance(comp.get("safe"), bool)
+                    or not isinstance(comp.get("veto", []), list)):
+                raise TypeError("malformed hazards component (%s)" % type(comp).__name__)
+            comp = _json_clean(comp)
+            comp["veto"] = comp.get("veto") or []
+        except Exception as e:
+            self._log_component_error("hazards", e)
+            comp = _hazards_unavailable(self.cfg, enabled=True,
+                                        error="hazard layer error: %s" % str(e)[:200])
+            held = self._held_vetoes(now)
+            if held:
+                comp["veto"], comp["safe"] = held, False
+            return comp
+        with self._lock:
+            self._last_veto = [v for v in comp["veto"] if isinstance(v, dict)]
+            self._last_veto_ts = now
+        return comp
+
+    def _held_vetoes(self, now) -> list:
+        """The vetoes last reported by the hazard layer that are still running by their
+        own end time, marked 'latched'. A bug in the code that REPORTS a tornado warning
+        must never be what reopens the dome. Bounded like the poller's own hold: to the
+        warning's end_ts, or HAZARD_NO_END_HOLD_SEC after the last report without one."""
+        with self._lock:
+            last, seen = list(self._last_veto), self._last_veto_ts
+        held = []
+        for v in last:
+            end = _finite(v.get("end_ts"))
+            if end is None:
+                end = (seen if seen is not None else now) + HAZARD_NO_END_HOLD_SEC
+            if now < end:
+                held.append(dict(v, source="latched"))
+        return held
+
+    def _hazard_info_component(self, now) -> dict:
+        """INFORMATION ONLY. Whatever the feeds poller returns — or raises — can at most be
+        displayed: the result is JSON-cleaned and stamped safe/info_only, an exception
+        becomes an 'unavailable' component (never an HTTP error on IsSafe), and the
+        decision in _evaluate never reads it."""
+        if self.hazard_feeds is None and self.hazard_feeds_error:
+            comp = _hazard_info_unavailable(
+                self.cfg, enabled=True,
+                error="hazard information feeds failed to start (%s); see the log"
+                      % str(self.hazard_feeds_error)[:160])
+        elif self.hazard_feeds is None:
+            comp = _hazard_info_unavailable(self.cfg,
+                                            error=_import_note(HAZARD_FEEDS_IMPORT_ERROR))
+        else:
+            try:
+                comp = self.hazard_feeds.component(now)
+                if not isinstance(comp, dict):
+                    raise TypeError("hazard info component is %s, not a dict"
+                                    % type(comp).__name__)
+                comp = _json_clean(comp)
+            except Exception as e:
+                self._log_component_error("hazard_info", e)
+                comp = _hazard_info_unavailable(self.cfg, enabled=True,
+                                                error="hazard info error: %s" % str(e)[:200])
+        comp["safe"] = True
+        comp["info_only"] = True
+        return comp
+
+    def _log_component_error(self, name, exc):
+        """Log a broken layer's traceback when its error changes, else every
+        COMPONENT_ERROR_LOG_SEC — not on each of the many evaluations per minute."""
+        msg = "%s: %s" % (type(exc).__name__, exc)
+        mono = time.monotonic()
+        with self._lock:
+            last = self._comp_err_logged.get(name)
+            if last and last[0] == msg and (mono - last[1]) < COMPONENT_ERROR_LOG_SEC:
+                return
+            self._comp_err_logged[name] = (msg, mono)
+        log.error("%s component failed: %s", name, msg, exc_info=exc)
+
     def _maybe_write_state(self, state, now):
         """SD-wear throttle: evaluate() runs on every Alpaca poll, but the state file only
         needs writing when the DECISION changed, or as a slow heartbeat so the status
         page's staleness gate still sees a live daemon."""
+        hz = state["components"].get("hazards") or {}
         sig = json.dumps({
             "is_safe": state["is_safe"], "reasons": state["reasons"],
             "warnings": state["warnings"], "connected": state["connected"],
             "comp": {k: (c.get("safe"), c.get("latched"), c.get("available"),
                          c.get("enabled")) for k, c in state["components"].items()},
+            # a change in WHICH warnings veto (or their end time: an extension) is written
+            # at once — even when the reasons read the same (two warnings, same text)
+            "hazard_veto": sorted("%s|%s" % (v.get("key"), v.get("end_ts"))
+                                  for v in hz.get("veto") or [] if isinstance(v, dict)),
         }, sort_keys=True)
         if (sig == self._last_state_sig
                 and (now - self._last_state_write) < self.cfg.STATE_WRITE_HEARTBEAT_SEC):

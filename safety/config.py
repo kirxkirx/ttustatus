@@ -45,6 +45,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _clamp(name: str, value, lo, hi=None):
+    """Bound a parsed value LOUDLY: an out-of-range setting is corrected with a startup
+    warning, never silently obeyed (a 0 s poll interval would hammer api.weather.gov, a
+    fill alpha of 900 would break the map renderer)."""
+    if value < lo or (hi is not None and value > hi):
+        fixed = lo if value < lo else hi
+        CONFIG_WARNINGS.append(f"{name}={value!r} is outside [{lo}, "
+                               f"{'inf' if hi is None else hi}] — using {fixed}")
+        return fixed
+    return value
+
+
 # --- Weather Underground (rain input) --------------------------------------
 # REQUIRED for rain polling. NEVER hardcode a key here — it would end up on GitHub.
 # Set the TTU_SAFETY_WU_KEY environment variable instead (see README_SAFETY.md). If it's
@@ -189,14 +201,24 @@ RADAR_THUMB_PATH_DAY = _env_str("TTU_SAFETY_RADAR_THUMB_DAY", _day_variant(RADAR
 RADAR_THUMB_HALF_DEG = _env_float("TTU_SAFETY_RADAR_THUMB_HALF", 1.0)  # region half-size
 RADAR_THUMB_PX = _env_int("TTU_SAFETY_RADAR_THUMB_PX", 440)
 RADAR_TILE_ZOOM = _env_int("TTU_SAFETY_RADAR_TILE_ZOOM", 8)
-RADAR_TILE_URL = _env_str(
-    "TTU_SAFETY_RADAR_TILE_URL",
-    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png")   # OSM data, dark theme
+# Basemap tiles: OpenStreetMap's standard tiles for BOTH maps — the one key-free source
+# with readable town labels. CARTO's free rasters (the former default) now answer every
+# request with an "API KEY REQUIRED" watermark tile under HTTP 200 (checked 2026-09-24),
+# which a new SD card, a cleared cache or a GPS-adopted site move would cache for good.
+# The night map inverts the tiles' lightness instead (RADAR_TILE_DARK_INVERT), as the
+# owner's weather project does. Tiles are fetched once per site and theme (~9 each, the
+# composite cached for good): well within the OSM tile policy, which asks for an
+# identifying User-Agent — TTU_SAFETY_NWS_UA, with a contact.
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+RADAR_TILE_URL = _env_str("TTU_SAFETY_RADAR_TILE_URL", OSM_TILE_URL)       # night map
 # Daytime (light) version of the map, shown when the status page is in day style.
 RADAR_DAY_ENABLED = _env_str("TTU_SAFETY_RADAR_DAY", "1").strip().lower() not in ("0", "false", "no")
-RADAR_TILE_URL_DAY = _env_str(
-    "TTU_SAFETY_RADAR_TILE_URL_DAY",
-    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png")  # OSM data, light theme
+RADAR_TILE_URL_DAY = _env_str("TTU_SAFETY_RADAR_TILE_URL_DAY", OSM_TILE_URL)  # day map
+# Night map from light tiles: each tile whose mean luminance is light gets its lightness
+# inverted (hue kept: white land turns near-black, black labels white). A dark tile set
+# configured above is left alone, tile by tile.
+RADAR_TILE_DARK_INVERT = (_env_str("TTU_SAFETY_RADAR_TILE_DARK_INVERT", "1").strip().lower()
+                          not in ("0", "false", "no"))
 RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
 # Write the thumbnails into /dev/shm and leave a one-time symlink at RADAR_THUMB_PATH:
 # the two PNGs are rewritten every poll (~150-250 MB/day) — the single largest SD write
@@ -204,9 +226,197 @@ RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cach
 # and lighttpd all follow symlinks out of the box on Debian. Set 0 to write directly.
 RADAR_THUMB_VIA_SHM = (_env_str("TTU_SAFETY_RADAR_THUMB_SHM", "1").strip().lower()
                        not in ("0", "false", "no")) and os.path.isdir("/dev/shm")
-RADAR_ATTRIBUTION = "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS via IEM"
+RADAR_ATTRIBUTION = ("© OpenStreetMap contributors"
+                     + (", © CARTO" if "cartocdn" in RADAR_TILE_URL + RADAR_TILE_URL_DAY
+                        else "")
+                     + " · Radar: NOAA/NSSL MRMS via IEM")
 # (Persistence note: the radar keeps its OWN post-rain freeze above — it does NOT rely on the
 # WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
+
+# --- NWS hazards: active alerts (one narrow veto) + hazard information -------
+# Two layers, deliberately unequal (safety/nws_alerts.py and safety/hazard_feeds.py):
+#  * NWS ACTIVE ALERTS. Every active warning / watch / advisory / statement touching the
+#    radar map is listed on the status page and drawn on the map. ONLY the events named in
+#    HAZARD_VETO_EVENTS make the monitor UNSAFE, and only while one is in effect OVER THE
+#    SITE (NWS's own point query, or the warning's polygon / the site's zones) — for the
+#    whole life of the warning, persisted across restarts like the other latches. It is
+#    released early only when FRESH point AND area queries both say the warning is gone;
+#    a feed outage holds it to the warning's own end time, never longer.
+#  * HAZARD INFORMATION (USGS quakes, NOAA HMS smoke, NIFC fires, SPC outlook and
+#    mesoscale discussions, local storm reports, space weather) is INFORMATION ONLY: shown
+#    on the page and the map, never part of IsSafe.
+# With no veto held, an unreachable alert feed is "unavailable" and does not veto on its
+# own — like the forecast and radar layers; the connectivity watchdog covers total loss.
+HAZARDS_ENABLED = _env_str("TTU_SAFETY_HAZARDS", "1").strip().lower() not in ("0", "false", "no")
+
+# Every event name api.weather.gov/alerts/types listed on 2026-09-24, plus the legacy names
+# retired by the 2024-25 heat/cold renaming. Used ONLY to catch a typo in
+# HAZARD_VETO_EVENTS — "Tornado Warnign" would otherwise silently never veto — so an
+# unknown name is KEPT (NWS does rename products) and announced loudly at startup.
+NWS_EVENT_NAMES = frozenset(n.strip().lower() for n in (
+    "911 Telephone Outage,Administrative Message,Air Quality Alert,Air Stagnation Advisory,"
+    "Ashfall Advisory,Ashfall Warning,Avalanche Advisory,Avalanche Warning,Avalanche Watch,"
+    "Beach Hazards Statement,Blizzard Warning,Blowing Dust Advisory,Blowing Dust Warning,"
+    "Blue Alert,Brisk Wind Advisory,Child Abduction Emergency,Civil Danger Warning,"
+    "Civil Emergency Message,Coastal Flood Advisory,Coastal Flood Statement,"
+    "Coastal Flood Warning,Coastal Flood Watch,Cold Weather Advisory,Dense Fog Advisory,"
+    "Dense Smoke Advisory,Dust Advisory,Dust Storm Warning,Earthquake Warning,"
+    "Evacuation Immediate,Extreme Heat Warning,Extreme Heat Watch,Extreme Cold Warning,"
+    "Extreme Cold Watch,Extreme Fire Danger,Extreme Wind Warning,Fire Warning,"
+    "Fire Weather Watch,Flash Flood Statement,Flash Flood Warning,Flash Flood Watch,"
+    "Flood Advisory,Flood Statement,Flood Warning,Flood Watch,Freeze Warning,Freeze Watch,"
+    "Freezing Fog Advisory,Freezing Spray Advisory,Frost Advisory,Gale Warning,Gale Watch,"
+    "Hazardous Materials Warning,Hazardous Seas Warning,Hazardous Seas Watch,"
+    "Hazardous Weather Outlook,Heat Advisory,Heavy Freezing Spray Warning,"
+    "Heavy Freezing Spray Watch,High Surf Advisory,High Surf Warning,High Wind Warning,"
+    "High Wind Watch,Hurricane Force Wind Warning,Hurricane Force Wind Watch,"
+    "Hurricane Warning,Hurricane Watch,Hydrologic Outlook,Ice Storm Warning,"
+    "Lake Effect Snow Warning,Lake Wind Advisory,Lakeshore Flood Advisory,"
+    "Lakeshore Flood Statement,Lakeshore Flood Warning,Lakeshore Flood Watch,"
+    "Law Enforcement Warning,Local Area Emergency,Low Water Advisory,"
+    "Marine Weather Statement,Nuclear Power Plant Warning,Radiological Hazard Warning,"
+    "Red Flag Warning,Rip Current Statement,Severe Thunderstorm Warning,"
+    "Severe Thunderstorm Watch,Severe Weather Statement,Shelter In Place Warning,"
+    "Short Term Forecast,Small Craft Advisory,Snow Squall Warning,Special Marine Warning,"
+    "Special Weather Statement,Storm Surge Warning,Storm Surge Watch,Storm Warning,"
+    "Storm Watch,Test,Tornado Warning,Tornado Watch,Tropical Cyclone Local Statement,"
+    "Tropical Storm Warning,Tropical Storm Watch,Tsunami Advisory,Tsunami Warning,"
+    "Tsunami Watch,Typhoon Warning,Typhoon Watch,Volcano Warning,Wind Advisory,"
+    "Winter Storm Warning,Winter Storm Watch,Winter Weather Advisory,"
+    # legacy names (pre-2025), still possible in old configs
+    "Excessive Heat Warning,Excessive Heat Watch,Wind Chill Warning,Wind Chill Watch,"
+    "Wind Chill Advisory"
+).split(",") if n.strip())
+
+
+def _parse_event_names(raw: str, var: str = "TTU_SAFETY_HAZARD_VETO_EVENTS") -> tuple:
+    """'tornado warning, Dust  Storm Warning' -> ('Tornado Warning', 'Dust Storm Warning').
+
+    Matching is case-insensitive everywhere; the names are nevertheless stored in NWS's
+    own Title Case (every CAP event name is Title Case), so even an exact comparison
+    matches and the page shows them the way NWS spells them. Duplicates are dropped; a
+    name NWS does not know is kept but warned about (see NWS_EVENT_NAMES)."""
+    out, seen = [], set()
+    for part in (raw or "").split(","):
+        words = part.split()
+        if not words:
+            continue
+        canon = " ".join(w[:1].upper() + w[1:].lower() for w in words)
+        if canon.lower() in seen:
+            continue
+        seen.add(canon.lower())
+        if canon.lower() not in NWS_EVENT_NAMES:
+            CONFIG_WARNINGS.append(f"{var}: {canon!r} is not a known NWS event name — "
+                                   f"check the spelling (kept, but it can only veto if "
+                                   f"NWS issues an event with exactly this name)")
+        out.append(canon)
+    return tuple(out)
+
+
+# NWS event names (comma-separated, case-insensitive) that make the monitor UNSAFE while
+# one is in effect OVER THE SITE. The default three are the owner's choice — each means
+# conditions that endanger an open dome at this very spot: a tornado; a haboob (near-zero
+# visibility, abrasive dust driven into the optics); damaging wind (sustained 40+ mph or
+# gusts 58+ mph). Everything else NWS issues — Severe Thunderstorm Warnings included,
+# whose rain, hail and lightning the radar, GLM and WU layers already catch — is shown,
+# never gated on. Empty => every alert is display-only (warned loudly at startup).
+HAZARD_VETO_EVENTS = _parse_event_names(_env_str(
+    "TTU_SAFETY_HAZARD_VETO_EVENTS", "Tornado Warning,Dust Storm Warning,High Wind Warning"))
+# A veto warning issued AHEAD of its onset (a High Wind Warning "from 10 AM Friday" is often
+# issued the afternoon before) vetoes from this long before its onset — time to park and
+# close — not from issuance: the owner asked for "the duration of the warning", and the
+# dome must not stay shut the whole night before a daytime wind event. Until then it is
+# shown as "scheduled". Tornado and Dust Storm Warnings take effect when issued, so this
+# never delays them, and a warning without an onset time vetoes at once.
+HAZARD_VETO_ONSET_LEAD_SEC = _clamp("TTU_SAFETY_HAZARD_VETO_ONSET_LEAD_SEC",
+                                    _env_int("TTU_SAFETY_HAZARD_VETO_ONSET_LEAD_SEC", 900), 0)
+# Cadences. The POINT query (/alerts/active?point=<site>: NWS's own answer to "what is in
+# effect HERE", a few hundred bytes) is the veto's fast path, so it runs every minute — a
+# tornado warning here typically lasts only ~35 min. The AREA query (the map and the
+# nearby list: every alert in TX/NM/OK, ~8 KB gzipped on a quiet day, 50-150 KB on a busy
+# one) runs every 2 min, together with a national query of the civil emergency message
+# types (usually empty, ~200 bytes). Zone outlines for zone-based alerts are fetched once
+# per zone, ever (HAZARD_CACHE_DIR).
+HAZARD_POINT_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_POINT_POLL_SEC",
+                               _env_int("TTU_SAFETY_HAZARD_POINT_POLL_SEC", 60), 30)
+HAZARD_AREA_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_AREA_POLL_SEC",
+                              _env_int("TTU_SAFETY_HAZARD_AREA_POLL_SEC", 120), 60)
+# A query result older than this is no longer "current": with no veto held the layer
+# reports unavailable (no veto on its own), and a held veto can only run out at the
+# warning's end time. At least two intervals of the SLOWER query, so one slow poll never
+# flaps it — a stale time shorter than the area cadence would blank the map and the
+# nearby list (and forbid every early release) for part of each area-poll cycle.
+HAZARD_STALE_AFTER_SEC = _clamp("TTU_SAFETY_HAZARD_STALE_SEC",
+                                _env_int("TTU_SAFETY_HAZARD_STALE_SEC", 600),
+                                2 * max(HAZARD_POINT_POLL_SEC, HAZARD_AREA_POLL_SEC))
+# The veto is PERSISTED — a daemon restart mid-warning must not reopen the dome. A small
+# JSON file on the SD card, rewritten only when the set of vetoing warnings changes (a
+# few writes per warning, never per poll).
+HAZARD_LATCH_FILE = _env_str("TTU_SAFETY_HAZARD_LATCH_FILE",
+                             os.path.expanduser("~/safety_hazard_latch.json"))
+# Outlines of forecast/county/fire zones, for the zone-based alerts that carry no polygon
+# (watches; wind, winter, heat, fire-weather products). A zone's shape practically never
+# changes, so each is fetched ONCE and kept on disk — like the radar basemap tiles —
+# instead of re-downloaded per alert or per boot.
+HAZARD_CACHE_DIR = _env_str("TTU_SAFETY_HAZARD_CACHE",
+                            os.path.expanduser("~/.cache/ttu-hazards"))
+
+
+# The api.weather.gov ?area= codes this daemon accepts: the 50 states, DC and the
+# territories (USPS codes; the same keys as nws_alerts.STATE_BOXES — a test pins that).
+# Marine areas are left out: marine-only products are never shown.
+US_AREA_CODES = frozenset((
+    "AK,AL,AR,AS,AZ,CA,CO,CT,DC,DE,FL,GA,GU,HI,IA,ID,IL,IN,KS,KY,LA,MA,MD,ME,MI,MN,MO,MP,"
+    "MS,MT,NC,ND,NE,NH,NJ,NM,NV,NY,OH,OK,OR,PA,PR,RI,SC,SD,TN,TX,UT,VA,VI,VT,WA,WI,WV,WY"
+).split(","))
+
+
+def _parse_states(raw: str, var: str = "TTU_SAFETY_HAZARD_AREA_STATES") -> str:
+    """'auto', or a normalized comma list of state codes ('tx, nm' -> 'TX,NM').
+
+    api.weather.gov rejects the WHOLE area query (HTTP 400) when one code is unknown, so a
+    typo ('NW' for 'NM') would silently cost the map, the nearby list, the local site test
+    and every early veto release: unknown codes are dropped with a startup warning, and
+    'auto' is used when nothing valid is left."""
+    v = (raw or "").strip()
+    if not v or v.lower() == "auto":
+        return "auto"
+    codes = list(dict.fromkeys(c.strip().upper() for c in v.split(",") if c.strip()))
+    bad = [c for c in codes if c not in US_AREA_CODES]
+    good = [c for c in codes if c in US_AREA_CODES]
+    if bad:
+        CONFIG_WARNINGS.append(f"{var}: ignoring unknown state code(s) {', '.join(bad)} "
+                               f"(api.weather.gov would reject the whole query)"
+                               + ("" if good else " — using 'auto'"))
+    return ",".join(good) if good else "auto"
+
+
+# States the area query covers: "auto" = the states whose bounding boxes intersect the
+# radar map (for TTU: TX, NM, OK — the map's west edge is a few km from New Mexico),
+# re-derived if the site coordinates change; or an explicit list such as "TX,NM".
+HAZARD_AREA_STATES = _parse_states(_env_str("TTU_SAFETY_HAZARD_AREA_STATES", "auto"))
+# Map styling: alert areas are filled at this alpha (0-255) under a cased outline, so the
+# radar echoes beneath stay readable.
+HAZARD_ALERT_FILL_ALPHA = _clamp("TTU_SAFETY_HAZARD_FILL_ALPHA",
+                                 _env_int("TTU_SAFETY_HAZARD_FILL_ALPHA", 60), 0, 255)
+
+# Hazard information feeds (INFORMATION ONLY — shown, never part of IsSafe). Each feed is
+# independent: one failing never blanks the others.
+HAZARD_FEEDS_ENABLED = (_env_str("TTU_SAFETY_HAZARD_FEEDS", "1").strip().lower()
+                        not in ("0", "false", "no"))
+# Every 10 min: slow-moving products (SPC outlooks and HMS smoke update a few times a
+# day); a feed whose own cadence is slower is polled at that cadence instead.
+HAZARD_FEEDS_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_FEEDS_POLL_SEC",
+                               _env_int("TTU_SAFETY_HAZARD_FEEDS_POLL_SEC", 600), 60)
+# Earthquakes listed within this radius and at or above this magnitude. 300 km reaches
+# the induced-seismicity cluster near Snyder/Ackerly (125-175 km), where nearly all the
+# nearby events occur — well outside the map, so these are mostly text.
+HAZARD_QUAKE_RADIUS_KM = _clamp("TTU_SAFETY_HAZARD_QUAKE_KM",
+                                _env_float("TTU_SAFETY_HAZARD_QUAKE_KM", 300.0), 1.0)
+HAZARD_QUAKE_MIN_MAG = _env_float("TTU_SAFETY_HAZARD_QUAKE_MIN_MAG", 2.5)
+# NWS Local Storm Reports (via IEM) from the last this-many hours, within the map.
+HAZARD_LSR_HOURS = _clamp("TTU_SAFETY_HAZARD_LSR_HOURS",
+                          _env_int("TTU_SAFETY_HAZARD_LSR_HOURS", 24), 1, 168)
 
 # --- status-page runner ------------------------------------------------------
 # The daemon periodically runs make_status_page.py as a SUBPROCESS (one systemd service

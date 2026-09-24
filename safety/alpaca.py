@@ -8,6 +8,7 @@ human-readable /setup page (and /status JSON) is served too.
 from __future__ import annotations
 
 import html
+import re
 import threading
 
 from flask import Flask, jsonify, request
@@ -286,6 +287,31 @@ def _setup_html(monitor, cfg) -> str:
             cv = "OFFLINE %d min — no internet, failing safe" % conn.get("offline_min", 0)
         rows.append(row("Internet", cv, conn.get("safe", True), unknown=conn_unknown))
 
+    hz = comp.get("hazards")
+    if hz:
+        names = _veto_names(hz) or "none configured"
+        veto = [v for v in hz.get("veto") or [] if isinstance(v, dict)]
+        hz_unknown = False
+        if veto:
+            # checked first: a held veto is in force whether or not the feed is fresh
+            hv = "; ".join("VETO — %s over the site until %s%s" % (
+                _txt(v.get("event"), 60), _txt(v.get("end_local"), 40) or "?",
+                " (held: not re-confirmed by a fresh query)"
+                if v.get("source") == "latched" else "") for v in veto)
+        elif not hz.get("enabled"):
+            hv, hz_unknown = "disabled", True
+        elif not hz.get("available"):
+            hv, hz_unknown = "unavailable / stale (not gating)", True
+        else:
+            counts = hz.get("counts") if isinstance(hz.get("counts"), dict) else {}
+            hv = "no veto event over the site · %s alert(s) at the site, %s nearby" % (
+                counts.get("at_site", 0), counts.get("nearby", 0))
+        if hz.get("error") and not veto:
+            hv += " — %s" % _txt(hz["error"], 90)
+        rows.append(row("NWS warnings (veto: %s)" % names, hv,
+                        bool(hz.get("safe", True)) and not veto, unknown=hz_unknown))
+    hazards_html = _hazards_html(hz, comp.get("hazard_info"))
+
     reasons = ""
     if st["reasons"]:
         items = "".join(f"<li>{html.escape(r)}</li>" for r in st["reasons"])
@@ -310,7 +336,188 @@ background:{badge_col}}}code{{background:#f3f3f3;padding:.1rem .3rem}}</style></
 <p><span class="badge">{label}</span></p>
 {reasons}
 <h2>Inputs</h2><table>{''.join(rows)}</table>
+{hazards_html}
 <h2>Recent events</h2><ul>{events}</ul>
 <p>ASCOM Alpaca SafetyMonitor · device {cfg.DEVICE_NUMBER} · IsSafe at
 <code>/api/v1/safetymonitor/{cfg.DEVICE_NUMBER}/issafe</code></p>
 </body></html>"""
+
+
+# --- hazards section of /setup ------------------------------------------------------
+_HEX_COLOR = re.compile(r"#[0-9A-Fa-f]{6}")          # used with fullmatch
+# keys a pre-formatted info item may carry its display line under, most specific first
+_TEXT_KEYS = ("text", "line", "summary", "label", "headline", "title", "name", "place")
+_MAX_ALERTS = 25
+
+
+def _txt(x, limit=300) -> str:
+    """One line of plain text, bounded (callers html.escape it)."""
+    return "" if x is None else " ".join(str(x).split())[:limit]
+
+
+def _item_text(x, limit=160) -> str:
+    """A display line for one info item, whatever its shape: the feeds pre-format their
+    items, but this debug page must never crash (or go blank) on an unexpected one."""
+    if isinstance(x, dict):
+        for k in _TEXT_KEYS:
+            if x.get(k):
+                return _txt(x[k], limit)
+        return _txt(", ".join("%s %s" % (k, v) for k, v in x.items()
+                              if isinstance(v, (str, int, float))
+                              and not isinstance(v, bool)), limit)
+    return _txt(x, limit)
+
+
+def _swatch(color) -> str:
+    # only a strict #RRGGBB reaches the style attribute; anything else draws no swatch
+    if not isinstance(color, str) or not _HEX_COLOR.fullmatch(color):
+        return ""
+    return ('<span style="display:inline-block;width:.8em;height:.8em;margin-right:.35em;'
+            'border:1px solid #888;background:%s"></span>' % color)
+
+
+def _veto_names(hz) -> str:
+    names = hz.get("veto_events")
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, (list, tuple)):
+        return ""
+    return ", ".join(_txt(n, 60) for n in names if n)
+
+
+def _alert_items(alerts, known=True) -> str:
+    """The alert list; ``known`` = the query behind it is current. Fail-safe wording (the
+    status page's rule): an empty list from a failing or stale query is 'unknown', never
+    'none' — and a non-empty one is labelled last-known."""
+    alerts = [a for a in (alerts if isinstance(alerts, list) else []) if isinstance(a, dict)]
+    if not alerts:
+        return ("<p>none</p>" if known else
+                "<p>unknown — the NWS queries are failing or stale</p>")
+    items = [] if known else ["<li><i>last known — the NWS queries are not current</i></li>"]
+    for a in alerts[:_MAX_ALERTS]:
+        chips = ""
+        if a.get("vetoes"):
+            chips += ' <b style="color:#b42318">VETO</b>'
+        if a.get("threat"):
+            chips += " <b>[%s]</b>" % html.escape(_txt(a["threat"], 40))
+        head = _txt(a.get("nws_headline") or a.get("headline"), 220)
+        tail = "".join(" · %s" % html.escape(t) for t in (
+            _txt(a.get("sender"), 60),
+            ("until " + _txt(a.get("end_local"), 40)) if a.get("end_local") else "") if t)
+        items.append("<li>%s<b>%s</b>%s%s%s</li>" % (
+            _swatch(a.get("color")), html.escape(_txt(a.get("event"), 60) or "alert"), chips,
+            (" — " + html.escape(head)) if head else "", tail))
+    if len(alerts) > _MAX_ALERTS:
+        items.append("<li>… and %d more</li>" % (len(alerts) - _MAX_ALERTS))
+    return "<ul>%s</ul>" % "".join(items)
+
+
+def _info_lines(info) -> list:
+    lines = []
+    feeds = info.get("feeds")
+    if isinstance(feeds, dict) and feeds:
+        st = []
+        for name in sorted(feeds, key=str):
+            f = feeds[name] if isinstance(feeds[name], dict) else {}
+            if f.get("ok"):
+                age = f.get("age_s")
+                st.append("%s ok%s" % (_txt(name, 30), "" if not isinstance(age, (int, float))
+                                       else " (%d min old)" % (age // 60)))
+            else:
+                st.append("%s ERROR%s" % (_txt(name, 30), (": " + _txt(f.get("error"), 60))
+                                          if f.get("error") else ""))
+        lines.append("Feeds: " + "; ".join(st))
+    feeds = feeds if isinstance(feeds, dict) else {}
+    totals = info.get("totals") if isinstance(info.get("totals"), dict) else {}
+
+    def unknown(feed):
+        """None when the feed is current, else 'no current data (why)': an empty list
+        from a failed, stale or missing feed is never reported as 'none'."""
+        f = feeds.get(feed) if isinstance(feeds.get(feed), dict) else {}
+        if f.get("ok"):
+            return None
+        return "no current data (%s)" % (_txt(f.get("error"), 60) or "status unknown")
+
+    def listed(label, items, feed, none="none"):
+        items = items if isinstance(items, list) else []
+        shown = [t for t in (_item_text(i) for i in items[:5]) if t]
+        total = totals.get(feed)
+        total = total if isinstance(total, int) and total >= len(items) else len(items)
+        more = " (+%d more)" % (total - len(shown)) if shown and total > len(shown) else ""
+        stale = (" — last known, %s" % unknown(feed)) if unknown(feed) else ""
+        if shown:
+            lines.append("%s: %s%s%s" % (label, "; ".join(shown), more, stale))
+        elif items:                     # present but not displayable: never "none"
+            lines.append("%s: %d item(s) without a displayable text%s"
+                         % (label, total, stale))
+        else:
+            lines.append("%s: %s" % (label, unknown(feed) or none))
+
+    listed("Earthquakes", info.get("quakes"), "quakes")
+    smoke = info.get("smoke")
+    lines.append("Smoke (NOAA HMS): %s" % (_item_text(smoke) if smoke
+                                           else unknown("smoke") or "none reported"))
+    listed("Wildfires", info.get("fires"), "fires")
+    spc = info.get("spc") if isinstance(info.get("spc"), dict) else {}
+    mds = spc.get("mds") if isinstance(spc.get("mds"), list) else []
+    outlook = (unknown("spc_outlook")
+               or _txt(spc.get("text") or spc.get("label") or spc.get("category"), 120)
+               or "no risk area at the site")
+    lines.append("SPC Day-1 outlook: %s · mesoscale discussions on the map: %s"
+                 % (outlook, unknown("spc_md") or len(mds)))
+    listed("Storm reports", info.get("lsr"), "lsr")
+    sw = info.get("space_weather")
+    lines.append("Space weather: %s" % (_item_text(sw) if sw
+                                        else unknown("space_weather") or "unavailable"))
+    return lines
+
+
+def _hazards_html(hz, info) -> str:
+    """NWS alerts (at the site / nearby) and the information-only hazard feeds. Every
+    string is escaped; a colour reaches the markup only as a validated #RRGGBB."""
+    if not hz and not info:
+        return ""
+    out = ["<h2>Hazards</h2>"]
+    sources = []
+    if hz:
+        names = _veto_names(hz)
+        veto = [v for v in hz.get("veto") or [] if isinstance(v, dict)]
+        if not hz.get("enabled") and not veto:
+            # switched off (or failed to load): no lists, and no policy line claiming a
+            # veto that cannot happen
+            err = hz.get("error")
+            out.append("<p>NWS alert layer off — no veto%s.</p>"
+                       % (" (%s)" % html.escape(_txt(err, 160)) if err
+                          else " (TTU_SAFETY_HAZARDS=0)"))
+        else:
+            out.append('<p style="color:#666;font-size:.85em">Only these NWS warnings, while '
+                       "in effect over the site, make the monitor UNSAFE: %s. Every other "
+                       "alert below is information only.</p>"
+                       % html.escape(names or "none configured (all alerts display-only)"))
+            available = bool(hz.get("available"))
+            area = hz.get("area_fresh")
+            area = area if isinstance(area, bool) else available
+            if hz.get("error") and not available:
+                out.append("<p>%s</p>" % html.escape(_txt(hz["error"], 200)))
+            out.append("<h3>NWS alerts at the site</h3>"
+                       + _alert_items(hz.get("at_site"), known=available))
+            out.append("<h3>NWS alerts nearby (on the map)</h3>"
+                       + _alert_items(hz.get("nearby"), known=area))
+            sources.append(_txt(hz.get("source"), 120) or "NWS api.weather.gov active alerts")
+    if info:
+        out.append("<h3>Other hazard information "
+                   "<small>(information only — never affects IsSafe)</small></h3>")
+        if not info.get("enabled"):
+            err = info.get("error")
+            out.append("<p>disabled%s</p>" % (" — " + html.escape(_txt(err, 120)) if err else ""))
+        else:
+            if info.get("error"):
+                out.append("<p>%s</p>" % html.escape(_txt(info["error"], 160)))
+            out.append("<ul>%s</ul>" % "".join(
+                "<li>%s</li>" % html.escape(ln) for ln in _info_lines(info)))
+            if info.get("source"):
+                sources.append(_txt(info["source"], 300))
+    if sources:
+        out.append('<p style="color:#666;font-size:.85em">Sources: %s</p>'
+                   % html.escape(" · ".join(sources)))
+    return "\n".join(out)

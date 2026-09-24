@@ -5,6 +5,8 @@ import html
 import os
 import glob
 import json
+import math
+import re
 import shutil
 import shlex
 import warnings
@@ -1814,6 +1816,41 @@ PAGE_CSS = """  body { margin: 0; }
   details .cmdrow { font-size: 13px; color: var(--muted); margin: 6px 0; }
   details .cmdrow code { background: var(--codebg); border: 1px solid var(--line); padding: 2px 6px; border-radius: 4px; }
   .foot { font-size: 12px; color: var(--faint); margin-top: 22px; }
+
+  /* hazards section: NWS alerts (the only hazard input that can veto) + info-only feeds.
+     Red is kept for borders/badges with white text: red TEXT on the night card is unreadable. */
+  .hz { margin: 0 0 24px; }
+  .hz h3 { font-size: 14px; margin: 14px 0 6px; }
+  .hz-veto { display: flex; gap: 8px; align-items: flex-start; border: 2px solid #b42318;
+             border-radius: 10px; padding: 10px 14px; margin: 0 0 10px; background: var(--card); }
+  .hz-veto .dot { margin-top: 5px; }
+  .hz-veto.hz-pend { border-color: var(--warn); }
+  .hz-veto-t { font-size: 15px; }
+  .hz-veto-s { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+  .hz-note { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  .hz-line { font-size: 14px; margin: 4px 0 10px; }
+  .hz-list { list-style: none; padding: 0; margin: 0 0 12px; }
+  .hz-a { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .hz-sw { flex: none; width: 14px; height: 14px; border-radius: 3px; margin-top: 3px;
+           border: 1px solid var(--line); }
+  .hz-body { min-width: 0; flex: 1 1 auto; }
+  .hz-ev { font-size: 14.5px; }
+  .hz-hl { font-size: 13px; margin-top: 2px; }
+  .hz-m { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .hz-chip { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+             background: var(--neutbg); color: var(--neut); margin-left: 6px; white-space: nowrap;
+             vertical-align: 1px; }
+  .hz-chip.threat { background: var(--ink); color: var(--bg); font-weight: 700; letter-spacing: .04em; }
+  .hz-chip.veto { background: #b42318; color: #fff; font-weight: 700; letter-spacing: .04em; }
+  .hz-chip.vtype { background: var(--warnbg); color: var(--warn); }
+  .hz-txt { white-space: pre-wrap; font-size: 12.5px; color: var(--muted); margin: 6px 0; }
+  .hz-info { list-style: none; padding: 0; margin: 0 0 10px; font-size: 13.5px; }
+  .hz-info > li { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .hz-info ul { margin: 3px 0 0; padding-left: 18px; }
+  .hz-fs { font-size: 11.5px; color: var(--faint); margin-left: 6px; }
+  .hz-src { font-size: 11px; color: var(--faint); margin: 6px 0 0; }
+  .hz details, .hz details:last-of-type { border: 0; }
+  .hz details summary { padding: 4px 0 0; font-size: 12.5px; }
 """
 
 PAGE_JS = """  var btn = document.getElementById('modebtn');
@@ -2696,21 +2733,92 @@ def build_safety_tiles_html(comp, state_stale=False):
     items = [("Sun altitude", sun_v, sun_s), ("Humidity", hum_v, hum_s),
              ("Rain (WU)", rain_v, rain_s), ("NWS (now/next)", nws_v, nws_s),
              ("Lightning (GLM)", glm_v, glm_s)]
+    hz_tile = _hazards_tile(comp.get("hazards"))
+    if hz_tile is not None:           # absent = a daemon older than this page: no tile
+        items.append(hz_tile)
+    hz_vetoing = hz_tile is not None and hz_tile[1] == _HZ_TILE_VETO
     if state_stale:
         # The whole safety state is frozen (daemon down): none of the per-tile verdicts
         # are current — grey-out every claim (mirrors the radar section's guard; the
         # STALE banner alone must not leave green "no rain" behind). Numeric last values
         # stay, labelled; but a verdict WORD like "no rain" is itself a claim and gets
-        # blanked — there is no current data to back it.
+        # blanked — there is no current data to back it. (A last-known VETO stays: it
+        # errs toward caution, and the stale sub-line says it may be over.)
         stale_sub = safety_dot_html(False, unknown=True) + "state stale &mdash; last known"
         blank = '<div class="v mono">&mdash;</div>'
-        items = [(k, (blank if k == "Rain (WU)" else v), stale_sub) for k, v, _ in items]
+        blanked = {"Rain (WU)"} | (set() if hz_vetoing else {"NWS warnings"})
+        items = [(k, (blank if k in blanked else v), stale_sub) for k, v, _ in items]
     tiles = "".join(tile % it for it in items)
     # auto-fit: 5-across on the ~1020px desktop wrap, and wraps to 3/2/1 columns on
-    # narrower/phone screens instead of shrinking into an unreadable single row.
-    return ('  <div class="tiles" '
-            'style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">\n'
+    # narrower/phone screens instead of shrinking into an unreadable single row. Six
+    # tiles (with the NWS-warnings tile) would leave one orphan under a row of five, so
+    # they are capped at three columns (3 + 3); the 1px of slack in the calc keeps
+    # sub-pixel rounding from dropping the grid to two columns.
+    if len(items) == 6:
+        cols = "repeat(auto-fit,minmax(max(170px,calc((100% - 25px) / 3)),1fr))"
+    else:
+        cols = "repeat(auto-fit,minmax(170px,1fr))"
+    return ('  <div class="tiles" style="grid-template-columns:%s">\n' % cols
             + tiles + '  </div>\n')
+
+
+# The NWS-warnings tile value while a veto is held (also used to spot the veto state).
+_HZ_TILE_VETO = '<div class="v mono">VETO</div>'
+
+
+def _hazards_tile(hz):
+    """(label, value html, sub html) for the NWS-warnings safety tile, or None when the
+    state has no hazards component (older daemon). Three honest states, like the other
+    tiles: red = a configured warning is vetoing, green = fresh NWS data shows no veto
+    warning at the site, grey = no current data (which does not veto on its own)."""
+    if not isinstance(hz, dict):
+        return None
+    label = "NWS warnings"
+    veto = _hz_dicts(hz.get("veto"))
+    if not hz.get("enabled", True) and not veto:
+        # off by config, or the layer failed to load (then the daemon says why)
+        err = hz.get("error")
+        return (label, '<div class="v mono">off</div>',
+                safety_dot_html(True, unknown=True)
+                + (("unavailable (%s)" % _hz_e(err, 60)) if err
+                   else "disabled (TTU_SAFETY_HAZARDS=0)"))
+    if veto:
+        first = veto[0]
+        until = _hz_until(first)
+        sub = _hz_e(first.get("event") or "NWS warning", 60)
+        if until:
+            sub += " until %s" % html.escape(until)
+        if len(veto) > 1:
+            sub += " (+%d more)" % (len(veto) - 1)
+        return (label, _HZ_TILE_VETO, safety_dot_html(False) + sub)
+    if not hz.get("safe", True):
+        # unsafe without a listed veto should not happen; never render it as clear
+        return (label, '<div class="v mono">unsafe</div>',
+                safety_dot_html(False) + "NWS warning veto")
+    # a veto warning issued for a later period: not a veto yet, but worth a line here
+    pending = _hz_dicts(hz.get("veto_pending"))
+    pend = ""
+    if pending:
+        p = pending[0]
+        onset = p.get("onset_local") if isinstance(p.get("onset_local"), str) else None
+        pend = " &middot; scheduled: %s%s" % (_hz_e(p.get("event") or "NWS warning", 60),
+                                              (" from %s" % _hz_e(onset, 30)) if onset else "")
+    if not hz.get("available"):
+        err = hz.get("error")
+        why = (" (%s)" % _hz_e(err, 60)) if err else ""
+        return (label, '<div class="v mono" style="font-size:15px">N/A</div>',
+                safety_dot_html(True, unknown=True) + "alerts unavailable" + why + pend)
+    if pending:
+        return (label, '<div class="v mono">none</div>',
+                safety_dot_html(True) + "no veto now" + pend)
+    counts = hz.get("counts") if isinstance(hz.get("counts"), dict) else {}
+    n_site = counts.get("at_site")
+    if not _hz_num(n_site):
+        n_site = len(_hz_dicts(hz.get("at_site")))
+    sub = safety_dot_html(True) + "no veto warning at the site"
+    if n_site:
+        sub += " &middot; %d info alert%s" % (n_site, "" if n_site == 1 else "s")
+    return (label, '<div class="v mono">none</div>', sub)
 
 
 def _safety_endpoint_html(state):
@@ -2888,6 +2996,10 @@ def build_radar_html(state):
         "Mesonet. The cyan ring is the <b>%g&nbsp;km</b> rain trigger: any echo inside it "
         "marks the monitor UNSAFE. Colours run green (light) &rarr; red/magenta "
         "(downpour). Polled every 5&nbsp;min, day and night." % rk)
+    _comp = state.get("components") or {}
+    if isinstance(_comp.get("hazards"), dict) or isinstance(_comp.get("hazard_info"), dict):
+        source += (" Active NWS alert areas and other hazards are drawn over the radar when "
+                   "present &mdash; the <b>Hazards</b> section below is their key.")
 
     return (
         '  <h2>Radar (MRMS, %g km ring)</h2>\n'
@@ -2901,6 +3013,777 @@ def build_radar_html(state):
         '    </div>\n'
         '  </div>\n' % (rk, img, verdict, source, attribution, frame)
     )
+
+
+# ---- Hazards section: NWS alerts (the veto) + information-only hazard feeds -----------
+# Inputs: state["components"]["hazards"] (safety/nws_alerts.py — the ONLY hazard input
+# that can make the monitor unsafe, and only for the configured veto events over the
+# site) and state["components"]["hazard_info"] (safety/hazard_feeds.py — information
+# only, never part of IsSafe). Either may be missing (a daemon older than this page):
+# then its part is omitted rather than claiming "no hazards".
+# Fallback only: the daemon publishes its own verdict (area_fresh) and threshold
+# (stale_after_s, TTU_SAFETY_HAZARD_STALE_SEC), which win; this is for an older daemon.
+HAZARD_ALERTS_STALE_SEC = 600    # = the daemon's TTU_SAFETY_HAZARD_STALE_SEC default
+# Sanity bound only: hazard_feeds.py already marks a feed not-ok after two poll intervals
+# (ok=False, "stale: ..."); this catches an inconsistent "ok" with an ancient age, which
+# must never back a "nothing current" statement.
+HAZARD_INFO_STALE_SEC = 6 * 3600
+HAZARD_LIST_MAX = 25             # listed per group; every alert is still drawn on the map
+_HZ_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}")   # used with fullmatch ($ would pass "...\n")
+_HZ_GREY = "#808080"
+_HZ_VETO_SOURCE = {
+    "point": "confirmed by the NWS point query for the site",
+    "local": "its polygon / the site's zone covers the site",
+    "both": "confirmed by the NWS point query and its polygon / the site's zone",
+    "latched": ("held until the warning ends (not re-confirmed by the latest NWS data "
+                "— released early only when fresh data shows it is over)"),
+}
+
+
+def _hz_dicts(v):
+    """The dict entries of a component list; anything else (a missing key, a
+    malformed state file) is an empty list, never an exception."""
+    return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+
+
+def _hz_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _hz_str(v, limit=None):
+    """Display text for a feed value (None -> ''), cut to ``limit`` characters."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if limit and len(s) > limit:
+        s = s[:limit - 1].rstrip() + "…"
+    return s
+
+
+def _hz_e(v, limit=None):
+    """Escaped display text. EVERY feed-derived string goes through here (or through
+    _hz_color): alert text is written by thousands of offices and relayed civil
+    authorities, and must never be able to inject markup into the page."""
+    return html.escape(_hz_str(v, limit))
+
+
+def _hz_color(c):
+    """An alert colour is used inline in a style= attribute, so only a strict #RRGGBB
+    passes; anything else (None, 'red', an injection attempt) becomes neutral grey."""
+    return c if isinstance(c, str) and _HZ_HEX_RE.fullmatch(c) else _HZ_GREY
+
+
+# The map's fallback colour per product type (safety/radar.py KIND_RGB), used there for a
+# missing/invalid colour and for a green one — hazards are never drawn green.
+_HZ_KIND_COLOR = {"warning": "#D00000", "watch": "#E6B800", "advisory": "#7B68EE",
+                  "statement": "#FFE4B5", "other": "#808080"}
+_HZ_STATEMENT_SUFFIXES = ("statement", "outlook", "alert", "message", "forecast",
+                          "emergency")
+
+
+def _hz_alert_color(a):
+    """The swatch colour for an alert = the colour the radar map actually draws it in, so
+    this list stays the map's legend: the feed's #RRGGBB, unless it is missing, invalid
+    or green-dominant (radar._is_green: g >= 64 and g - max(r, b) >= 40), in which case
+    the map uses its product-type fallback, and so does the swatch."""
+    c = a.get("color")
+    # same accepted spellings as radar._hex_rgb ('#RRGGBB', 'RRGGBB', '#RGB'), re-emitted
+    # as a canonical, strictly validated #RRGGBB
+    h = c.strip().lstrip("#") if isinstance(c, str) else ""
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    if _HZ_HEX_RE.fullmatch("#" + h):
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        if not (g >= 64 and g - max(r, b) >= 40):
+            return "#" + h.upper()
+    kind = a.get("kind") if a.get("kind") in _HZ_KIND_COLOR else None
+    if kind is None:
+        name = _hz_str(a.get("event")).lower()
+        kind = next((k for k in ("warning", "watch", "advisory") if name.endswith(k)),
+                    "statement" if name.endswith(_HZ_STATEMENT_SUFFIXES) else "other")
+    return _HZ_KIND_COLOR[kind]
+
+
+def _hz_iso_ts(s):
+    """ISO-8601 with an offset (as api.weather.gov sends it) -> epoch s, else None."""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
+    if t[-1:] in ("Z", "z"):
+        t = t[:-1] + "+00:00"            # fromisoformat() on Python 3.9 rejects 'Z'
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None                      # a naive time is ambiguous: unknown
+    return dt.timestamp()
+
+
+def _hz_local(ts):
+    """'Fri 10:00 CDT' in the daemon's display zone (TTU_SAFETY_LOCAL_TZ, which the daemon
+    passes down to this script), so times formatted here match the ones the daemon
+    pre-formats (end_local, onset_local) even if the Pi's system zone differs. Invalid or
+    missing zone data -> the system's local time."""
+    try:
+        ts = float(ts)
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(os.environ.get("TTU_SAFETY_LOCAL_TZ", "America/Chicago"))
+            return datetime.fromtimestamp(ts, tz).strftime("%a %H:%M %Z")
+        except Exception:
+            return time.strftime("%a %H:%M %Z", time.localtime(ts))
+    except Exception:
+        return None
+
+
+def _hz_until(d):
+    """Local end time of an alert / veto entry: the daemon's end_local, else ends, else
+    expires (ISO), else end_ts (epoch). None when none is usable."""
+    s = d.get("end_local")
+    if isinstance(s, str) and s.strip():
+        return s.strip()[:40]
+    for k in ("ends", "expires"):
+        ts = _hz_iso_ts(d.get(k))
+        if ts is not None:
+            return _hz_local(ts)
+    if _hz_num(d.get("end_ts")):
+        return _hz_local(d["end_ts"])
+    return None
+
+
+def _hz_age(s):
+    if not _hz_num(s):
+        return None
+    s = max(0.0, float(s))
+    if s < 90:
+        return "%d s ago" % s
+    if s < 5400:
+        return "%d min ago" % round(s / 60.0)
+    return "%.1f h ago" % (s / 3600.0)
+
+
+def _hz_join(parts, sep=" &middot; "):
+    return sep.join(p for p in parts if p)
+
+
+def _hz_veto_html(veto, stale):
+    """The red banner(s): one per configured warning currently vetoing the monitor."""
+    out = []
+    for v in veto:
+        until = _hz_until(v)
+        head = "UNSAFE: %s over the site%s" % (
+            _hz_e(v.get("event") or "NWS warning", 80),
+            (" until %s" % html.escape(until)) if until else "")
+        if stale:
+            head = "Last known (safety state stale): " + head
+        sub = [_hz_e(v.get("sender"), 80)]
+        if _hz_num(v.get("first_seen_ts")):
+            sub.append("first seen %s" % html.escape(_hz_local(v["first_seen_ts"]) or "?"))
+        sub.append(_HZ_VETO_SOURCE.get(v.get("source"), ""))
+        hl = _hz_e(v.get("headline"), 300)
+        out.append(
+            '    <div class="hz-veto">%s<div>\n'
+            '      <div class="hz-veto-t"><b>%s</b></div>\n'
+            '%s'
+            '      <div class="hz-veto-s">%s</div>\n'
+            '    </div></div>\n'
+            % (safety_dot_html(False), head,
+               ('      <div class="hz-veto-s">%s</div>\n' % hl) if hl else "",
+               _hz_join(sub)))
+    return "".join(out)
+
+
+def _hz_pending_html(pending, stale):
+    """Amber notice(s): a configured warning issued for a LATER period over the site (a
+    High Wind Warning "from 10 AM Friday"). nws_alerts vetoes it from shortly before its
+    onset, not from issuance — so it is announced here, but it is not (yet) a veto."""
+    out = []
+    for p in pending:
+        onset = p.get("onset_local") if isinstance(p.get("onset_local"), str) else None
+        if not onset and _hz_num(p.get("onset_ts")):
+            onset = _hz_local(p["onset_ts"])
+        until = _hz_until(p)
+        head = "Scheduled: %s for the site%s%s" % (
+            _hz_e(p.get("event") or "NWS warning", 80),
+            (" from %s" % _hz_e(onset, 40)) if onset else "",
+            (" until %s" % html.escape(until)) if until else "")
+        if stale:
+            head = "Last known (safety state stale): " + head
+        sub = [_hz_e(p.get("sender"), 80),
+               "not a veto yet &mdash; the safety monitor goes UNSAFE shortly before it "
+               "takes effect"]
+        out.append(
+            '    <div class="hz-veto hz-pend">'
+            '<span class="dot warnc" style="display:inline-block;margin-right:6px;'
+            'vertical-align:middle"></span><div>\n'
+            '      <div class="hz-veto-t"><b>%s</b></div>\n'
+            '      <div class="hz-veto-s">%s</div>\n'
+            '    </div></div>\n' % (head, _hz_join(sub)))
+    return "".join(out)
+
+
+def _hz_alert_li(a, at_site, veto_keys, pending_keys, veto_names):
+    """One NWS alert: colour swatch (the same colour the map uses), event, threat and
+    VETO chips, headline(s), sender / time / area, and the full text folded away."""
+    chips = []
+    if a.get("threat"):
+        chips.append('<span class="hz-chip threat">%s</span>' % _hz_e(a["threat"], 40))
+    ev = _hz_str(a.get("event"))
+    # VETO only for what is in the component's veto list — the very list IsSafe uses
+    # (nws_alerts also flags those rows vetoes=True); a veto-TYPE event that is not
+    # vetoing (not over the site, or not yet in effect) is labelled as such
+    veto_type = (a.get("veto_event") is True or a.get("vetoes") is True
+                 or (a.get("veto_event") is None and ev.lower() in veto_names))
+    key = a.get("key") if isinstance(a.get("key"), str) else None
+    if key is not None and key in veto_keys:
+        chips.append('<span class="hz-chip veto">VETO</span>')
+    elif veto_type:
+        if key is not None and key in pending_keys:
+            why = "not in effect yet"
+        elif at_site:
+            why = "not vetoing"
+        else:
+            # so a red Tornado Warning 20 km away is not mistaken for the reason the
+            # monitor is (or is not) closed
+            why = "not over the site"
+        chips.append('<span class="hz-chip vtype">veto type &middot; %s</span>' % why)
+    for k in ("severity", "urgency"):
+        val = _hz_str(a.get(k), 20)
+        if val and val.lower() != "unknown":
+            chips.append('<span class="hz-chip">%s</span>' % html.escape(val))
+
+    headline = _hz_str(a.get("headline"), 300)
+    nws_hl = _hz_str(a.get("nws_headline"), 300)
+    lines = ""
+    if headline:
+        lines += '      <div class="hz-hl">%s</div>\n' % html.escape(headline)
+    if nws_hl and nws_hl.lower() != headline.lower():
+        lines += '      <div class="hz-hl">%s</div>\n' % html.escape(nws_hl)
+
+    meta = [_hz_e(a.get("sender"), 80)]
+    onset = _hz_iso_ts(a.get("onset"))
+    if onset is not None and onset > time.time():
+        meta.append("from %s" % html.escape(_hz_local(onset) or "?"))
+    until = _hz_until(a)
+    if until:
+        meta.append("until %s" % html.escape(until))
+    meta.append(_hz_e(a.get("area_desc"), 300))
+
+    body = ""
+    if a.get("description"):
+        body += '<div class="hz-txt">%s</div>' % _hz_e(a["description"], 2000)
+    if a.get("instruction"):
+        body += ('<div class="hz-txt"><b>Instruction:</b> %s</div>'
+                 % _hz_e(a["instruction"], 1000))
+    details = ('      <details><summary>Full text</summary>%s</details>\n' % body
+               if body else "")
+    return ('    <li class="hz-a"><span class="hz-sw" style="background:%s"></span>'
+            '<div class="hz-body">\n'
+            '      <div class="hz-ev"><b>%s</b>%s</div>\n'
+            '%s'
+            '      <div class="hz-m">%s</div>\n'
+            '%s'
+            '    </div></li>\n'
+            % (_hz_alert_color(a), _hz_e(ev or "NWS alert", 80),
+               "".join(" " + c for c in chips), lines, _hz_join(meta), details))
+
+
+def _hz_alert_list(alerts, total, at_site, veto_keys, pending_keys, veto_names):
+    shown = alerts[:HAZARD_LIST_MAX]
+    items = "".join(_hz_alert_li(a, at_site, veto_keys, pending_keys, veto_names)
+                    for a in shown)
+    more = ""
+    if total > len(shown):
+        more = ('    <p class="hz-note">+%d more not listed (all are drawn on the map).</p>\n'
+                % (total - len(shown)))
+    return '    <ul class="hz-list">\n' + items + '    </ul>\n' + more
+
+
+def _hz_policy_html(hz):
+    """Say plainly which alerts can close the observatory — and that nothing else can."""
+    events = [e for e in (hz.get("veto_events") or []) if isinstance(e, str) and e.strip()]
+    if not events:
+        return ('    <p class="hz-note">No veto events are configured: every NWS alert '
+                'here is information only and never changes the safety monitor.</p>\n')
+    names = ["<b>%s</b>" % _hz_e(e, 60) for e in events]
+    listed = (names[0] if len(names) == 1 else
+              ", ".join(names[:-1]) + " or " + names[-1])
+    return ('    <p class="hz-note">Only a %s in effect <b>over the site</b> makes the safety '
+            'monitor UNSAFE, for as long as the warning lasts. Every other alert, and '
+            'everything under &ldquo;Other hazard information&rdquo;, is information only '
+            'and never changes IsSafe.</p>\n' % listed)
+
+
+def _hz_stale_line(age):
+    when = ("the safety state has no timestamp" if age is None else
+            "last safety-daemon update %d min ago" % int(age / 60))
+    return ('    <p class="hz-line">%sHazard information stale &mdash; %s; current NWS '
+            'alerts and hazards are unknown.</p>\n'
+            % (safety_dot_html(False, unknown=True), when))
+
+
+def _hz_area_fresh(hz):
+    """Is the map-area query current? The daemon's own verdict when it publishes one (it
+    applies TTU_SAFETY_HAZARD_STALE_SEC, which this page cannot know), else the area
+    query's age against the daemon's published threshold, else against the default."""
+    if isinstance(hz.get("area_fresh"), bool):
+        return hz["area_fresh"]
+    limit = hz.get("stale_after_s")
+    limit = limit if _hz_num(limit) and limit > 0 else HAZARD_ALERTS_STALE_SEC
+    age = hz.get("area_age_s")
+    return bool(_hz_num(age) and -5 <= age <= limit)
+
+
+def _hz_nws_html(hz, stale, age=None):
+    veto = _hz_dicts(hz.get("veto"))
+    if not hz.get("enabled", True) and not veto:
+        err = _hz_str(hz.get("error"), 160)
+        return ('    <p class="hz-line">%sNWS alert layer off%s: no alerts are shown and NWS '
+                'warnings cannot veto.</p>\n'
+                % (safety_dot_html(True, unknown=True),
+                   (" (%s)" % html.escape(err)) if err else " (TTU_SAFETY_HAZARDS=0)"))
+    at = _hz_dicts(hz.get("at_site"))
+    near = _hz_dicts(hz.get("nearby"))
+    counts = hz.get("counts") if isinstance(hz.get("counts"), dict) else {}
+    n_at = counts.get("at_site") if _hz_num(counts.get("at_site")) else len(at)
+    n_near = counts.get("nearby") if _hz_num(counts.get("nearby")) else len(near)
+    n_at, n_near = max(int(n_at), len(at)), max(int(n_near), len(near))
+    pending = _hz_dicts(hz.get("veto_pending"))
+    veto_keys = {v["key"] for v in veto if isinstance(v.get("key"), str)}
+    pending_keys = {p["key"] for p in pending if isinstance(p.get("key"), str)} - veto_keys
+    veto_names = {_hz_str(e).lower() for e in (hz.get("veto_events") or [])
+                  if isinstance(e, str)}
+    parts = [_hz_veto_html(veto, stale), _hz_pending_html(pending, stale)]
+
+    if stale:
+        # Fail-safe display (the radar/forecast sections' rule): the lists are only as
+        # fresh as the daemon writing them. A last-known VETO stays visible above (it
+        # errs toward caution); reassuring "no alerts" text must not.
+        parts.append(_hz_stale_line(age))
+        return "".join(parts) + _hz_policy_html(hz)
+
+    available = bool(hz.get("available"))
+    area_fresh = _hz_area_fresh(hz)
+    err = _hz_str(hz.get("error"), 120)
+
+    if not at and not near and available and area_fresh:
+        parts.append('    <p class="hz-line">%sNo NWS alerts in effect at the site or '
+                     'elsewhere on the map.</p>\n' % safety_dot_html(True))
+    else:
+        # a count is shown only when data backs it: "(0)" from a failed query is a claim
+        parts.append('    <h3>NWS alerts at the site%s</h3>\n'
+                     % ((" (%d)" % n_at) if (at or available) else ""))
+        if at:
+            if not available:
+                parts.append('    <p class="hz-note">Last known &mdash; the NWS alert '
+                             'queries are currently failing.</p>\n')
+            parts.append(_hz_alert_list(at, n_at, True, veto_keys, pending_keys, veto_names))
+        elif available:
+            parts.append('    <p class="hz-line">%sNo NWS alert in effect at the site.</p>\n'
+                         % safety_dot_html(True))
+        else:
+            parts.append('    <p class="hz-line">%sNWS alerts unavailable%s &mdash; whether '
+                         'an alert is in effect at the site is unknown. This does not veto '
+                         'on its own (the connectivity watchdog covers a total outage).</p>\n'
+                         % (safety_dot_html(True, unknown=True),
+                            (" (%s)" % html.escape(err)) if err else ""))
+        parts.append('    <h3>NWS alerts nearby (on the map)%s</h3>\n'
+                     % ((" (%d)" % n_near) if (near or area_fresh) else ""))
+        if near:
+            if not area_fresh:
+                parts.append('    <p class="hz-note">Last known &mdash; the map-area query '
+                             'is not current.</p>\n')
+            parts.append(_hz_alert_list(near, n_near, False, veto_keys, pending_keys,
+                                        veto_names))
+        elif area_fresh:
+            parts.append('    <p class="hz-line">None elsewhere on the map.</p>\n')
+        else:
+            parts.append('    <p class="hz-line">%sMap-area query unavailable &mdash; '
+                         'alerts near the site are unknown.</p>\n'
+                         % safety_dot_html(True, unknown=True))
+
+    parts.append(_hz_policy_html(hz))
+    status = ["Source: NWS api.weather.gov active alerts"]
+    for k, name in (("point_age_s", "site query"), ("area_age_s", "map-area query")):
+        age = _hz_age(hz.get(k))
+        status.append("%s %s" % (name, age) if age else "%s: no successful poll" % name)
+    if err:
+        status.append("last error: %s" % html.escape(err))
+    parts.append('    <p class="hz-src">%s</p>\n' % _hz_join(status))
+    return "".join(parts)
+
+
+# ---- information-only feeds (hazard_info) -------------------------------------------
+def _hz_first(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _hz_dist(d):
+    dist = _hz_first(d, "distance_km", "dist_km")
+    if not _hz_num(dist):
+        return ""
+    brg = _hz_str(_hz_first(d, "bearing", "direction"), 4)
+    return "%.0f km%s from the site" % (dist, (" " + brg) if brg else "")
+
+
+def _hz_quake_text(q):
+    mag = _hz_first(q, "mag", "magnitude")
+    head = ("M%.1f" % mag) if _hz_num(mag) else "M?"
+    place = _hz_str(q.get("place"), 120)
+    return _hz_join([html.escape(head + (" " + place if place else "")),
+                     html.escape(_hz_dist(q)),
+                     _hz_e(_hz_first(q, "time_local", "local", "time"), 40)])
+
+
+def _hz_fire_text(f):
+    acres = _hz_first(f, "acres", "size_acres", "size_ac")
+    cont = _hz_first(f, "contained_pct", "percent_contained", "containment_pct")
+    return _hz_join([
+        _hz_e(_hz_first(f, "name", "incident") or "Wildfire", 80),
+        ("%s ac" % ("{:,.0f}".format(acres))) if _hz_num(acres) else "",
+        ("%.0f%% contained" % cont) if _hz_num(cont) else "",
+        html.escape(_hz_dist(f)),
+        _hz_e(_hz_first(f, "county"), 40),
+        ("updated %s" % _hz_e(f["updated_local"], 40)) if f.get("updated_local") else ""])
+
+
+def _hz_lsr_text(r):
+    mag = _hz_first(r, "magnitude", "mag")
+    unit = _hz_str(r.get("unit"), 12)
+    what = _hz_str(_hz_first(r, "type", "typetext", "event") or "Report", 40)
+    if _hz_num(mag) and mag:
+        what += " %g%s" % (mag, (" " + unit) if unit else "")
+    elif isinstance(mag, str) and mag.strip():
+        what += " " + _hz_str(mag, 20)
+    return _hz_join([
+        _hz_e(_hz_first(r, "time_local", "local", "valid"), 40),
+        html.escape(what),
+        _hz_e(_hz_first(r, "place", "city", "location"), 80),
+        html.escape(_hz_dist(r)),
+        _hz_e(r.get("remark"), 200)])
+
+
+def _hz_md_text(m):
+    num = _hz_first(m, "num", "number")
+    prob = _hz_first(m, "watch_prob", "watch_confidence", "watch_probability")
+    return _hz_join([
+        _hz_e(("MD #%s" % num) if num is not None else "Mesoscale discussion", 30),
+        _hz_e(_hz_first(m, "concerning", "title"), 160),
+        ("until %s" % _hz_e(_hz_first(m, "expire_local", "until", "expires_local"), 40))
+        if _hz_first(m, "expire_local", "until", "expires_local") else "",
+        ("watch probability %s%%" % _hz_e(prob, 6)) if _hz_num(prob) else
+        (_hz_e(prob, 40) if prob else "")])
+
+
+def _hz_smoke_text(s):
+    at = _hz_first(s, "at_site", "over_site", "site_in_smoke")
+    dens = _hz_str(s.get("density"), 20)
+    window = _hz_str(_hz_first(s, "window", "time_window"), 60)
+    if at:
+        return html.escape("%s smoke over the site%s" % (
+            dens or "Analysed", (" (%s)" % window) if window else ""))
+    n = _hz_first(s, "count", "on_map_count", "polygons")
+    return html.escape("no smoke analysed over the site%s" % (
+        ("; %d smoke area%s on the map" % (n, "" if n == 1 else "s"))
+        if _hz_num(n) and n else ""))
+
+
+def _hz_spc_text(spc):
+    cat = _hz_str(spc.get("category"), 12)
+    label = _hz_str(spc.get("label"), 120)
+    if not cat:
+        return html.escape(label or "the site is outside every Day-1 risk area")
+    if label and cat.lower() not in label.lower():
+        return html.escape("%s (%s) at the site" % (label, cat))
+    return html.escape("%s at the site" % (label or cat))
+
+
+def _hz_sw_text(sw):
+    kp = _hz_first(sw, "kp", "kp_now")
+    kpmax = _hz_first(sw, "kp_max_24h", "kp_max")
+    scales = sw.get("scales") if isinstance(sw.get("scales"), dict) else {}
+    parts = []
+    if _hz_num(kp):
+        peak = (" (max %.1f in 24 h)" % kpmax) if _hz_num(kpmax) else ""
+        parts.append("Kp %.1f now%s" % (kp, peak))
+    sc = []
+    for k in ("G", "R", "S"):
+        v = _hz_first(scales, k, k.lower())
+        if v is None:
+            v = _hz_first(sw, k, k.lower())
+        if v is not None:
+            v = _hz_str(v, 4)
+            sc.append(v if v[:1].upper() == k else k + v)
+    if sc:
+        parts.append("NOAA scales " + " ".join(sc))
+    return html.escape(", ".join(parts))
+
+
+def _hz_unprefix(s, prefixes):
+    """'SPC Day 1: Marginal Risk ...' -> 'Marginal Risk ...' under a row already labelled
+    'SPC Day 1 outlook' (case-insensitive; the first matching prefix is removed)."""
+    for p in prefixes:
+        if s[:len(p)].lower() == p.lower():
+            return s[len(p):].lstrip()
+    return s
+
+
+def _hz_item(item, compose, prefixes=()):
+    """(escaped text, escaped "on map" chip text or '') for one information item: a
+    pre-formatted string, or a dict whose 'text' the daemon formatted (else composed from
+    its fields). on_map may be a flag, a count (smoke areas) or a list of what is drawn
+    (SPC categories — named on the chip, since they need not be the site's category)."""
+    if isinstance(item, str):
+        return _hz_e(_hz_unprefix(item, prefixes), 400), ""
+    if not isinstance(item, dict):
+        return "", ""
+    txt = _hz_first(item, "text", "summary", "line")
+    txt = (_hz_e(_hz_unprefix(txt, prefixes), 400) if isinstance(txt, str)
+           else compose(item))
+    if not txt and isinstance(item.get("label"), str):
+        txt = _hz_e(item["label"], 400)     # a bare short label, as the last resort
+    on_map = _hz_first(item, "on_map", "in_box", "in_map")
+    if isinstance(on_map, list):
+        names = [_hz_str(x, 12) for x in on_map[:6] if isinstance(x, str) and x.strip()]
+        chip = ("on map: " + ", ".join(names)) if names else ("on map" if on_map else "")
+    else:
+        chip = "on map" if on_map else ""
+    return txt, html.escape(chip)
+
+
+def _hz_feed_status(feeds, names):
+    """("ok"|"stale"|"error"|"unknown", escaped status text) for the first feed of
+    ``names`` present in the component's per-feed status block."""
+    st = None
+    for n in names:
+        if isinstance(feeds.get(n), dict):
+            st = feeds[n]
+            break
+    if st is None:
+        return "unknown", "status unknown"
+    age = st.get("age_s")
+    if not st.get("ok"):
+        e = _hz_str(st.get("error"), 80)
+        return "error", "unavailable" + ((": " + html.escape(e)) if e else "")
+    if not _hz_num(age) or age > HAZARD_INFO_STALE_SEC:
+        a = _hz_age(age)
+        return "stale", "no recent update" + ((" (%s)" % a) if a else "")
+    return "ok", "updated " + (_hz_age(age) or "?")
+
+
+# (row label, where the items are, feed-status names, source credit, item formatter,
+# what an empty row means, text prefixes the row label already says). "where" is a key
+# of hazard_info, or "spc.mds". The first feed name is hazard_feeds.py's (FEEDS); the
+# others are tolerated spellings, and a feed the page cannot find degrades to "no current
+# data" (never to a false "nothing current").
+_HZ_INFO_ROWS = (
+    ("Smoke", "smoke", ("smoke", "hms", "hms_smoke"), "NOAA HMS", _hz_smoke_text,
+     "smoke analysed on the map", ()),
+    ("SPC Day 1 outlook", "spc", ("spc_outlook", "spc", "spc_day1", "outlook"),
+     "NOAA SPC", _hz_spc_text, "SPC Day 1 risk area at the site",
+     ("SPC Day 1 outlook:", "SPC Day 1:", "SPC Day-1 outlook:")),
+    ("SPC mesoscale discussions", "spc.mds", ("spc_md", "spc_mds", "mds", "md"),
+     "NOAA SPC via IEM", _hz_md_text, "SPC mesoscale discussions on the map", ()),
+    ("Storm reports", "lsr", ("lsr", "lsrs", "storm_reports"), "NWS LSR via IEM",
+     _hz_lsr_text, "storm reports on the map", ()),
+    ("Wildfires", "fires", ("fires", "wfigs", "fire_incidents", "wfigs_incidents"),
+     "NIFC WFIGS", _hz_fire_text, "wildfire incidents", ()),
+    ("Earthquakes", "quakes", ("quakes", "earthquakes", "usgs"), "USGS", _hz_quake_text,
+     "earthquakes", ()),
+    ("Space weather", "space_weather", ("space_weather", "swpc", "spaceweather"),
+     "NOAA SWPC", _hz_sw_text, "space-weather status", ()),
+)
+
+
+def _hz_total(info, feeds, where, names, n_listed):
+    """How many items a list row really has: the daemon's uncapped total (hazard_info
+    totals, else the feed's count), never less than what is listed. The daemon caps each
+    list at 20 for the state file, so len(list) alone would pass the cap off as the count
+    (104 storm reports drawn on the map, "Storm reports (20)" in the text)."""
+    totals = info.get("totals") if isinstance(info.get("totals"), dict) else {}
+    t = totals.get(where)
+    if not _hz_num(t):
+        st = feeds.get(names[0]) if isinstance(feeds.get(names[0]), dict) else {}
+        t = st.get("count")
+    return int(t) if _hz_num(t) and t >= n_listed else n_listed
+
+
+def _hz_info_html(info):
+    if not info.get("enabled", True):
+        err = _hz_str(info.get("error"), 160)
+        return ('    <p class="hz-line">Other hazard feeds off%s.</p>\n'
+                % ((" (%s)" % html.escape(err)) if err
+                   else " (TTU_SAFETY_HAZARD_FEEDS=0)")), []
+    feeds = info.get("feeds") if isinstance(info.get("feeds"), dict) else {}
+    spc = info.get("spc") if isinstance(info.get("spc"), dict) else {}
+    rows, quiet, unavailable, on_map_layers = [], [], [], []
+    for label, where, names, credit, fmt, empty, prefixes in _HZ_INFO_ROWS:
+        if where == "spc.mds":
+            raw = spc.get("mds")
+        else:
+            raw = info.get(where)
+        state, status = _hz_feed_status(feeds, names)
+        note = ""
+        total = None
+        if isinstance(raw, dict):
+            # one-object feeds: shown when they say something — smoke over the site (now
+            # or earlier today) or on the map; the SPC line (the daemon writes it only
+            # from a fresh outlook: a risk at the site, or none, or "no current outlook");
+            # the space-weather line
+            on_map = _hz_first(raw, "on_map", "in_box", "in_map")
+            notable = bool(
+                where == "space_weather"
+                or (where == "spc" and (_hz_str(raw.get("category")) or on_map
+                                        or isinstance(raw.get("text"), str)))
+                or (where == "smoke" and (_hz_first(raw, "at_site", "over_site",
+                                                    "site_in_smoke", "site_in_smoke_today")
+                                          or on_map or _hz_first(raw, "count"))))
+            items = [_hz_item(raw, fmt, prefixes)] if notable else []
+            if notable and isinstance(raw.get("note"), str):
+                note = ('<div class="hz-fs" style="margin:2px 0 0">%s</div>'
+                        % _hz_e(raw["note"], 300))
+        elif isinstance(raw, list):
+            items = [_hz_item(x, fmt, prefixes) for x in raw[:20]]
+            total = _hz_total(info, feeds, where, names, len(raw))
+        else:
+            items = []
+        items = [(t, m) for t, m in items if t]
+        fs = '<span class="hz-fs">%s &middot; %s</span>' % (credit, status) + note
+        if items:
+            if state != "ok":
+                fs = ('<span class="hz-fs">%s &middot; last known, %s</span>'
+                      % (credit, status)) + note
+            if any(m for _t, m in items):
+                on_map_layers.append(label)
+            chips = [(' <span class="hz-chip">%s</span>' % m) if m else "" for _t, m in items]
+            if len(items) == 1:
+                rows.append('      <li><b>%s:</b> %s%s %s</li>\n'
+                            % (label, items[0][0], chips[0], fs))
+            else:
+                sub = "".join('<li>%s%s</li>' % (t, c) for (t, _m), c in zip(items, chips))
+                n = max(total or 0, len(items))
+                more = ""
+                if n > len(items):
+                    more = ('<li class="hz-fs">+%d more not listed%s</li>'
+                            % (n - len(items), " (all are drawn on the map)"
+                               if where == "lsr" else ""))
+                rows.append('      <li><b>%s</b> (%d) %s<ul>%s%s</ul></li>\n'
+                            % (label, n, fs, sub, more))
+        elif state == "ok":
+            quiet.append("%s (%s)" % (empty, credit))
+        else:
+            # failed / stale / unknown feed: say so — never "nothing current"
+            unavailable.append("%s (%s, %s)" % (empty, credit, status))
+    if quiet:
+        rows.append('      <li class="hz-fs" style="margin:0">None current: %s.</li>\n'
+                    % ", ".join(quiet))
+    if unavailable:
+        rows.append('      <li class="hz-fs" style="margin:0">No current data: %s.</li>\n'
+                    % "; ".join(unavailable))
+    src = ('    <p class="hz-src">Sources: %s</p>\n' % _hz_e(info["source"], 300)
+           if isinstance(info.get("source"), str) and info["source"].strip() else "")
+    return ('    <ul class="hz-info">\n' + "".join(rows) + '    </ul>\n' + src,
+            on_map_layers)
+
+
+def _hz_feed_details(info):
+    """Every information feed's raw status, folded away (for diagnosing a quiet feed)."""
+    feeds = info.get("feeds") if isinstance(info.get("feeds"), dict) else {}
+    fl = []
+    for name, st in feeds.items():
+        if not isinstance(st, dict):
+            continue
+        desc = "ok" if st.get("ok") else "error"
+        if not st.get("ok") and st.get("error"):
+            desc += ": " + _hz_str(st.get("error"), 120)
+        a = _hz_age(st.get("age_s"))
+        if a:
+            desc += ", " + a
+        if _hz_num(st.get("count")):
+            desc += ", %d item%s" % (st["count"], "" if st["count"] == 1 else "s")
+        fl.append("%s &mdash; %s" % (_hz_e(name, 40), html.escape(desc)))
+    if not fl:
+        return ""
+    return ('    <details><summary>Feed status (%d feeds)</summary>'
+            '<div class="hz-txt">%s</div></details>\n' % (len(fl), "\n".join(fl)))
+
+
+def _hz_map_key(alerts_on_map, info_layers):
+    """What the overlays on the radar map mean — the page is the map's legend."""
+    # (wording follows what safety/radar.py draws for each overlay kind)
+    key = []
+    if alerts_on_map:
+        key.append("NWS alert areas are shaded and outlined in the colours listed above "
+                   "(warnings on top of watches and advisories; a vetoing warning is drawn "
+                   "last, with a thicker outline)")
+    names = {"Smoke": "smoke: a grey veil, more opaque where denser",
+             "SPC Day 1 outlook": ("SPC outlook: dashed outlines in the SPC risk colours "
+                                   "(Marginal in sand, never green; general thunder not "
+                                   "drawn)"),
+             "SPC mesoscale discussions": "mesoscale discussions: purple dashed outline",
+             "Wildfires": "wildfires: orange-red triangles, perimeters in orange-red",
+             "Earthquakes": "earthquakes: rings sized by magnitude",
+             "Storm reports": ("storm reports: &#9660; tornado, &#9679; hail, &#9632; wind, "
+                               "&#9670; flood/rain, &#215; dust, + winter, "
+                               "&#9675; other")}
+    key.extend(names[x] for x in info_layers if x in names)
+    if not key:
+        return ""
+    return ('    <p class="hz-note" style="margin-top:10px">On the radar map: %s.</p>\n'
+            % "; ".join(key))
+
+
+def build_hazards_html(state):
+    """The "Hazards" section: the NWS-warning veto banner, NWS alerts at the site and on
+    the map (text + colour key for the radar overlays), and the information-only feeds.
+    Omitted entirely when the daemon publishes neither hazard component (older daemon)."""
+    comp = state.get("components") if isinstance(state, dict) else None
+    if not isinstance(comp, dict):
+        return ""
+    hz = comp.get("hazards") if isinstance(comp.get("hazards"), dict) else None
+    info = comp.get("hazard_info") if isinstance(comp.get("hazard_info"), dict) else None
+    if hz is None and info is None:
+        return ""
+
+    def _off(c):
+        # switched off on purpose (no error, nothing held) — a layer that failed to load
+        # reports enabled=False WITH an error, and that must stay visible
+        return c is None or (not c.get("enabled", True) and not c.get("error")
+                             and not c.get("veto"))
+    if _off(hz) and _off(info):
+        return ""                            # both layers switched off -> like radar off
+
+    ts = state.get("ts")
+    age = (time.time() - ts) if _hz_num(ts) else None
+    stale = (age is None) or (age > SAFETY_STATE_STALE_SEC)
+
+    parts = ['  <section class="hz">\n',
+             '  <h2>Hazards (NWS alerts &amp; other hazard information)</h2>\n']
+    alerts_on_map = False
+    if hz is not None:
+        parts.append(_hz_nws_html(hz, stale, age))
+        alerts_on_map = bool(hz.get("enabled", True)
+                             and (_hz_dicts(hz.get("at_site")) or _hz_dicts(hz.get("nearby"))))
+    if stale and (hz is None or not hz.get("enabled", True)):
+        parts.append(_hz_stale_line(age))    # (an enabled NWS part says it itself)
+    layers, feed_details = [], ""
+    if info is not None and not stale:
+        parts.append('  <h3>Other hazard information <span class="hz-chip">information only'
+                     '</span></h3>\n')
+        body, layers = _hz_info_html(info)
+        parts.append(body)
+        if info.get("enabled", True):
+            feed_details = _hz_feed_details(info)
+    if not stale:
+        parts.append(_hz_map_key(alerts_on_map, layers))
+    parts.append(feed_details)
+    parts.append('  </section>\n')
+    return "".join(parts)
 
 
 def build_forecast_html(state):
@@ -3049,6 +3932,17 @@ def write_html(
         parts.append(build_radar_html(_safety_state))
     except Exception:
         pass
+    try:
+        parts.append(build_hazards_html(_safety_state))
+    except Exception:
+        # Not silently omitted like the purely informational sections: a missing Hazards
+        # section would read as "no warnings". The veto itself is still in the reasons
+        # list and the NWS-warnings tile of the safety card above.
+        _comp = (_safety_state.get("components")
+                 if isinstance(_safety_state, dict) else None)
+        if isinstance(_comp, dict) and _comp.get("hazards") is not None:
+            parts.append('  <h2>Hazards</h2>\n  <p class="lede">Hazards section unavailable '
+                         '(render error) &mdash; see the safety monitor card above.</p>\n')
     try:
         parts.append(build_forecast_html(_safety_state))
     except Exception:
