@@ -41,7 +41,10 @@ The measured GPS position propagates automatically: the status page writes its G
 into the shared inputs file, and the safety daemon — unless `TTU_SAFETY_LAT/LON` are set —
 **adopts it once at startup**, rounded to ~100 m so GPS jitter never re-derives anything.
 All derived values (NWS forecast grid, WU station set, radar/GLM rings, cached basemap
-tiles) follow the adopted coordinates. If the configured and measured positions ever
+tiles) follow the adopted coordinates: a radar map drawn before the adoption is rebuilt
+for the adopted site right after the next radar poll, from that site's cached map where
+there is one. A new site has no cached CARTO map, so it needs `TTU_SAFETY_CARTO_KEY` for
+one; otherwise the radar maps use OpenStreetMap. If the configured and measured positions ever
 disagree by more than ~100 m, a loud warning appears on the status page and `/setup` —
 but it never vetoes observing by itself. Components that don't cover the site (MRMS is
 CONUS-only, GLM is GOES-East) disable themselves loudly instead of reporting a false
@@ -78,7 +81,7 @@ safety/                  the daemon package (config, wu_poll, monitor, alpaca, .
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
   hazard_feeds.py        information-only hazard feeds (USGS, HMS, NIFC, SPC, LSR, SWPC)
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
-ttustatus.env.example    template for the secrets file (WU API key)
+ttustatus.env.example    template for the secrets file (WU key, User-Agent contact, CARTO key)
 ```
 
 ## Deploy (Raspberry Pi)
@@ -90,14 +93,49 @@ sudo apt update && sudo apt install -y python3-flask python3-waitress git
 # 2. clone
 cd ~ && git clone https://github.com/kirxkirx/ttustatus.git   # public repo: no credentials needed
 
-# 3. secrets (WU API key) — kept OUTSIDE the repo, never committed
+# 3. secrets + contact — kept OUTSIDE the repo, never committed
 cp ~/ttustatus/ttustatus.env.example ~/ttustatus.env
 nano ~/ttustatus.env          # set TTU_SAFETY_WU_KEY=<your key>
+                              # uncomment TTU_SAFETY_NWS_UA and put YOUR REAL e-mail in it
+                              # optional: TTU_SAFETY_CARTO_KEY=<key> (CARTO radar maps)
 chmod 600 ~/ttustatus.env
 
 # 4. install ONE systemd service — the daemon also runs the status page:
 sudo ~/ttustatus/deploy/install.sh
 ```
+
+The env file (step 3), in short — details in README_SAFETY.md:
+
+- **`TTU_SAFETY_NWS_UA` with a real e-mail address is crucial.** It is the User-Agent of
+  the daemon's NWS, radar, hazard-feed and map-tile requests:
+  `TTU_SAFETY_NWS_UA="ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)"`
+  with `you@example.org` **replaced by your own address** (keep the double quotes).
+  OpenStreetMap blocks a placeholder such as `you@example.org`, so the daemon then
+  requests no OpenStreetMap tiles at all and a radar map with no CARTO basemap is left
+  without one; NWS asks for a contact too. The daemon's log warns at startup while the
+  address is missing or a placeholder; the status page and `/setup` warn whenever
+  OpenStreetMap is (or would be) used without a real address.
+- **Radar basemap: CARTO first, OpenStreetMap as the backup.** CARTO maps already cached
+  on the Pi (`~/.cache/ttu-radar/basemap_*.png`) keep being used with no network and no
+  key. New CARTO tiles need a free CARTO API key (`TTU_SAFETY_CARTO_KEY`, requested by
+  e-mail at [carto.com/basemaps/apikey](https://carto.com/basemaps/apikey)); without one
+  CARTO serves only an "API KEY REQUIRED" watermark, so the daemon never asks it and uses
+  OpenStreetMap tiles instead. The status page says which basemap each map shows. A
+  cached map's file name depends on the site and on `TTU_SAFETY_RADAR_THUMB_PX`,
+  `TTU_SAFETY_RADAR_THUMB_HALF` and `TTU_SAFETY_RADAR_TILE_ZOOM`: change any of them and
+  the old CARTO maps are left unused (without a key the new ones come from
+  OpenStreetMap).
+- **A cached CARTO map that shows the watermark** (one built after CARTO began requiring
+  a key): delete **only that file**. The daemon logs which file each map uses:
+  ```bash
+  journalctl -u ttu-safety | grep 'basemap loaded from cache' | tail -2
+  # radar night basemap loaded from cache /home/kirx/.cache/ttu-radar/basemap_<hash>.png ...
+  mkdir -p ~/basemap-watermarked && mv ~/.cache/ttu-radar/basemap_<hash>.png ~/basemap-watermarked/
+  sudo systemctl restart ttu-safety
+  ```
+  Keep the good ones: without `TTU_SAFETY_CARTO_KEY` a deleted CARTO map cannot be
+  rebuilt from CARTO — it comes back as OpenStreetMap. (`rm ~/.cache/ttu-radar/basemap_*.png`
+  starts over with every map, the good CARTO ones included.)
 
 That's the whole deployment: **one service**. The safety daemon spawns
 `make_status_page.py` every ~90 s as an isolated subprocess (a page crash or hang is

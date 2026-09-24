@@ -5,9 +5,13 @@ the latest MRMS composite-reflectivity frame
 from the Iowa Environmental Mesonet (free, no key), and:
   * CHECK: declares unsafe if any echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of the dome.
     Deliberately simple — no upwind/downwind logic, just a plain radius.
-  * THUMBNAIL: renders a TTU-centered map (dark OSM tiles from Carto, cached to disk so
-    they are NOT re-downloaded every cycle) with the radar overlaid, the trigger ring, and
-    10 km / 10 mi scale bars, saved where the status page can load it.
+  * THUMBNAIL: renders a TTU-centered map with the radar overlaid, the trigger ring, and
+    10 km / 10 mi scale bars, saved where the status page can load it. The basemap is
+    built once and cached to disk (never re-downloaded every cycle), from the first source
+    that works: a CARTO composite already cached on this Pi, CARTO tiles fetched with
+    TTU_SAFETY_CARTO_KEY, OpenStreetMap tiles (the key-free backup), else a plain
+    background — see the basemap block in config.py. The component reports which source
+    each map uses, and the attribution line follows it.
 
 A single frame never vetoes: an in-ring echo must repeat on RADAR_TRIGGER_AFTER (2)
 CONSECUTIVE polls before it counts, because MRMS composites occasionally carry a
@@ -43,7 +47,9 @@ import os
 import re
 import threading
 import time
+import types
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -75,17 +81,31 @@ def deps_available():
 
 
 # ---- HTTP -----------------------------------------------------------------
-def _get(url, timeout=25, refuse_uncacheable=False):
-    """GET -> bytes. refuse_uncacheable (basemap tiles): a reply the server marks
-    Cache-Control no-cache / no-store is refused (ValueError) — OpenStreetMap sends its
-    "Access blocked" tile that way, with HTTP 200 — so it is never pasted into a basemap,
-    let alone into the basemap cached for good."""
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+class TileRefused(ValueError):
+    """A tile reply that must never be drawn although it came with HTTP 200: OSM's
+    "access blocked" tile (marked not cacheable) or CARTO's "API KEY REQUIRED" watermark
+    (a keyed tile identical to its unkeyed twin)."""
+
+
+def _get(url, timeout=25, refuse_uncacheable=False, fresh=False):
+    """GET -> bytes. refuse_uncacheable (OSM and custom basemap tiles): a reply the
+    server marks Cache-Control no-cache / no-store is refused (TileRefused) —
+    OpenStreetMap sends its "Access blocked" tile that way, with HTTP 200 — so it is never
+    pasted into a basemap, let alone into the basemap cached for good. fresh (the CARTO
+    key check): asks every cache on the way for a fresh copy (Cache-Control/Pragma
+    no-cache), so a proxy holding a pre-watermark copy of an unkeyed tile cannot make a
+    rejected key look accepted. (CARTO's own CDN ignores it — checked 2026-09-24 — which
+    is harmless: its unkeyed copies are all watermarked.)"""
+    headers = dict(UA)
+    if fresh:
+        headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                timeout=timeout) as r:
         if refuse_uncacheable:
             cc = (r.headers.get("Cache-Control") or "").lower()
             if "no-cache" in cc or "no-store" in cc:
-                raise ValueError("tile server marked the tile not cacheable (%s): an "
-                                 "'access blocked' tile?" % cc)
+                raise TileRefused("tile server marked the tile not cacheable (%s): an "
+                                  "'access blocked' tile?" % cc)
         return r.read()
 
 
@@ -183,9 +203,111 @@ def _region(cfg):
 
 
 def _cache_key(cfg, tile_url, inverted=False):
+    """The cached composite's file-name hash. With inverted=False this is EXACTLY the
+    formula the code has always used, so a CARTO composite cached before the key
+    requirement (keyed by the key-free CARTO URL) is found again; a keyed CARTO build is
+    stored under that same key-free name, so the key never reaches a file name."""
     s = (f"{cfg.GEOCODE}|{cfg.RADAR_THUMB_HALF_DEG}|{cfg.RADAR_THUMB_PX}|"
          f"{cfg.RADAR_TILE_ZOOM}|{tile_url}" + ("|inverted" if inverted else ""))
     return hashlib.md5(s.encode()).hexdigest()[:10]
+
+
+def _geo_sig(cfg):
+    """Everything the map's region and cached composite name depend on (bar the URL)."""
+    return (cfg.GEOCODE, cfg.RADAR_THUMB_HALF_DEG, cfg.RADAR_THUMB_PX, cfg.RADAR_TILE_ZOOM)
+
+
+# ---- basemap sources (the chain is described in config.py's basemap block) -----------
+# Per map, first that works: carto-cached -> carto (keyed) -> osm -> none; a custom
+# TTU_SAFETY_RADAR_TILE_URL(_DAY) takes CARTO's place as custom-cached -> custom.
+BASEMAP_SOURCES = ("carto-cached", "carto", "custom-cached", "custom", "osm", "none")
+BASEMAP_RETRY_SEC = 1800             # a missing/incomplete basemap is rebuilt this often
+# A rejected CARTO key is not re-probed sooner; OSM standing in for a rejected key or a
+# failed custom source is re-checked this often (for CARTO: 2 probe requests). A merely
+# incomplete build (some tiles arrived) is retried after BASEMAP_RETRY_SEC instead.
+CARTO_REJECT_MEMORY_SEC = 6 * 3600
+# HTTP statuses of an unkeyed CARTO request that prove CARTO enforces the key: the keyed
+# twin that DID come through is then a real tile. (408/429 prove nothing: a timeout, a
+# rate limit.) Keyed requests answered 401/403 = the key refused outright.
+_CARTO_KEY_REFUSED = (401, 403)
+BASEMAP_TILE_TIMEOUT = 15            # s per tile request
+BASEMAP_GIVE_UP_AFTER = 3            # failed tiles, none arrived: the source is down
+BASEMAP_BG = (16, 20, 30)            # the plain background where no tile arrived
+CARTO_CREDIT = "© OpenStreetMap contributors, © CARTO"
+OSM_CREDIT = "© OpenStreetMap contributors"
+CARTO_KEY_URL = "carto.com/basemaps/apikey"
+# CARTO key verdicts of THIS process: sha256(key) -> (monotonic expiry, "rejected" |
+# "unreachable", short reason for the page). Module-level so the night and day maps share
+# one probe; in memory only (a restart re-probes: 2 requests), and never the key itself.
+_CARTO_REJECTED: dict = {}
+_CARTO_ERROR_LOGGED: set = set()     # key hashes whose rejection was logged at ERROR
+_OSM_UA_WARNED: set = set()          # User-Agents already logged as blocked by OSM
+# any key-like query parameter, for URLs whose key did not come from CARTO_API_KEY (a
+# custom template with its key written in)
+_KEY_PARAM_RE = re.compile(r"([?&](?:api_?key|key|token|access_token)=)[^&#\s'\"]+",
+                           re.IGNORECASE)
+
+
+def redact(text, cfg=None, keys=()) -> str:
+    """``text`` with the CARTO key (raw and URL-encoded), any further ``keys`` (a key
+    found in a tile URL) and any key= / apikey= / token= query value replaced by ***.
+    Every log line that can carry a tile URL or a fetch error goes through this: the key
+    is a secret, and logs end up in journald, bug reports and screenshots."""
+    s = str(text)
+    keys = {str(k or "").strip() for k in keys} | {
+        str(getattr(c, "CARTO_API_KEY", "") or "").strip()
+        for c in (cfg, _config) if c is not None}
+    forms = set()
+    for k in keys:
+        if k:
+            forms.update((k, urllib.parse.quote(k, safe="")))
+    for form in sorted(forms, key=len, reverse=True):
+        s = s.replace(form, "***")
+    return _KEY_PARAM_RE.sub(r"\1***", s)
+
+
+def _with_key(url, key):
+    """The tile URL with CARTO's ?key= parameter (URL-encoded)."""
+    return url + ("&" if "?" in url else "?") + "key=" + urllib.parse.quote(key, safe="")
+
+
+def _key_id(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def carto_key(cfg) -> str:
+    return str(getattr(cfg, "CARTO_API_KEY", "") or "").strip()
+
+
+def _carto_memory(key, now=None):
+    """(verdict, reason) while this process remembers the key failing its probe
+    (CARTO_REJECT_MEMORY_SEC), else None."""
+    if not key:
+        return None
+    kid = _key_id(key)
+    hit = _CARTO_REJECTED.get(kid)
+    if hit is None:
+        return None
+    if (time.monotonic() if now is None else now) >= hit[0]:
+        _CARTO_REJECTED.pop(kid, None)
+        return None
+    return hit[1], (hit[2] if len(hit) > 2 else "")
+
+
+def carto_rejection(key, now=None):
+    """'rejected' / 'unreachable' while this process remembers the key failing its probe
+    (CARTO_REJECT_MEMORY_SEC), else None."""
+    hit = _carto_memory(key, now)
+    return hit[0] if hit else None
+
+
+def _osm_url(cfg):
+    return getattr(cfg, "OSM_TILE_URL", _config.OSM_TILE_URL)
+
+
+def basemap_mode(cfg) -> str:
+    m = str(getattr(cfg, "RADAR_BASEMAP", "auto") or "auto").strip().lower()
+    return m if m in ("auto", "carto", "osm") else "auto"
 
 
 # A tile whose mean luminance is above this is "light" and, for the night map, gets its
@@ -215,8 +337,11 @@ def _mean_luminance(img) -> float:
 # overlay colours per basemap theme (dark labels/lines are invisible on a light basemap).
 # smoke = the HMS smoke veil (a light grey that still shows on the light basemap);
 # mrgl = the SPC Marginal-risk outline, which SPC draws dark green (see _never_green);
-# base = the basemap's typical colour (the median pixel of the TTU maps: OSM's land colour,
-# and its lightness-inverted twin at night), against which _casing_for judges an outline.
+# base = the basemap's typical colour, against which _casing_for judges an outline: the
+# median pixel of the TTU maps from OpenStreetMap (its land colour, and the lightness-
+# inverted twin at night). CARTO's medians — Dark Matter ~(9, 9, 9), Positron
+# ~(250, 250, 248) — are close enough that the 3:1 casing rule holds against them too
+# (test_radar_review_fixes checks every NWS colour against both basemaps).
 _THEME = {
     "dark":  {"ink": (255, 255, 255), "stroke": (0, 0, 0), "ring": (90, 200, 255),
               "label": (120, 210, 255), "text": (200, 215, 235),
@@ -780,7 +905,10 @@ class Thumbnailer:
     """Builds and caches a tile basemap once, then composites radar each cycle.
 
     Parametrized by tile URL / output path / theme so the same machinery makes both the
-    night (dark) and day (light) maps.
+    night (dark) and day (light) maps. ``tile_url`` is the map's configured source: its
+    theme's CARTO URL (the default), an OpenStreetMap URL, or a custom template (on a
+    CARTO host still under the CARTO rules); the chain follows from it, by host, and from
+    RADAR_BASEMAP (basemap_plan).
     """
 
     def __init__(self, cfg, tile_url, thumb_path, theme):
@@ -798,59 +926,423 @@ class Thumbnailer:
         # caption: a hazard-overlay change re-renders from it (rerender) without refetching
         # MRMS — and without holding the 24 MB CONUS frame in RAM between polls.
         self._frame = None
+        # What the current basemap is, for the component / page / attribution: written
+        # only by the radar thread (_use), read from the evaluator thread — each attribute
+        # read ONCE there (_snap), as a rebuild may rewrite them between two reads.
+        self.basemap_source = None      # one of BASEMAP_SOURCES; None = not built yet
+        self.basemap_tiles = None       # (arrived, expected) of an incomplete build
+        self.basemap_inverted = False   # light tiles lightness-inverted (the night OSM map)
+        self.carto_state = None         # step 2 reached: no-key/accepted/rejected/unreachable
+        self.carto_reason = ""          # a failed key check in short ("HTTP 403", ...)
+        self.osm_state = None           # step 3 reached: used/refused/failed/skipped-ua
+        self.basemap_why = ()           # (kind, arrived, expected) of better sources that
+        #                                 failed: kind "carto" or "custom"
+        self._basemap_retry_at = None   # monotonic time of the next rebuild; None = final
+        self._built_for = None          # _geo_sig of the region the basemap was built for
+        # the build in progress writes these; _use publishes them with the new basemap,
+        # so the evaluator thread never sees a half-updated state during a rebuild
+        self._pending_carto = None
+        self._pending_carto_reason = ""
+        self._pending_osm = None
+        self._geo = None                # the region settings this build uses (_geometry)
+        self._invert = False
+        self._tiles = []
+        self._canvas_size = (1, 1)
+
+    @property
+    def map_name(self):
+        return "night" if self.theme == "dark" else "day"
+
+    def _default_carto_url(self):
+        cfg = self.cfg
+        if self.theme == "dark":
+            return getattr(cfg, "CARTO_TILE_URL", _config.CARTO_TILE_URL)
+        return getattr(cfg, "CARTO_TILE_URL_DAY", _config.CARTO_TILE_URL_DAY)
+
+    def basemap_plan(self):
+        """How this map is built, as a dict: "chain" = the sources tried in order ("none"
+        is implied at the end); "carto_url" = the key-free CARTO URL of its CARTO steps
+        (None: they are not CARTO); "carto_key" = a key written into the configured URL
+        (''); "osm_url" = the URL of its OpenStreetMap step; "osm_by" = the setting that
+        made OpenStreetMap this map's CHOICE rather than the fallback (None).
+
+        Classified by host (config.tile_host_kind), not by exact URL: EVERY CARTO URL
+        (another subdomain or style, @2x, ...) is only ever fetched with the key and
+        through the key check, and EVERY OpenStreetMap URL gets the User-Agent check and
+        obeys RADAR_BASEMAP — a variant spelling must not slip past either."""
+        cfg = self.cfg
+        mode = basemap_mode(cfg)
+        kind = _config.tile_host_kind(self.tile_url)
+        var = "TTU_SAFETY_RADAR_TILE_URL" + ("" if self.theme == "dark" else "_DAY")
+        plan = {"carto_url": None, "carto_key": "", "osm_url": _osm_url(cfg), "osm_by": None}
+        if mode == "osm":
+            # never CARTO, not even the cached maps; the map's own OSM URL if it has one
+            plan.update(chain=["osm"], osm_by="TTU_SAFETY_RADAR_BASEMAP=osm")
+            if kind == "osm":
+                plan["osm_url"] = self.tile_url
+            return plan
+        if kind == "osm" and mode == "auto":
+            # an OpenStreetMap URL configured for this map: OpenStreetMap only
+            plan.update(chain=["osm"], osm_url=self.tile_url, osm_by=var)
+            return plan
+        if kind == "osm":
+            # "carto" mode = never OpenStreetMap: the map's own CARTO chain instead
+            # (config.py warns about the ignored URL at startup)
+            url, key, label = self._default_carto_url(), "", "carto"
+        elif kind == "carto":
+            url, key = _config.split_key_param(self.tile_url)
+            label = "carto" if url == self._default_carto_url() else "custom"
+        else:
+            url, key, label = None, "", "custom"
+        chain = [label + "-cached", label] + (["osm"] if mode == "auto" else [])
+        plan.update(chain=chain, carto_url=url, carto_key=key)
+        return plan
+
+    def basemap_chain(self):
+        """The sources this map tries, in order ("none" is implied at the end)."""
+        return list(self.basemap_plan()["chain"])
+
+    def basemap_due(self):
+        """A rebuild is due: its scheduled time has come, or the region changed since the
+        map was built — a GPS position adopted after the first build (after every reboot:
+        the inputs file lives in /dev/shm), whose own cached composite may well exist
+        (see RadarPoller._retry_basemaps)."""
+        at = self._basemap_retry_at
+        if at is not None and time.monotonic() >= at:
+            return True
+        built = self._built_for
+        return built is not None and built != _geo_sig(self.cfg)
+
+    def _cache_path(self, step, plan=None):
+        """The cached composite of a step. CARTO steps (a CARTO host) use the key-free
+        CARTO URL and never "|inverted": exactly the name the Pi's pre-watermark
+        composites carry (CARTO tiles are never inverted). Other sources add "|inverted"
+        for a night map made from light tiles."""
+        plan = plan or self.basemap_plan()
+        geo = self._geo or self.cfg
+        if step == "osm":
+            name = _cache_key(geo, plan["osm_url"], self._invert)
+        elif plan["carto_url"] is not None:
+            name = _cache_key(geo, plan["carto_url"])
+        else:
+            name = _cache_key(geo, self.tile_url, self._invert)
+        return os.path.join(self.cfg.RADAR_CACHE_DIR, f"basemap_{name}.png")
 
     # basemap (static): fetch tiles once, cache the composited image to disk
     def _build_basemap(self):
         cfg = self.cfg
-        z = cfg.RADAR_TILE_ZOOM
-        latmin, latmax, lonmin, lonmax = _region(cfg)
+        self._geometry()
+        try:
+            self._run_chain()
+        except Exception as e:          # noqa: BLE001 - the map is never worth a crash
+            log.error("radar %s basemap build failed (%s) — plain background, retried in "
+                      "%d min", self.map_name, redact(e, cfg), BASEMAP_RETRY_SEC // 60)
+            self._use(Image.new("RGB", (self._ox, self._oy), BASEMAP_BG), "none",
+                      retry=BASEMAP_RETRY_SEC)
+
+    def _geometry(self):
+        """The map's tile box, output size and tile list (no network)."""
+        cfg = self.cfg
+        # ONE snapshot of the region settings for the whole build: the evaluator thread
+        # may adopt a GPS position meanwhile, and a composite must never be cached under
+        # a name that describes another region than the one it shows
+        geo = types.SimpleNamespace(GEOCODE=cfg.GEOCODE,
+                                    RADAR_THUMB_HALF_DEG=cfg.RADAR_THUMB_HALF_DEG,
+                                    RADAR_THUMB_PX=cfg.RADAR_THUMB_PX,
+                                    RADAR_TILE_ZOOM=cfg.RADAR_TILE_ZOOM)
+        self._geo = geo
+        z = geo.RADAR_TILE_ZOOM
+        latmin, latmax, lonmin, lonmax = _region(geo)
         x0f, y0f = _deg2num(latmax, lonmin, z)
         x1f, y1f = _deg2num(latmin, lonmax, z)
         gx0, gy0, gx1, gy1 = int(x0f * 256), int(y0f * 256), int(x1f * 256), int(y1f * 256)
-        self._tilebox = (gx0, gy0, gx1, gy1, z)
+        box = (gx0, gy0, gx1, gy1, z)
+        if self._tilebox is not None and self._tilebox != box:
+            # a rebuild after the site moved: the reprojection and the kept frame belong
+            # to the old map and must not be drawn on the new one
+            self._remap = None
+            self._frame = None
+        self._tilebox = box
         # Non-square output matching the Mercator canvas aspect, so px/km is equal on both
         # axes: the trigger ring draws as a true circle and one scale bar is valid in every
         # direction (a square would stretch E-W by 1/cos(lat) ~ 1.2x here).
         cw, ch = gx1 - gx0, gy1 - gy0
-        self._ox = cfg.RADAR_THUMB_PX
+        self._ox = geo.RADAR_THUMB_PX
         self._oy = max(1, round(self._ox * ch / cw))
+        self._canvas_size = (cw, ch)
+        self._tiles = [(tx, ty) for tx in range(int(x0f), int(x1f) + 1)
+                       for ty in range(int(y0f), int(y1f) + 1)]
+        self._invert = self.theme == "dark" and bool(getattr(cfg, "RADAR_TILE_DARK_INVERT",
+                                                             False))
 
-        invert = self.theme == "dark" and bool(getattr(cfg, "RADAR_TILE_DARK_INVERT", False))
-        cache = os.path.join(cfg.RADAR_CACHE_DIR,
-                             f"basemap_{_cache_key(cfg, self.tile_url, invert)}.png")
-        if os.path.exists(cache):
-            try:
-                self._basemap = Image.open(cache).convert("RGB")
-                log.info("radar basemap loaded from cache %s (tiles not re-fetched)", cache)
-                return
-            except Exception:
-                pass
-        canvas = Image.new("RGB", (cw, ch), (16, 20, 30))
-        n = 0
-        expected = (int(x1f) - int(x0f) + 1) * (int(y1f) - int(y0f) + 1)
-        for tx in range(int(x0f), int(x1f) + 1):
-            for ty in range(int(y0f), int(y1f) + 1):
-                try:
-                    t = Image.open(io.BytesIO(_get(self.tile_url.format(z=z, x=tx, y=ty),
-                                                   refuse_uncacheable=True))).convert("RGB")
-                    if invert and _mean_luminance(t) > LIGHT_TILE_LUMINANCE:
-                        t = invert_lightness(t)
-                    canvas.paste(t, (tx * 256 - gx0, ty * 256 - gy0))
-                    n += 1
-                except Exception as e:
-                    log.warning("radar tile fetch failed z%s x%s y%s: %s", z, tx, ty, e)
-        self._basemap = canvas.resize((self._ox, self._oy), Image.LANCZOS)
-        # Only persist a COMPLETE basemap — never cache a partial/blank one forever.
-        if n == expected and n > 0:
-            try:
-                os.makedirs(cfg.RADAR_CACHE_DIR, exist_ok=True)
-                self._basemap.save(cache)
-                log.info("radar basemap built from %d tiles and cached to %s", n, cache)
-            except Exception:
-                log.exception("could not cache radar basemap")
+    def _run_chain(self):
+        cfg = self.cfg
+        plan = self.basemap_plan()
+        z = self._tilebox[4]
+        self._pending_carto = None
+        self._pending_carto_reason = ""
+        self._pending_osm = None
+        why = []                # (kind, arrived, expected) of better sources that failed
+        best = None             # the most complete partial build: (arrived, expected, src, img)
+        retry = None            # a better source failed: re-check it after this many s
+
+        def later(sec):
+            nonlocal retry
+            retry = sec if retry is None else min(retry, sec)
+
+        for step in plan["chain"]:
+            if step.endswith("-cached"):
+                img = self._load_cache(self._cache_path(step, plan))
+                if img is not None:
+                    return self._use(img, step)             # final: never rebuilt
+                continue
+            if step == "osm":
+                self._pending_osm = "used"
+                img = self._load_cache(self._cache_path("osm", plan))
+                if img is not None:
+                    # a composite built earlier needs no request, whatever the UA says now
+                    return self._use(img, "osm", retry=retry, why=why)
+                ua = str(getattr(cfg, "NWS_USER_AGENT", "") or "")
+                if _config.ua_has_placeholder(ua):
+                    # OSM answers such a UA with its "access blocked" tile: asking would
+                    # only earn the Pi a block. Warned on the page and /setup.
+                    self._pending_osm = "skipped-ua"
+                    if ua not in _OSM_UA_WARNED:
+                        _OSM_UA_WARNED.add(ua)
+                        log.warning("OpenStreetMap basemap NOT requested: TTU_SAFETY_NWS_UA=%r "
+                                    "carries a placeholder contact, which OSM blocks — put a "
+                                    "real e-mail address in it", redact(ua, cfg))
+                    continue
+                kind = "osm"
+                built = self._build_tiles(self._plain_fetch(plan["osm_url"], z), "osm",
+                                          self._invert)
+            elif plan["carto_url"] is not None:
+                # "carto", or "custom" on a CARTO host: only ever with the key, checked
+                kind = "carto"
+                built = self._build_carto(plan["carto_url"], plan["carto_key"], z)
+                if built is None:
+                    if self._pending_carto in ("rejected", "unreachable"):
+                        later(CARTO_REJECT_MEMORY_SEC)
+                    continue
+            else:                                   # custom: fetched exactly as given
+                kind = "custom"
+                built = self._build_tiles(self._plain_fetch(self.tile_url, z), "custom",
+                                          self._invert)
+            img, n, expected, refused = built
+            if n == expected and n > 0:
+                # Only a COMPLETE basemap is cached — never a partial/blank one for good.
+                self._save_cache(img, step, n, plan)
+                return self._use(img, step, retry=retry, why=why)
+            if kind == "osm":
+                self._pending_osm = "refused" if refused else "failed"
+            else:
+                why.append((kind, n, expected))
+                # Some tiles came (a timeout, a watermarked tile mid-build): transient, so
+                # the better source is retried soon. None came: a dead or wrong source,
+                # re-checked like a rejected key.
+                later(BASEMAP_RETRY_SEC if n > 0 else CARTO_REJECT_MEMORY_SEC)
+            if n > 0 and (best is None or n > best[0]):
+                best = (n, expected, step, img)
+        if best is not None:
+            n, expected, step, img = best
+            log.warning("radar %s basemap incomplete (%d/%d tiles, %s) — not cached; retried "
+                        "in %d min", self.map_name, n, expected, step, BASEMAP_RETRY_SEC // 60)
+            # the partial map shown says so itself (basemap_tiles): no "why" entry for it
+            shown = "carto" if (step != "osm" and plan["carto_url"] is not None) else step
+            return self._use(img, step, retry=BASEMAP_RETRY_SEC, tiles=(n, expected),
+                             why=[w for w in why if w[0] != shown])
+        # WARNING on the way in, INFO while it lasts: the retry runs every 30 min, and
+        # journald on the SD card needs no identical warning each time
+        log.log(logging.WARNING if self.basemap_source != "none" else logging.INFO,
+                "radar %s basemap: no tile source worked (%s) — plain background, "
+                "retried in %d min", self.map_name, " -> ".join(plan["chain"]),
+                BASEMAP_RETRY_SEC // 60)
+        return self._use(Image.new("RGB", (self._ox, self._oy), BASEMAP_BG), "none",
+                         retry=BASEMAP_RETRY_SEC, why=why)
+
+    @staticmethod
+    def _plain_fetch(url, z):
+        """The tile fetcher of an OSM or custom source: each tile as the template gives
+        it; a reply marked not cacheable (OSM's "access blocked" tile) is refused."""
+        return lambda tx, ty: _get(url.format(z=z, x=tx, y=ty), timeout=BASEMAP_TILE_TIMEOUT,
+                                   refuse_uncacheable=True)
+
+    def _build_carto(self, url, embedded_key, z):
+        """Step 2: CARTO tiles with the key, once a probe tile shows CARTO accepts it —
+        and every other tile checked against its unkeyed twin as it comes (_carto_tile).
+        None when the step is skipped (no key, a remembered rejection, a failed probe)."""
+        cfg = self.cfg
+        key = carto_key(cfg) or embedded_key
+        if not key:
+            # never a CARTO request without a key: every tile would be the watermark
+            self._pending_carto = "no-key"
+            return None
+        remembered = _carto_memory(key)
+        if remembered:
+            self._pending_carto, self._pending_carto_reason = remembered
+            return None
+        ptx, pty = self._tiles[len(self._tiles) // 2]        # the map's middle tile
+        verdict, keyed, detail, reason = self._carto_tile(url.format(z=z, x=ptx, y=pty), key)
+        if verdict != "ok":
+            return self._carto_failed(key, verdict, detail, reason)
+        _CARTO_REJECTED.pop(_key_id(key), None)
+        self._pending_carto = "accepted"
+        log.info("CARTO accepted TTU_SAFETY_CARTO_KEY (the keyed probe tile is not the unkeyed "
+                 "watermark): building the %s map from keyed tiles, each checked against "
+                 "its unkeyed twin", self.map_name)
+
+        def fetch(tx, ty):
+            v, data, why, _reason = self._carto_tile(url.format(z=z, x=tx, y=ty), key)
+            if v == "ok":
+                return data
+            # a watermarked tile after an accepted probe (key revoked, quota spent): never
+            # drawn — the build stays incomplete, is not cached and is retried
+            raise (TileRefused if v == "rejected" else OSError)(redact(why, cfg, (key,)))
+        return self._build_tiles(fetch, "carto", False, prefetched={(ptx, pty): keyed},
+                                 secret=key)
+
+    def _carto_tile(self, url, key):
+        """One CARTO tile, fetched with the key and without it -> (verdict, the keyed
+        tile's bytes, log detail, short reason). "ok" = the keyed tile is a real map tile;
+        "rejected" = CARTO refused the keyed request (HTTP 401/403) or answered it with
+        the same bytes as the unkeyed one — the "API KEY REQUIRED" watermark, which CARTO
+        sends for a missing and a bogus key alike under HTTP 200, so the headers cannot
+        tell but the bytes can; "unreachable" = no verdict possible (a failed fetch).
+        The verdict follows the KEYED reply: an unkeyed twin CARTO refuses outright (a
+        4xx) only proves that CARTO enforces the key, so the keyed tile that came through
+        is real; a failed keyed request never blames an unkeyed hiccup on the key."""
+        keyed_url = _with_key(url, key)
+        try:
+            keyed = _get(keyed_url, timeout=BASEMAP_TILE_TIMEOUT, fresh=True)
+        except urllib.error.HTTPError as e:
+            if e.code in _CARTO_KEY_REFUSED:
+                return ("rejected", None, "CARTO refused the keyed tile %s (HTTP %d)"
+                        % (keyed_url, e.code), "HTTP %d" % e.code)
+            return ("unreachable", None, "the keyed tile %s failed (%s)" % (keyed_url, e),
+                    "HTTP %d" % e.code)
+        except Exception as e:                  # noqa: BLE001 - network, timeout, ...
+            return ("unreachable", None, "the keyed tile %s could not be fetched (%s)"
+                    % (keyed_url, e), "no answer")
+        try:
+            Image.open(io.BytesIO(keyed)).verify()
+        except Exception as e:                  # noqa: BLE001 - an error page, a portal
+            return ("unreachable", None, "the keyed tile %s is not an image (%s)"
+                    % (keyed_url, e), "not an image")
+        try:
+            plain = _get(url, timeout=BASEMAP_TILE_TIMEOUT, fresh=True)
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                return "ok", keyed, "", ""      # CARTO refuses keyless tiles: key enforced
+            return ("unreachable", None, "the unkeyed twin %s failed (%s), so the keyed tile "
+                    "cannot be told from the watermark" % (url, e), "HTTP %d" % e.code)
+        except Exception as e:                  # noqa: BLE001
+            return ("unreachable", None, "the unkeyed twin %s could not be fetched (%s), so "
+                    "the keyed tile cannot be told from the watermark" % (url, e),
+                    "no answer")
+        if plain == keyed:
+            return ("rejected", None, "the keyed tile %s is byte-identical to the unkeyed one, "
+                    "i.e. still CARTO's 'API KEY REQUIRED' watermark" % keyed_url,
+                    "tiles still watermarked")
+        return "ok", keyed, "", ""
+
+    def _carto_failed(self, key, kind, detail, reason=""):
+        _CARTO_REJECTED[_key_id(key)] = (time.monotonic() + CARTO_REJECT_MEMORY_SEC, kind,
+                                         reason)
+        self._pending_carto = kind
+        self._pending_carto_reason = reason
+        msg = redact("%s TTU_SAFETY_CARTO_KEY: %s — the %s map falls back to the next "
+                     "basemap source; not re-probed for %d h"
+                     % ("CARTO did not accept" if kind == "rejected" else "could not check",
+                        detail, self.map_name, CARTO_REJECT_MEMORY_SEC // 3600),
+                     self.cfg, (key,))
+        kid = _key_id(key)
+        if kid not in _CARTO_ERROR_LOGGED:      # ERROR once per key and process
+            _CARTO_ERROR_LOGGED.add(kid)
+            log.error("%s", msg)
         else:
-            log.warning("radar basemap incomplete (%d/%d tiles) — not cached; will retry",
-                        n, expected)
+            log.warning("%s", msg)
+        return None
+
+    def _build_tiles(self, fetch, source, invert, prefetched=None, secret=""):
+        """Fetch this map's tiles with ``fetch(tx, ty) -> bytes`` -> (composite resized
+        to the thumbnail, arrived, expected, refused). A tile refused as never drawable
+        (TileRefused: OSM's "access blocked" tile, a CARTO watermark) is counted apart, so
+        the page can say why. Gives up on a source after BASEMAP_GIVE_UP_AFTER failures
+        with nothing arrived (a dead server must not hold the radar thread for minutes)."""
+        cfg = self.cfg
+        gx0, gy0, z = self._tilebox[0], self._tilebox[1], self._tilebox[4]
+        canvas = Image.new("RGB", self._canvas_size, BASEMAP_BG)
+        n, refused, errors = 0, 0, []
+        prefetched = prefetched or {}
+        # a tile already in hand (the CARTO probe) first: it counts as arrived before the
+        # give-up rule below can write the whole source off
+        order = ([t for t in self._tiles if t in prefetched]
+                 + [t for t in self._tiles if t not in prefetched])
+        for tx, ty in order:
+            if n == 0 and len(errors) >= BASEMAP_GIVE_UP_AFTER:
+                break
+            try:
+                data = prefetched.get((tx, ty))
+                if data is None:
+                    data = fetch(tx, ty)
+                t = Image.open(io.BytesIO(data)).convert("RGB")
+                if invert and _mean_luminance(t) > LIGHT_TILE_LUMINANCE:
+                    t = invert_lightness(t)
+                canvas.paste(t, (tx * 256 - gx0, ty * 256 - gy0))
+                n += 1
+            except Exception as e:              # noqa: BLE001 - one tile, not the map
+                refused += isinstance(e, TileRefused)
+                errors.append("z%s x%s y%s: %s" % (z, tx, ty, e))
+        if errors:
+            log.warning("radar %s basemap (%s): %d of %d tiles failed, first: %s",
+                        self.map_name, source, len(errors), len(self._tiles),
+                        redact(errors[0], cfg, (secret,)))
+        return canvas.resize((self._ox, self._oy), Image.LANCZOS), n, len(self._tiles), refused
+
+    def _load_cache(self, path):
+        if not os.path.exists(path):
+            return None
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:                  # noqa: BLE001 - a torn file: rebuild
+            log.warning("radar basemap cache %s unreadable (%s) — ignored", path, e)
+            return None
+        if img.size != (self._ox, self._oy):   # never expected (the size is in the name)
+            img = img.resize((self._ox, self._oy), Image.LANCZOS)
+        # this line names the file each map uses: README.md shows how to find a
+        # watermarked CARTO composite with it and delete just that one
+        log.info("radar %s basemap loaded from cache %s (tiles not re-fetched)",
+                 self.map_name, path)
+        return img
+
+    def _save_cache(self, img, step, n, plan=None):
+        path = self._cache_path(step, plan)
+        tmp = path + ".tmp"
+        try:
+            os.makedirs(self.cfg.RADAR_CACHE_DIR, exist_ok=True)
+            img.save(tmp, format="PNG")         # .tmp ext -> must state the format
+            os.replace(tmp, path)               # a brownout never leaves a torn cache
+            log.info("radar %s basemap (%s) built from %d tiles and cached to %s",
+                     self.map_name, step, n, path)
+        except Exception as e:                  # noqa: BLE001
+            log.error("could not cache radar basemap %s: %s", path, e)
+
+    def _use(self, img, source, retry=None, tiles=None, why=()):
+        self._basemap = img
+        self.carto_state = self._pending_carto
+        self.carto_reason = self._pending_carto_reason
+        self.osm_state = self._pending_osm
+        self.basemap_why = tuple(why)
+        if source != self.basemap_source:
+            log.info("radar %s basemap: %s", self.map_name, source)
+        self.basemap_source = source
+        self.basemap_tiles = tiles
+        # light tiles are inverted for the night map from OSM and non-CARTO custom sets
+        self.basemap_inverted = bool(self._invert and (
+            source == "osm" or (source in ("custom", "custom-cached")
+                                and _config.tile_host_kind(self.tile_url) != "carto")))
+        self._basemap_retry_at = None if retry is None else time.monotonic() + retry
+        self._built_for = _geo_sig(self._geo) if self._geo is not None else None
 
     # reproject lookup (static for a fixed region): thumb pixel -> radar (col,row)
     def _build_remap(self):
@@ -1224,6 +1716,220 @@ class Thumbnailer:
         return im
 
 
+# ---- what the basemap is: attribution, notes, warnings, one-line summary ---------------
+def basemap_attribution(cfg, used):
+    """The map's credit line, from the sources actually drawn. ``used`` = [(source,
+    tile_url)] of the maps. Any CARTO map -> "© OpenStreetMap contributors, © CARTO"
+    (CARTO's required line, which covers OSM too); OSM alone -> "© OpenStreetMap
+    contributors"; a custom source is credited by its host (cartocdn / openstreetmap
+    hosts as above); nothing drawn -> the radar credit alone."""
+    carto = osm = False
+    hosts = []
+    for src, url in used:
+        if src in ("carto", "carto-cached"):
+            carto = True
+        elif src == "osm":
+            osm = True
+        elif src in ("custom", "custom-cached"):
+            try:
+                host = urllib.parse.urlsplit(str(url)).hostname or ""
+            except ValueError:
+                host = ""
+            if "cartocdn" in host:
+                carto = True
+            elif "openstreetmap" in host:
+                osm = True
+            elif host and host not in hosts:
+                hosts.append(host)
+    parts = [CARTO_CREDIT] if carto else ([OSM_CREDIT] if osm else [])
+    parts += ["Map tiles: %s" % h for h in hosts]
+    parts.append(str(getattr(cfg, "RADAR_ATTRIBUTION", _config.RADAR_ATTRIBUTION)))
+    return " · ".join(parts)
+
+
+class _MapSnap:
+    """One map's basemap attributes, each read ONCE (see _snap)."""
+    __slots__ = ("map_name", "source", "tiles", "inverted", "carto", "carto_reason", "osm",
+                 "why", "tile_url", "osm_by")
+
+
+def _snap(t):
+    """A consistent-enough copy of a map's basemap attributes. The radar thread rewrites
+    them during a rebuild (_use), and two reads of one attribute can straddle that — a
+    ``if t.basemap_tiles: tuple(t.basemap_tiles)`` once raised TypeError straight into
+    the IsSafe path. So every attribute is read exactly once, here."""
+    if isinstance(t, _MapSnap):
+        return t
+    s = _MapSnap()
+    s.map_name = getattr(t, "map_name", None)
+    s.source = getattr(t, "basemap_source", None)
+    tiles = getattr(t, "basemap_tiles", None)
+    s.tiles = tuple(tiles) if isinstance(tiles, (tuple, list)) and len(tiles) == 2 else None
+    s.inverted = bool(getattr(t, "basemap_inverted", False))
+    s.carto = getattr(t, "carto_state", None)
+    s.carto_reason = str(getattr(t, "carto_reason", "") or "")
+    s.osm = getattr(t, "osm_state", None)
+    why = getattr(t, "basemap_why", ())
+    s.why = tuple(w for w in (why if isinstance(why, (tuple, list)) else ())
+                  if isinstance(w, (tuple, list)) and len(w) == 3)
+    s.tile_url = str(getattr(t, "tile_url", "") or "")
+    plan = getattr(t, "basemap_plan", None)
+    s.osm_by = plan().get("osm_by") if (callable(plan) and s.source == "osm") else None
+    return s
+
+
+_SOURCE_SHORT = {"carto-cached": "cached CARTO", "carto": "CARTO",
+                 "custom-cached": "cached custom tiles", "custom": "custom tiles",
+                 "osm": "OSM", "none": "nothing (plain background)"}
+
+
+def _maps_phrase(built):
+    """'the map uses OSM' / 'the night map uses cached CARTO and the day map OSM'."""
+    pairs = [(s.map_name, _SOURCE_SHORT.get(s.source, s.source)) for s in built]
+    if len({p for _, p in pairs}) == 1:
+        return "the map uses %s" % pairs[0][1]
+    return ("the %s map uses %s" % pairs[0]
+            + "".join(" and the %s map %s" % p for p in pairs[1:]))
+
+
+def _for_maps(names):
+    return "%s map%s" % (" and ".join(names), "s" if len(names) > 1 else "")
+
+
+def basemap_messages(cfg, thumbs):
+    """(notes, warnings) about the basemaps: short page notes (what each map lacks and
+    what to set), and warnings for the monitor's state "warnings" (page + /setup; never a
+    veto). Never contains the key."""
+    notes, warns = [], []
+    built = [s for s in (_snap(t) for t in thumbs) if isinstance(s.source, str)]
+    if not built:
+        return notes, warns
+    carto = {s.carto for s in built}
+    osm = {s.osm for s in built}
+    hours = CARTO_REJECT_MEMORY_SEC // 3600
+    if "rejected" in carto:
+        reason = next((s.carto_reason for s in built if s.carto == "rejected"
+                       and s.carto_reason), "") or "tiles still watermarked"
+        warns.append("TTU_SAFETY_CARTO_KEY was not accepted by CARTO (%s); %s"
+                     % (reason, _maps_phrase(built)))
+        notes.append("TTU_SAFETY_CARTO_KEY not accepted by CARTO (%s), re-checked every %d h"
+                     % (reason, hours))
+    elif "unreachable" in carto:
+        reason = next((s.carto_reason for s in built if s.carto == "unreachable"
+                       and s.carto_reason), "")
+        warns.append("TTU_SAFETY_CARTO_KEY could not be checked (the CARTO probe tile could "
+                     "not be fetched%s); %s" % (": " + reason if reason else "",
+                                                _maps_phrase(built)))
+        notes.append("CARTO unreachable, re-checked every %d h" % hours)
+    if "no-key" in carto and any(s.source in ("osm", "none") for s in built):
+        notes.append("for CARTO maps set TTU_SAFETY_CARTO_KEY (free key: %s)" % CARTO_KEY_URL)
+    # a better source that failed while the map shows another: why, and when it is retried
+    failed = {}
+    for s in built:
+        for kind, n, m in s.why:
+            if kind == "carto":
+                text = ("CARTO tiles incomplete (%d/%d), retried every %d min"
+                        % (n, m, BASEMAP_RETRY_SEC // 60) if n else
+                        "CARTO tiles could not be fetched, re-checked every %d h" % hours)
+            elif n:
+                text = ("custom tiles incomplete (%d/%d), retried every %d min"
+                        % (n, m, BASEMAP_RETRY_SEC // 60))
+            else:
+                text = ("custom TTU_SAFETY_RADAR_TILE_URL%s failed, re-checked every %d h"
+                        % ("" if s.map_name == "night" else "_DAY", hours))
+            failed.setdefault(text, []).append(s.map_name)
+    notes += ["%s: %s" % (_for_maps(names), text) for text, names in failed.items()]
+    ua = str(getattr(cfg, "NWS_USER_AGENT", "") or "")
+    if "skipped-ua" in osm:
+        notes.append("OpenStreetMap not requested: TTU_SAFETY_NWS_UA has a placeholder "
+                     "contact")
+    if "refused" in osm:
+        notes.append("OpenStreetMap refused the tiles ('access blocked' replies): check "
+                     "TTU_SAFETY_NWS_UA")
+    elif "failed" in osm:
+        notes.append("OpenStreetMap tiles could not be fetched")
+    if osm & {"used", "refused", "failed", "skipped-ua"} and not _config.ua_has_real_email(ua):
+        # One UA identifies the daemon to OSM and NWS alike. OSM serves a UA that just
+        # names the app (checked 2026-09-24) but blocks a placeholder contact; NWS asks
+        # for a contact. A real address settles both.
+        if _config.ua_has_placeholder(ua):
+            why = ("OpenStreetMap blocks tile requests from User-Agents with a placeholder "
+                   "contact like you@example.org, so no OSM tiles are fetched, and NWS asks "
+                   "for a contact")
+        else:
+            why = ("OpenStreetMap asks for a User-Agent that identifies the app and blocks "
+                   "placeholder contacts like you@example.org, and NWS asks for a contact")
+        warns.append("Set TTU_SAFETY_NWS_UA with a real contact e-mail: %s (now: '%s')"
+                     % (why, ua[:120]))
+    for s in built:
+        if s.tiles:
+            notes.append("%s map incomplete (%d/%d tiles), retrying" % ((s.map_name,) + s.tiles))
+    blank = [s.map_name for s in built if s.source == "none"]
+    if blank:
+        notes.append("%s retried every %d min" % (_for_maps(blank), BASEMAP_RETRY_SEC // 60))
+    return [redact(n, cfg) for n in notes], [redact(w, cfg) for w in warns]
+
+
+_BOTH_MAPS = {
+    "carto-cached": "CARTO Dark Matter (night) / Positron (day), from tiles cached on this Pi",
+    "carto": ("CARTO Dark Matter (night) / Positron (day), fetched with the configured "
+              "CARTO API key"),
+    "custom-cached": "custom tiles (TTU_SAFETY_RADAR_TILE_URL / _DAY), cached on this Pi",
+    "custom": "custom tiles (TTU_SAFETY_RADAR_TILE_URL / _DAY)",
+    "none": "none (plain background)",
+}
+
+
+def _osm_role(by):
+    """OpenStreetMap as the chain's key-free fallback, or as the configured choice."""
+    return "as set by %s" % by if by else "the key-free fallback"
+
+
+def _one_map(name, src, inverted, by=None):
+    style = "Dark Matter" if name == "night" else "Positron"
+    var = "TTU_SAFETY_RADAR_TILE_URL" + ("" if name == "night" else "_DAY")
+    return {
+        "carto-cached": "CARTO %s, from tiles cached on this Pi" % style,
+        "carto": "CARTO %s, fetched with the configured CARTO API key" % style,
+        "custom-cached": "custom tiles (%s), cached on this Pi" % var,
+        "custom": "custom tiles (%s)" % var,
+        "osm": "OpenStreetMap standard tiles%s, %s"
+               % (" (colour-inverted)" if inverted and name == "night" else "", _osm_role(by)),
+        "none": "none (plain background)",
+    }.get(src, str(src))
+
+
+def basemap_summary(basemap, notes=()):
+    """One plain-text line saying which basemap each map shows, then the notes, e.g.
+    "Basemap: CARTO Dark Matter (night) / Positron (day), from tiles cached on this Pi."
+    OpenStreetMap is "the key-free fallback" unless basemap["chosen_by"] names the
+    setting that chose it for that map. '' when no map is built yet or ``basemap`` is
+    not a dict (an older daemon). make_status_page.py carries an identical copy (a test
+    keeps the two in step)."""
+    if not isinstance(basemap, dict):
+        return ""
+    night, day = basemap.get("night"), basemap.get("day")
+    inverted = bool(basemap.get("night_inverted"))
+    chosen = basemap.get("chosen_by") if isinstance(basemap.get("chosen_by"), dict) else {}
+    maps = [(m, s, chosen.get(m) if isinstance(chosen.get(m), str) else None)
+            for m, s in (("night", night), ("day", day)) if isinstance(s, str) and s]
+    if not maps:
+        return ""
+    if len(maps) == 2 and maps[0][1:] == maps[1][1:]:
+        if night == "osm":
+            desc = ("OpenStreetMap standard tiles%s, %s"
+                    % (" (night map colour-inverted)" if inverted else "",
+                       _osm_role(maps[0][2])))
+        else:
+            desc = _BOTH_MAPS.get(night, str(night))
+    elif len(maps) == 1:
+        desc = _one_map(maps[0][0], maps[0][1], inverted, maps[0][2])
+    else:
+        desc = "; ".join("%s map: %s" % (m, _one_map(m, s, inverted, b)) for m, s, b in maps)
+    notes = [str(n) for n in (notes if isinstance(notes, (list, tuple)) else ()) if n]
+    return "Basemap: " + desc + "".join("; " + n for n in notes) + "."
+
+
 # ---- poller ----------------------------------------------------------------
 class RadarPoller:
     def __init__(self, cfg, eventlog, overlay_sources=None):
@@ -1354,8 +2060,44 @@ class RadarPoller:
                             source="mrms", result=f"frame {self._ring_streak} of "
                                                   f"{self._trigger_after}",
                             nearest=f"{nearest}km", pixels=count)
+        self._retry_basemaps()
         return {"ok": True, "in_ring": in_ring, "nearest_km": nearest, "count": count,
                 "streak": self._ring_streak, "confirmed": confirmed}
+
+    def _retry_basemaps(self):
+        """Rebuild a basemap whose retry time has come — a missing or incomplete one every
+        BASEMAP_RETRY_SEC, OSM standing in for a rejected CARTO key or a dead custom
+        source every CARTO_REJECT_MEMORY_SEC — or whose region changed (a GPS position
+        adopted after the first build: the adopted site's cached CARTO map is then found).
+        Runs AFTER the frame's verdict is published, so a slow tile server never delays
+        the rain check; the next render shows it."""
+        for t in self._thumbs:
+            due = getattr(t, "basemap_due", None)
+            try:
+                if callable(due) and due():
+                    t._build_basemap()
+            except Exception as e:              # noqa: BLE001 - decoration, never fatal
+                log.warning("radar basemap rebuild failed: %s", redact(e, self.cfg))
+
+    def _basemap_status(self):
+        """(basemap, notes, warnings, attribution) for component(). Only the source names
+        and fixed texts: the CARTO key never reaches the state file, page or /setup. Each
+        map's attributes are read once (_snap): the radar thread may be rebuilding."""
+        by_name = {}
+        for t in self._thumbs:
+            name = getattr(t, "map_name", None)
+            if name in ("night", "day") and name not in by_name:
+                by_name[name] = _snap(t)
+        night, day = by_name.get("night"), by_name.get("day")
+        maps = [s for s in (night, day) if s is not None]
+        basemap = {"night": night.source if night else None,
+                   "day": day.source if day else None,
+                   "night_inverted": bool(night and night.inverted),
+                   # the setting that made OpenStreetMap a map's choice (not the fallback)
+                   "chosen_by": {s.map_name: s.osm_by for s in maps if s.osm_by}}
+        notes, warns = basemap_messages(self.cfg, maps)
+        used = [(s.source, s.tile_url) for s in maps if isinstance(s.source, str)]
+        return basemap, notes, warns, basemap_attribution(self.cfg, used)
 
     def maybe_poll(self, sun_alt, now=None):
         # Radar polls DAY AND NIGHT (unlike WU/GLM): the data is free, daytime rain
@@ -1480,6 +2222,20 @@ class RadarPoller:
             unsafe = deps_available() and (live_unsafe or latched)
             available = deps_available() and fresh
             polling_active = deps_available()      # radar polls day and night
+            try:
+                basemap, notes, warns, attribution = self._basemap_status()
+            except Exception as e:      # noqa: BLE001 - decoration must never break IsSafe
+                # component() runs inside monitor.evaluate(), i.e. on every /issafe: a bug
+                # in the basemap description must cost the page a line, not NINA a 500
+                if not getattr(self, "_basemap_status_failed", False):
+                    self._basemap_status_failed = True
+                    log.warning("radar basemap status unavailable (%s) — reported empty; the "
+                                "rain check is unaffected", redact(e, self.cfg))
+                basemap = {"night": None, "day": None, "night_inverted": False,
+                           "chosen_by": {}}
+                notes, warns = [], []
+                attribution = str(getattr(self.cfg, "RADAR_ATTRIBUTION",
+                                          _config.RADAR_ATTRIBUTION))
             return {
                 # Unsafe on a fresh in-ring frame, OR while the post-rain freeze holds. A stale
                 # frame with no recent detection is "unknown" (available False), no veto.
@@ -1513,7 +2269,13 @@ class RadarPoller:
                 "thumb_path": self.cfg.RADAR_THUMB_PATH,
                 "thumb_path_day": (self.cfg.RADAR_THUMB_PATH_DAY
                                    if self.cfg.RADAR_DAY_ENABLED else None),
-                "attribution": self.cfg.RADAR_ATTRIBUTION,
+                # which basemap each map shows (BASEMAP_SOURCES; None = not built yet /
+                # no day map), what to configure for a better one, and the credit line
+                # for exactly those sources
+                "basemap": basemap,
+                "basemap_notes": notes,
+                "basemap_warnings": warns,      # -> the monitor's "warnings" (no veto)
+                "attribution": attribution,
                 "source": "NOAA/NSSL MRMS composite reflectivity via IEM",
             }
 
@@ -1527,6 +2289,8 @@ def unavailable_component(cfg):
         "nearest_km": None, "pixels": 0, "frame_utc": None, "age_s": None,
         "trigger_km": cfg.RADAR_TRIGGER_KM, "dbz": cfg.RADAR_DBZ, "polling_active": False,
         "thumb_available": False, "thumb_path": cfg.RADAR_THUMB_PATH, "thumb_path_day": None,
-        "attribution": cfg.RADAR_ATTRIBUTION,
+        "basemap": {"night": None, "day": None, "night_inverted": False, "chosen_by": {}},
+        "basemap_notes": [], "basemap_warnings": [],
+        "attribution": basemap_attribution(cfg, []),
         "source": "NOAA/NSSL MRMS composite reflectivity via IEM (disabled)",
     }

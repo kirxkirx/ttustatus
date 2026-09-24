@@ -14,6 +14,7 @@ import threading
 from flask import Flask, jsonify, request
 
 from . import __version__
+from .radar import basemap_summary
 
 ERR_OK = 0
 ERR_NOT_IMPLEMENTED = 0x400
@@ -270,6 +271,16 @@ def _setup_html(monitor, cfg) -> str:
             rv = "no rain within %g km" % rk
         rows.append(row("Radar (MRMS ≤%g km)" % rk, rv, rad.get("safe", True),
                         unknown=rad_unknown))
+    # The radar map's basemap (CARTO / OpenStreetMap / none) and what to configure — the
+    # same line as the status page; absent from an older daemon's component.
+    basemap_line = ""
+    if isinstance(rad, dict) and rad.get("enabled"):
+        line = basemap_summary(rad.get("basemap"), rad.get("basemap_notes"))
+        if line:
+            credit = str(rad.get("attribution") or "")
+            basemap_line = ('<p style="color:#666;font-size:.85em">Radar map &mdash; %s%s</p>'
+                            % (html.escape(line),
+                               " Credit: " + html.escape(credit) if credit else ""))
 
     conn = comp.get("connectivity")
     if conn:
@@ -336,6 +347,7 @@ background:{badge_col}}}code{{background:#f3f3f3;padding:.1rem .3rem}}</style></
 <p><span class="badge">{label}</span></p>
 {reasons}
 <h2>Inputs</h2><table>{''.join(rows)}</table>
+{basemap_line}
 {hazards_html}
 <h2>Recent events</h2><ul>{events}</ul>
 <p>ASCOM Alpaca SafetyMonitor · device {cfg.DEVICE_NUMBER} · IsSafe at

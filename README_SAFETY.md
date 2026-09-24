@@ -73,7 +73,8 @@ extra components in `safety/monitor.py`.
    Then run the daemon with `~/safety-venv/bin/python` instead of `/usr/bin/python3`
    (edit that path in `run_safety_monitor.sh` and the systemd unit's `ExecStart`). A plain
    venv suffices — the daemon needs only flask + waitress + stdlib, not the Pi hardware libs.
-3. Set the WU API key (see the next section), then install the single service:
+3. Fill in `~/ttustatus.env` — the WU API key and a User-Agent with your real e-mail
+   address, optionally a CARTO key (see the next section) — then install the single service:
    ```bash
    sudo ~/ttustatus/deploy/install.sh
    ```
@@ -83,22 +84,39 @@ extra components in `safety/monitor.py`.
    journald): `journalctl -u ttu-safety -f`. Disable the built-in page runner with
    `TTU_SAFETY_PAGE=0` if you prefer to schedule the page yourself.
 
-### The WU API key (required, kept out of git)
+### `ttustatus.env`: the WU API key, the User-Agent contact, the CARTO key (kept out of git)
 
-The key is **not** in the code — set it via the environment. Create a secrets file
+The keys are **not** in the code — set them via the environment. Create a secrets file
 **outside the repo** and point the unit at it:
 
 ```bash
-cp ttustatus.env.example /home/kirx/ttustatus.env   # then edit it and paste your key
+cp ttustatus.env.example /home/kirx/ttustatus.env   # then edit it (see below)
 chmod 600 /home/kirx/ttustatus.env
 sudo systemctl daemon-reload && sudo systemctl restart ttu-safety
 journalctl -u ttu-safety -n 20     # should NOT warn "TTU_SAFETY_WU_KEY is not set"
 ```
 
-`ttustatus.env` contains just `TTU_SAFETY_WU_KEY=<your key>` (systemd `EnvironmentFile`
-format: `KEY=value`, no `export`, no quotes). Only the daemon needs it —
-`make_status_page.py` does not use the key. If the key is unset the daemon still runs
-(sun/humidity protection) but rain polling is disabled and the page shows rain "off".
+`ttustatus.env` holds (systemd `EnvironmentFile` format: `KEY=value`, no `export`; a
+value with spaces, `( )` or `;` goes in double quotes, which systemd and bash both strip):
+
+- `TTU_SAFETY_WU_KEY=<your key>` — required for rain polling (the example file's
+  placeholder value is flagged at startup as a `CONFIG` warning);
+- `TTU_SAFETY_NWS_UA="ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)"`
+  with `you@example.org` replaced by your own address — **absolutely crucial: a REAL
+  e-mail address.** This User-Agent goes with the daemon's NWS, IEM radar, hazard-feed
+  and map-tile requests. OpenStreetMap blocks a placeholder contact such as
+  `you@example.org` (the example file's value, there to be replaced), so with one the
+  daemon requests no OpenStreetMap tiles at all: a radar map with no CARTO basemap
+  (cached on the Pi or fetched with a key) then has **no basemap**. NWS also gets the
+  placeholder as its contact, and it asks for a real one. At startup the log warns about
+  a placeholder (also a `CONFIG` event) or a missing address; the page and `/setup` warn
+  whenever OpenStreetMap is, or would be, used without a real address;
+- `TTU_SAFETY_CARTO_KEY=<key>` — optional, for CARTO radar basemaps (see the radar
+  section).
+
+Only the daemon needs them — `make_status_page.py` uses none of these. If the WU key is
+unset the daemon still runs (sun/humidity protection) but rain polling is disabled and
+the page shows rain "off".
 
 After editing `ttustatus.env`, apply it with `sudo systemctl restart ttu-safety`.
 Quick manual test without systemd: `TTU_SAFETY_WU_KEY=<key> python3 safety_monitor.py`
@@ -165,7 +183,7 @@ The Pi runs 24/7 from an SD card on imperfect power, so every recurring write ma
 | `~/safety_latch.json`, `~/safety_glm_latch.json`, `~/safety_radar_latch.json` | only on rain/lightning events | SD (must survive reboot) |
 | `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning; written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
 | `~/safety_events.log` (audit trail) | only on events | SD (its purpose) |
-| `~/.cache/ttu-radar/` basemaps | once ever (per site and theme; never a partial one, never one with a refused tile) | SD (avoids re-fetching OSM tiles per boot) |
+| `~/.cache/ttu-radar/` basemaps | once ever (per site, theme and source — CARTO or OpenStreetMap; never a partial one, never one with a refused tile) | SD (avoids re-fetching map tiles per boot) |
 | `~/.cache/ttu-hazards/zones/<type>_<ID>.json` (NWS zone outlines), `points_<lat>_<lon>.json` (the site's zones) | once per zone (never re-fetched while the site stays put); the site's zones only if NWS changes them | SD (~200 KB for a three-state event: simplified outlines near the map, bounding boxes far away) |
 
 The hazard information feeds (`safety/hazard_feeds.py`) write nothing at all: their state
@@ -232,7 +250,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_STATE_HEARTBEAT_SEC` | `60` | max interval between unchanged state-file writes (SD-wear throttle) |
 | `TTU_SAFETY_INPUTS_FILE` / `_STATE_FILE` / `_LATCH_FILE` / `_EVENT_LOG` | see `config.py` | file paths |
 | `TTU_SAFETY_NWS` | `1` | enable the NWS forecast component (`0` disables) |
-| `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent NWS asks for (add a contact) |
+| `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent of the NWS, IEM radar, hazard-feed and map-tile requests (WU, GLM and the connectivity probe send their own). **Absolutely crucial: put a REAL e-mail address in it**: `ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)` with `you@example.org` replaced by your own address (double-quoted in `ttustatus.env`). OpenStreetMap blocks a placeholder like `you@example.org` — the daemon then requests no OSM tiles, and a map with no CARTO basemap (cached or keyed) has no basemap — and NWS asks for a contact. The default names the app but has no contact (warned at startup, and on the page when OSM is used) |
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
 | `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min) |
 | `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `45` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour) |
@@ -248,10 +266,12 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR_LATCH_SEC` | `900` | freeze time (s) after the last in-ring echo; clear frames do not cancel it |
 | `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (day and night) |
 | `TTU_SAFETY_RADAR_THUMB` | `/var/www/html/ttu_radar.png` | thumbnail path (beside status.html) |
-| `TTU_SAFETY_RADAR_TILE_URL` | OpenStreetMap standard tiles | night basemap tile template (inverted, see next rows) |
-| `TTU_SAFETY_RADAR_TILE_URL_DAY` | OpenStreetMap standard tiles | day basemap tile template (`TTU_SAFETY_RADAR_DAY=0` to skip) |
-| `TTU_SAFETY_RADAR_TILE_DARK_INVERT` | `1` | night map: invert the lightness of light tiles (hue kept); a dark tile set is left alone |
-| `TTU_SAFETY_RADAR_CACHE` | `~/.cache/ttu-radar` | cached basemaps (tiles fetched once each) |
+| `TTU_SAFETY_RADAR_BASEMAP` | `auto` | basemap chain: `auto` = cached CARTO → CARTO with the key → OpenStreetMap → plain background; `carto` = never OpenStreetMap; `osm` = never CARTO, not even the cached maps (anything else ⇒ `auto`, warned) |
+| `TTU_SAFETY_CARTO_KEY` | (unset) | CARTO Basemaps API key, sent as `?key=` on CARTO tile URLs — a secret: never logged, never on the page, `/setup` or in a file name. Needed only to fetch new CARTO tiles; cached CARTO maps are used without it. Free, no account: request it by e-mail at [carto.com/basemaps/apikey](https://carto.com/basemaps/apikey) (free up to 5M requests/month, non-commercial) |
+| `TTU_SAFETY_RADAR_TILE_URL` | (unset: CARTO Dark Matter) | an explicit tile template (`{z}/{x}/{y}`) for the night map, handled by its host. **A CARTO URL** (any `basemaps.cartocdn.com` subdomain or style) keeps the CARTO rules: its own cached composite, then its tiles only with `TTU_SAFETY_CARTO_KEY` and through the key check — do not put a CARTO key into the URL (one found there is moved out and used as `TTU_SAFETY_CARTO_KEY`, with a `CONFIG` warning). **An OpenStreetMap URL** means OpenStreetMap only for that map, the cached CARTO map not used (with `TTU_SAFETY_RADAR_BASEMAP=carto` it is ignored). **Any other URL** takes CARTO's place in the chain: its own cached composite, then its tiles fetched exactly as given — no key is added, so a keyed non-CARTO service needs its key in the URL (a `key=`, `apikey=` or `token=` value is redacted in logs) — with OpenStreetMap still the fallback in `auto` |
+| `TTU_SAFETY_RADAR_TILE_URL_DAY` | (unset: CARTO Positron) | the same for the day map (`TTU_SAFETY_RADAR_DAY=0` to skip the day map) |
+| `TTU_SAFETY_RADAR_TILE_DARK_INVERT` | `1` | night map from light tiles (OpenStreetMap, a light non-CARTO custom set): invert the lightness of each light tile (hue kept); dark tiles are left alone, and CARTO tiles are never inverted |
+| `TTU_SAFETY_RADAR_CACHE` | `~/.cache/ttu-radar` | cached basemap composites (`basemap_<hash>.png`, one per site, theme and source; tiles fetched once each). The hash also covers `TTU_SAFETY_RADAR_THUMB_PX`, `TTU_SAFETY_RADAR_THUMB_HALF` and `TTU_SAFETY_RADAR_TILE_ZOOM`: changing one of them (or the site) leaves the cached CARTO maps unused. A watermarked CARTO map: remove just that file (README.md shows how to find it in the log) |
 | `TTU_SAFETY_CONN` | `1` | enable the connectivity watchdog (`0` disables) |
 | `TTU_SAFETY_OFFLINE_UNSAFE_SEC` | `3600` | UNSAFE after this long with no internet |
 | `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes |
@@ -304,14 +324,12 @@ silently unavailable (no internet). A response of any kind (even an HTTP error) 
 Every 5 min — **day and night** (the data is free) — the daemon pulls the latest **MRMS composite reflectivity** (NOAA
 via the Iowa Environmental Mesonet, free/no key) and declares **UNSAFE if any echo ≥ 20 dBZ
 is within 30 km** of the dome — a deliberately simple radius, no upwind logic. It also
-renders a **TTU-centered radar thumbnail** (OpenStreetMap tiles, lightness-inverted for
-the night map, **cached to disk so they aren't re-downloaded each cycle**; CARTO's free
-tiles, the former default, now return an "API KEY REQUIRED" watermark, and a tile the
-server marks not cacheable — OSM's "access blocked" tile — is never used) with the **30 km ring** and **10 km / 10 mi scale bars**,
-written beside `status.html`; the observatory page shows it with attribution and a source
-note. **Two versions are rendered — a dark map for the night page style and a light
-(`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches the page's
-day/night toggle.** An echo must appear on **two consecutive polls** (~5 min apart) before
+renders a **TTU-centered radar thumbnail** over a basemap (see *Radar basemap* below) with
+the **30 km ring** and **10 km / 10 mi scale bars**, written beside `status.html`; the
+observatory page shows it with a source note that names the basemap in use and the
+matching attribution. **Two versions are rendered — a dark map for the night page style
+and a light (`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches
+the page's day/night toggle.** An echo must appear on **two consecutive polls** (~5 min apart) before
 it triggers: MRMS composites occasionally carry a one-frame artefact — an aircraft,
 anomalous propagation, ground clutter — and a single frame should not close the dome. The
 first, unconfirmed frame is shown on both pages as *"echo within 30 km — unconfirmed (1 of
@@ -321,6 +339,69 @@ reopen the moment a cell's edge leaves the ring (it also covers the feed going b
 fetch error or stale frame → *unavailable*, which does not veto on its own. The
 slow tile/radar fetch + render runs in its own thread, so it never delays page/monitor
 refresh. Needs Pillow (`sudo apt install python3-pil`); absent → radar disabled.
+
+**Radar basemap: CARTO first, OpenStreetMap as the backup.** The basemap is built once
+per site and map and cached in `~/.cache/ttu-radar/` (`basemap_<hash>.png`), so tiles are
+fetched a handful of times per site, never per poll. Each map (night, day) uses the first
+source that works (`TTU_SAFETY_RADAR_BASEMAP=auto`, the default):
+
+1. **CARTO, cached on the Pi** — CARTO *Dark Matter* at night, *Positron* by day, from a
+   composite already in the cache. The names are the ones the code has always used, so
+   the Pi's CARTO maps cached before CARTO's key requirement keep being used, with no
+   network and no key. A name covers the site and `TTU_SAFETY_RADAR_THUMB_PX`,
+   `TTU_SAFETY_RADAR_THUMB_HALF` and `TTU_SAFETY_RADAR_TILE_ZOOM`: change any of them
+   and the cached CARTO maps are left unused (without a key, the new maps then come
+   from OpenStreetMap). A map drawn before a GPS position was adopted is rebuilt for the
+   adopted site right after the next radar poll.
+2. **CARTO with `TTU_SAFETY_CARTO_KEY`** — only when a key is set (without one, no CARTO
+   tile is ever requested). Since 2026-09 CARTO answers a tile requested without a valid
+   key — none, or a bogus one — with an *"API KEY REQUIRED"* watermark under HTTP 200 and a
+   6-month cache lifetime, so the headers cannot tell. The daemon therefore fetches one
+   probe tile with and without the key first: identical bytes, or a keyed request CARTO
+   refuses (HTTP 401/403), mean the key is not accepted; a failed fetch means it could
+   not be checked. Either way it is logged as an ERROR with the key redacted, shown as a
+   warning on the page and `/setup`, not re-probed for 6 h, and the chain moves on (an
+   unkeyed request CARTO refuses outright only proves that CARTO enforces the key: the
+   keyed tile that came through is then used). An accepted key builds the map from keyed
+   tiles, each compared with its unkeyed twin as well (2 requests per tile, once per
+   site), so a watermarked tile is never drawn; a complete map is cached under the same
+   key-free name as step 1, so the next start is step 1 again, and an incomplete one is
+   retried in 30 min. Keys are free and need no account: request one by e-mail at
+   [carto.com/basemaps/apikey](https://carto.com/basemaps/apikey) (free up to 5M requests
+   a month for non-commercial use).
+3. **OpenStreetMap standard tiles** — key-free, the backup; the night map inverts the
+   tiles' lightness (`TTU_SAFETY_RADAR_TILE_DARK_INVERT`). OSM wants a User-Agent that
+   identifies the app — `TTU_SAFETY_NWS_UA`, **which must carry your real e-mail
+   address** — and blocks a placeholder contact such as `you@example.org` (HTTP 200 with
+   an "access blocked" tile marked not cacheable). With a placeholder UA no OSM tile is
+   requested at all (a composite cached earlier is still used), and a tile the server
+   marks not cacheable is never drawn.
+4. **Nothing** — a plain background, retried every 30 min.
+
+`TTU_SAFETY_RADAR_BASEMAP=carto` runs steps 1, 2, 4 (never OpenStreetMap);
+`=osm` runs 3, 4 (never CARTO, not even the cached maps). A custom
+`TTU_SAFETY_RADAR_TILE_URL` / `_DAY` is handled by its host: another CARTO URL keeps the
+CARTO rules of steps 1-2 (only ever fetched with the key, through the same check — so
+set the key in `TTU_SAFETY_CARTO_KEY`, and do not put a CARTO key into the URL); an
+OpenStreetMap URL means step 3 only for that map; any other URL takes CARTO's place in
+steps 1-2. Only a complete basemap is cached; a map left on OpenStreetMap because the key
+was rejected or the custom source is down is re-checked every 6 h (after an incomplete
+build: every 30 min), so a key activated later is picked up without a restart. The
+status page and `/setup` say which basemap each map shows ("Basemap: CARTO Dark Matter
+(night) / Positron (day), from tiles cached on this Pi", "… fetched with the configured
+CARTO API key", "OpenStreetMap standard tiles (night map colour-inverted), the key-free
+fallback; for CARTO maps set TTU_SAFETY_CARTO_KEY …", or "… as set by
+TTU_SAFETY_RADAR_BASEMAP=osm" when OpenStreetMap was chosen) with short notes on what
+failed, and the attribution follows the maps shown: "© OpenStreetMap contributors, ©
+CARTO" whenever a CARTO map is shown, "© OpenStreetMap contributors" for OpenStreetMap
+alone.
+
+A cached CARTO map that shows the watermark (one built after the key requirement began)
+is removed on its own: the daemon logs the file each map uses (`journalctl -u ttu-safety
+| grep 'basemap loaded from cache'`); move just that file out of `~/.cache/ttu-radar/`
+and `sudo systemctl restart ttu-safety`. Without a CARTO key a removed CARTO map cannot
+be rebuilt from CARTO — it comes back as OpenStreetMap — so keep the good ones
+(`rm ~/.cache/ttu-radar/basemap_*.png` removes **every** cached map).
 
 **Hazard overlays.** Both hazard layers (below) are drawn on the two maps whenever
 something is present — display only: the radar verdict never reads them. They go after

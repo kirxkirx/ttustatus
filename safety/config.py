@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import urllib.parse
 
 # Problems found while parsing the environment. Config is imported before logging is set
 # up, so we collect messages here and server.main() logs them LOUDLY after basicConfig —
@@ -62,6 +64,13 @@ def _clamp(name: str, value, lo, hi=None):
 # Set the TTU_SAFETY_WU_KEY environment variable instead (see README_SAFETY.md). If it's
 # empty, the daemon still runs (sun/humidity protection) but rain polling is disabled.
 WU_API_KEY = _env_str("TTU_SAFETY_WU_KEY", "")
+# ttustatus.env.example's value, copied without editing. Only warned about: the key is
+# still used as given (WU then refuses it and the rain layer reports itself unavailable,
+# exactly as for any other wrong key) — treating it as "unset" would switch rain off.
+WU_KEY_TEMPLATE = "your-weather-underground-pws-api-key-here"
+if WU_API_KEY.strip() == WU_KEY_TEMPLATE:
+    CONFIG_WARNINGS.append("TTU_SAFETY_WU_KEY is still the ttustatus.env.example "
+                           "placeholder — paste your Weather Underground API key")
 
 # --- site coordinates -------------------------------------------------------
 # Priority: TTU_SAFETY_LAT/LON env vars > GPS fix adopted from make_status_page.py's
@@ -130,7 +139,42 @@ CLOCK_SKEW_TOLERANCE_SEC = 5    # future-dated inputs beyond this => also stale
 # fetch error or stale forecast is treated as "unavailable" (does not by itself flip unsafe
 # — it's a forecast, not a local sensor); a breach in a fresh forecast DOES flip unsafe.
 NWS_ENABLED = _env_str("TTU_SAFETY_NWS", "1").strip().lower() not in ("0", "false", "no")
-NWS_USER_AGENT = _env_str("TTU_SAFETY_NWS_UA", "ttu-safety-monitor")  # add a contact via env
+# ONE User-Agent for every request the daemon makes to NWS, IEM, the hazard feeds and the
+# basemap tile servers. Put a REAL contact e-mail in it, e.g.
+#   ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)
+# with you@example.org replaced by YOUR address. NWS uses the contact to reach you about
+# your traffic, and OpenStreetMap (the backup basemap) blocks a User-Agent that carries a
+# placeholder copied from an example, such as you@example.org (checked 2026-09-24: an
+# "access blocked" tile, refused by radar._get) — so no OSM tile is requested with one,
+# and a map with no CARTO basemap (cached or keyed) then has none. The bare default names
+# the app but gives no contact.
+NWS_USER_AGENT = _env_str("TTU_SAFETY_NWS_UA", "ttu-safety-monitor")
+# Placeholder contacts left over from an example (you@example.org, your.name@ttu.edu,
+# CONTACT_EMAIL). Matched case-insensitively. "you@" and "your.name@" count only as a
+# whole local part: zhouyou@ttu.edu is a real address, not a placeholder. (A contact
+# with no "@" at all, such as "<your e-mail>", is not an address: ua_has_real_email.)
+UA_PLACEHOLDER_RE = re.compile(
+    r"example\.(?:org|com|net)\b"
+    r"|(?<![\w.%+-])(?:you|your[._-]?(?:name|e-?mail|address))@"
+    r"|CONTACT_EMAIL", re.IGNORECASE)
+_UA_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+
+
+def ua_has_placeholder(ua) -> bool:
+    """A placeholder contact (you@example.org, CONTACT_EMAIL, ...) in the User-Agent."""
+    return bool(UA_PLACEHOLDER_RE.search(str(ua or "")))
+
+
+def ua_has_real_email(ua) -> bool:
+    """An address-shaped contact that is not a placeholder."""
+    return bool(_UA_EMAIL_RE.search(str(ua or ""))) and not ua_has_placeholder(ua)
+
+
+if ua_has_placeholder(NWS_USER_AGENT):
+    CONFIG_WARNINGS.append(
+        f"TTU_SAFETY_NWS_UA={NWS_USER_AGENT!r} carries a placeholder contact — "
+        "OpenStreetMap blocks such requests, so no OSM basemap tiles are fetched; put your "
+        "real e-mail address in it (NWS asks for a contact too)")
 NWS_GRID = _env_str("TTU_SAFETY_NWS_GRID", "")   # e.g. "LUB/46,41"; empty => resolve via GEOCODE
 NWS_POLL_INTERVAL = _env_int("TTU_SAFETY_NWS_POLL_INTERVAL", 900)     # 15 min
 NWS_STALE_AFTER_MIN = _env_int("TTU_SAFETY_NWS_STALE_MIN", 150)
@@ -163,10 +207,11 @@ GLM_STALE_AFTER_SEC = _env_int("TTU_SAFETY_GLM_STALE_SEC", 900)  # older poll =>
 # Every RADAR_POLL_INTERVAL (DAY AND NIGHT — free data) fetch the latest MRMS composite
 # reflectivity and declare UNSAFE if ANY echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of
 # the observatory. Deliberately simple — a plain 30 km "any rain" ring, no upwind logic.
-# Also renders a TTU-centered radar thumbnail (dark OSM tiles, cached to disk) with the
-# 30 km ring + scale bars for the status page. Needs Pillow (apt: python3-pil); absent =>
-# radar disabled (other layers unaffected). A fetch error/stale frame => unavailable (does
-# not by itself force unsafe); the radar keeps its own post-rain freeze (RADAR_LATCH_SEC).
+# Also renders a TTU-centered radar thumbnail (a CARTO or OpenStreetMap basemap, see the
+# basemap block below, cached to disk) with the 30 km ring + scale bars for the status
+# page. Needs Pillow (apt: python3-pil); absent => radar disabled (other layers
+# unaffected). A fetch error/stale frame => unavailable (does not by itself force
+# unsafe); the radar keeps its own post-rain freeze (RADAR_LATCH_SEC).
 RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "false", "no")
 RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 30.0)
 RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
@@ -201,22 +246,149 @@ RADAR_THUMB_PATH_DAY = _env_str("TTU_SAFETY_RADAR_THUMB_DAY", _day_variant(RADAR
 RADAR_THUMB_HALF_DEG = _env_float("TTU_SAFETY_RADAR_THUMB_HALF", 1.0)  # region half-size
 RADAR_THUMB_PX = _env_int("TTU_SAFETY_RADAR_THUMB_PX", 440)
 RADAR_TILE_ZOOM = _env_int("TTU_SAFETY_RADAR_TILE_ZOOM", 8)
-# Basemap tiles: OpenStreetMap's standard tiles for BOTH maps — the one key-free source
-# with readable town labels. CARTO's free rasters (the former default) now answer every
-# request with an "API KEY REQUIRED" watermark tile under HTTP 200 (checked 2026-09-24),
-# which a new SD card, a cleared cache or a GPS-adopted site move would cache for good.
-# The night map inverts the tiles' lightness instead (RADAR_TILE_DARK_INVERT), as the
-# owner's weather project does. Tiles are fetched once per site and theme (~9 each, the
-# composite cached for good): well within the OSM tile policy, which asks for an
-# identifying User-Agent — TTU_SAFETY_NWS_UA, with a contact.
+# --- radar basemap: CARTO first, OpenStreetMap as the backup ---
+# The basemap is fetched once per site and theme (~9 tiles per map at zoom 8) and the
+# composite is cached in RADAR_CACHE_DIR for good, so tile traffic is a handful of
+# requests per site, not per poll. Each map (night, day) uses the FIRST source that works:
+#  1. A CARTO composite already cached on this Pi (basemap_<hash>.png in RADAR_CACHE_DIR,
+#     the name the code has always given it; on the observatory Pi these predate CARTO's
+#     watermark — a watermarked one is deleted by hand, see README.md): no network at
+#     all. CARTO Dark Matter at night, Positron by day. The <hash> covers the site
+#     (GEOCODE), RADAR_THUMB_HALF_DEG, RADAR_THUMB_PX, RADAR_TILE_ZOOM and the key-free
+#     tile URL: changing any of them leaves the cached CARTO maps unused.
+#  2. CARTO tiles fetched WITH CARTO_API_KEY, only when a key is set (no CARTO tile is
+#     ever requested without one). Since 2026-09 CARTO answers every tile requested
+#     without a valid key (none, or a bogus one) with an "API KEY REQUIRED" watermark
+#     under HTTP 200 and a 6-month Cache-Control, so the headers cannot tell a good tile
+#     from a watermarked one; the bytes can. One probe tile is therefore fetched with
+#     AND without the key first: identical bytes, or a keyed request CARTO refuses (HTTP
+#     401/403), mean the key is not accepted; a failed fetch means it could not be
+#     checked. Either way it is logged (key redacted), shown as a warning, not re-probed
+#     for 6 h, and the chain moves on. Then every other keyed tile is compared with its
+#     unkeyed twin too (the watermark differs per tile), so a watermarked tile — a key
+#     revoked or a quota spent mid-build — is never drawn, let alone cached. A complete
+#     keyed build is cached under the SAME key-free name as step 1 (the key never
+#     reaches a file name, the state file, the page or a log line); an incomplete one is
+#     retried in 30 min.
+#  3. OpenStreetMap standard tiles: key-free, the backup. The OSM tile policy wants a
+#     User-Agent that identifies the app (TTU_SAFETY_NWS_UA, above) and OSM blocks one
+#     with a placeholder contact; with such a UA no OSM tile is requested at all (a
+#     composite cached earlier needs no request and is still used). The night map
+#     inverts the tiles' lightness (RADAR_TILE_DARK_INVERT). Cached like CARTO.
+#  4. Nothing: a plain background; the page says so, and the build is retried every 30 min.
+# RADAR_BASEMAP picks the chain: "auto" = 1-2-3-4, "carto" = 1-2-4 (never OSM),
+# "osm" = 3-4 (never CARTO, not even the cached composites).
+# CARTO keys are free (no account; requested by e-mail at https://carto.com/basemaps/apikey,
+# free up to 5M tile requests a month for non-commercial use); the key is sent as
+# ?key=... on every CARTO tile URL. Required credit: "© OpenStreetMap contributors, © CARTO".
+CARTO_API_KEY = _env_str("TTU_SAFETY_CARTO_KEY", "").strip()   # a SECRET: never logged
+RADAR_BASEMAP = _env_str("TTU_SAFETY_RADAR_BASEMAP", "auto").strip().lower() or "auto"
+if RADAR_BASEMAP not in ("auto", "carto", "osm"):
+    CONFIG_WARNINGS.append(f"TTU_SAFETY_RADAR_BASEMAP={RADAR_BASEMAP!r} is not one of "
+                           "auto / carto / osm — using auto")
+    RADAR_BASEMAP = "auto"
+# These two exact URLs matter beyond fetching: the cached composites of step 1 are named
+# after them (see radar._cache_key), so changing them would orphan the Pi's CARTO maps.
+CARTO_TILE_URL = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"       # night
+CARTO_TILE_URL_DAY = "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"  # day
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-RADAR_TILE_URL = _env_str("TTU_SAFETY_RADAR_TILE_URL", OSM_TILE_URL)       # night map
+# Query parameters that carry an API key in a tile URL (also redacted in every log line).
+KEY_QUERY_PARAMS = ("key", "apikey", "api_key")
+
+
+def tile_host_kind(url) -> str:
+    """What a tile URL's host is, which decides how its tiles are fetched (radar.py):
+    'carto' = basemaps.cartocdn.com and its subdomains (every style, any path: only ever
+    fetched with the key, through the key check of step 2, and never inverted);
+    'osm' = tile.openstreetmap.org / tile.osm.org and their subdomains (the OSM tile
+    policy: the User-Agent check of step 3); 'custom' = anything else."""
+    try:
+        host = (urllib.parse.urlsplit(str(url or "")).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host == "basemaps.cartocdn.com" or host.endswith(".basemaps.cartocdn.com"):
+        return "carto"
+    if host in ("openstreetmap.org", "osm.org") or host.endswith((".openstreetmap.org",
+                                                                  ".osm.org")):
+        return "osm"
+    return "custom"
+
+
+def split_key_param(url):
+    """(the URL without its key= / apikey= / api_key= query parameters, the first such
+    value URL-decoded, or ''). Plain string surgery: a tile template's {z}/{x}/{y} and
+    any other parameter stay exactly as written."""
+    url = str(url or "")
+    base, sep, query = url.partition("?")
+    if not sep:
+        return url, ""
+    kept, key = [], ""
+    for part in query.split("&"):
+        name, _, value = part.partition("=")
+        if name.lower() in KEY_QUERY_PARAMS:
+            key = key or urllib.parse.unquote(value)
+            continue
+        if part:
+            kept.append(part)
+    return base + ("?" + "&".join(kept) if kept else ""), key
+
+
+def _carto_url(var, url):
+    """A CARTO URL with a key written into it (as the docs once advised for keyed
+    services): (the URL without it, the key). CARTO URLs always go through the key check
+    of step 2, whose unkeyed twin and cache name are the key-free URL, so the key is
+    moved out; it serves as TTU_SAFETY_CARTO_KEY when that is unset. Never logged."""
+    if tile_host_kind(url) != "carto":
+        return url, ""
+    bare, key = split_key_param(url)
+    if bare != url:
+        CONFIG_WARNINGS.append(f"{var} has an API key in it — a CARTO key belongs in "
+                               "TTU_SAFETY_CARTO_KEY; the URL is used without it"
+                               + (" and the key as TTU_SAFETY_CARTO_KEY"
+                                  if key and not CARTO_API_KEY else ""))
+    return bare, key
+
+
+# An explicit CUSTOM tile template for a map (TTU_SAFETY_RADAR_TILE_URL / _DAY; unset or
+# empty = the CARTO URL above). How it is used depends on its host (tile_host_kind):
+#  * another CARTO URL (other subdomain or style: dark_nolabels, rastertiles/voyager,
+#    @2x, ...): CARTO rules — its own cached composite, then its tiles fetched ONLY with
+#    the key and through the key check of step 2 (a key written into the URL is moved to
+#    CARTO_API_KEY, see _carto_url); never fetched without a key.
+#  * an OpenStreetMap URL: OpenStreetMap ONLY for that map, even in "auto" (step 3 with
+#    that URL: the cached CARTO maps are not used); in "carto" mode it is ignored and the
+#    map uses the CARTO chain.
+#  * anything else: takes CARTO's place in steps 1-2 (its own cached composite, then its
+#    tiles fetched exactly as given — no key is added, so a keyed non-CARTO service
+#    needs its key written into the URL); OSM stays the fallback in "auto" mode.
+RADAR_TILE_URL, _key_night = _carto_url(
+    "TTU_SAFETY_RADAR_TILE_URL", _env_str("TTU_SAFETY_RADAR_TILE_URL", "").strip()
+    or CARTO_TILE_URL)
 # Daytime (light) version of the map, shown when the status page is in day style.
 RADAR_DAY_ENABLED = _env_str("TTU_SAFETY_RADAR_DAY", "1").strip().lower() not in ("0", "false", "no")
-RADAR_TILE_URL_DAY = _env_str("TTU_SAFETY_RADAR_TILE_URL_DAY", OSM_TILE_URL)  # day map
-# Night map from light tiles: each tile whose mean luminance is light gets its lightness
-# inverted (hue kept: white land turns near-black, black labels white). A dark tile set
-# configured above is left alone, tile by tile.
+RADAR_TILE_URL_DAY, _key_day = _carto_url(
+    "TTU_SAFETY_RADAR_TILE_URL_DAY", _env_str("TTU_SAFETY_RADAR_TILE_URL_DAY", "").strip()
+    or CARTO_TILE_URL_DAY)
+CARTO_API_KEY = CARTO_API_KEY or _key_night or _key_day
+del _key_night, _key_day
+if RADAR_BASEMAP == "osm" and any(
+        tile_host_kind(u) != "osm" and u not in (CARTO_TILE_URL, CARTO_TILE_URL_DAY)
+        for u in (RADAR_TILE_URL, RADAR_TILE_URL_DAY)):
+    CONFIG_WARNINGS.append("TTU_SAFETY_RADAR_BASEMAP=osm: the custom "
+                           "TTU_SAFETY_RADAR_TILE_URL(_DAY) is not used")
+if RADAR_BASEMAP == "osm" and CARTO_API_KEY:
+    CONFIG_WARNINGS.append("TTU_SAFETY_CARTO_KEY is set but TTU_SAFETY_RADAR_BASEMAP=osm: "
+                           "CARTO is never used")
+if RADAR_BASEMAP == "carto" and any(tile_host_kind(u) == "osm"
+                                    for u in (RADAR_TILE_URL, RADAR_TILE_URL_DAY)):
+    CONFIG_WARNINGS.append("TTU_SAFETY_RADAR_BASEMAP=carto: the OpenStreetMap "
+                           "TTU_SAFETY_RADAR_TILE_URL(_DAY) is not used — that map uses "
+                           "the CARTO chain")
+# Night map from light tiles (OpenStreetMap, or a light non-CARTO custom set): each tile
+# whose mean luminance is light gets its lightness inverted (hue kept: white land turns
+# near-black, black labels white). Dark tiles are left alone, tile by tile. CARTO tiles
+# are never inverted: the night map is Dark Matter already, and the cached CARTO
+# composites were built uninverted.
 RADAR_TILE_DARK_INVERT = (_env_str("TTU_SAFETY_RADAR_TILE_DARK_INVERT", "1").strip().lower()
                           not in ("0", "false", "no"))
 RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
@@ -226,10 +398,10 @@ RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cach
 # and lighttpd all follow symlinks out of the box on Debian. Set 0 to write directly.
 RADAR_THUMB_VIA_SHM = (_env_str("TTU_SAFETY_RADAR_THUMB_SHM", "1").strip().lower()
                        not in ("0", "false", "no")) and os.path.isdir("/dev/shm")
-RADAR_ATTRIBUTION = ("© OpenStreetMap contributors"
-                     + (", © CARTO" if "cartocdn" in RADAR_TILE_URL + RADAR_TILE_URL_DAY
-                        else "")
-                     + " · Radar: NOAA/NSSL MRMS via IEM")
+# The radar-data credit. The map's full attribution line is COMPUTED from the basemap
+# actually drawn (radar.basemap_attribution): "© OpenStreetMap contributors, © CARTO"
+# when a CARTO map is shown, "© OpenStreetMap contributors" for OSM alone, then this.
+RADAR_ATTRIBUTION = "Radar: NOAA/NSSL MRMS via IEM"
 # (Persistence note: the radar keeps its OWN post-rain freeze above — it does NOT rely on the
 # WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
 

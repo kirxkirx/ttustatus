@@ -1,6 +1,7 @@
 """Review fixes for the radar map: outline casing adapts to the alert colour, SPC outlook
 holes shared with a higher category are not stroked twice, civil products get their EAS
-level, and the basemap no longer depends on CARTO (API-key watermark tiles since 2026).
+level, and the OpenStreetMap backup basemap (night map inverted, blocked tiles refused).
+The CARTO-first basemap chain itself is tested in test_radar_basemap.py.
 
 Reuses test_radar's helpers (solid-colour basemaps, the real TO.W.0032 / TXZ035 shapes).
 """
@@ -23,10 +24,14 @@ def _theme(theme):
 
 
 # ---- casing -------------------------------------------------------------------------
-@pytest.mark.parametrize("theme", ["dark", "light"])
-def test_every_nws_outline_stands_out_from_the_basemap_once_cased(theme):
+# The casing is chosen against the theme's "base" (OpenStreetMap's median); the rule must
+# also hold on CARTO's maps, whose medians were measured on the TTU tiles (2026-09-24):
+# Dark Matter ~(9, 9, 9), Positron ~(250, 250, 248).
+@pytest.mark.parametrize("theme, base", [
+    ("dark", rd._THEME["dark"]["base"]), ("light", rd._THEME["light"]["base"]),
+    ("dark", (9, 9, 9)), ("light", (250, 250, 248))])
+def test_every_nws_outline_stands_out_from_the_basemap_once_cased(theme, base):
     t = _theme(theme)
-    base = t.colors["base"]
     for event, hexcolor in na.EVENT_COLORS.items():
         rgb = rd._never_green(rd._hex_rgb(hexcolor), rd.KIND_RGB[rd._event_kind(event)])
         casing = t._casing_for(rgb)
@@ -100,11 +105,17 @@ def test_civil_products_fall_back_to_their_eas_level():
 
 
 # ---- basemap -------------------------------------------------------------------------
-def test_default_tiles_need_no_key_and_attribution_matches():
-    assert "cartocdn" not in config.RADAR_TILE_URL + config.RADAR_TILE_URL_DAY
-    assert config.RADAR_TILE_URL == config.RADAR_TILE_URL_DAY == config.OSM_TILE_URL
+def test_default_basemap_is_carto_first_with_osm_as_the_key_free_backup():
+    # the two legacy CARTO URLs (the cached composites are named after them), OSM behind
+    assert config.RADAR_TILE_URL == config.CARTO_TILE_URL \
+        == "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+    assert config.RADAR_TILE_URL_DAY == config.CARTO_TILE_URL_DAY \
+        == "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+    assert config.OSM_TILE_URL == "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    assert config.RADAR_BASEMAP == "auto" and config.CARTO_API_KEY == ""
     assert config.RADAR_TILE_DARK_INVERT is True
-    assert config.RADAR_ATTRIBUTION.startswith("© OpenStreetMap contributors · ")
+    # the static part is the radar credit only; the map credit follows the basemap drawn
+    assert config.RADAR_ATTRIBUTION == "Radar: NOAA/NSSL MRMS via IEM"
 
 
 class _Resp:

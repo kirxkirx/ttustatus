@@ -2914,6 +2914,71 @@ def build_safety_html(state):
             + reasons_html + tiles_head + tiles + events_html + card_close)
 
 
+# ---- radar basemap line -----------------------------------------------------------------
+# The daemon reports which basemap each radar map shows (state components.radar.basemap:
+# "carto-cached" = CARTO tiles cached on the Pi, "carto" = fetched with
+# TTU_SAFETY_CARTO_KEY, "custom-cached"/"custom" = TTU_SAFETY_RADAR_TILE_URL(_DAY),
+# "osm" = OpenStreetMap — the key-free fallback, or the configured choice when "chosen_by"
+# names the setting — "none" = plain background) plus short notes on what to configure.
+# This is a COPY of safety/radar.py's basemap_summary (the page does not import the daemon
+# package); a test keeps the two identical, so the page and /setup always say the same.
+_BASEMAP_BOTH = {
+    "carto-cached": "CARTO Dark Matter (night) / Positron (day), from tiles cached on this Pi",
+    "carto": ("CARTO Dark Matter (night) / Positron (day), fetched with the configured "
+              "CARTO API key"),
+    "custom-cached": "custom tiles (TTU_SAFETY_RADAR_TILE_URL / _DAY), cached on this Pi",
+    "custom": "custom tiles (TTU_SAFETY_RADAR_TILE_URL / _DAY)",
+    "none": "none (plain background)",
+}
+
+
+def _basemap_osm_role(by):
+    return "as set by %s" % by if by else "the key-free fallback"
+
+
+def _basemap_one(name, src, inverted, by=None):
+    style = "Dark Matter" if name == "night" else "Positron"
+    var = "TTU_SAFETY_RADAR_TILE_URL" + ("" if name == "night" else "_DAY")
+    return {
+        "carto-cached": "CARTO %s, from tiles cached on this Pi" % style,
+        "carto": "CARTO %s, fetched with the configured CARTO API key" % style,
+        "custom-cached": "custom tiles (%s), cached on this Pi" % var,
+        "custom": "custom tiles (%s)" % var,
+        "osm": "OpenStreetMap standard tiles%s, %s"
+               % (" (colour-inverted)" if inverted and name == "night" else "",
+                  _basemap_osm_role(by)),
+        "none": "none (plain background)",
+    }.get(src, str(src))
+
+
+def radar_basemap_summary(basemap, notes=()):
+    """'Basemap: ...' in plain text (callers escape it); '' for an older daemon (no
+    basemap dict) or before the first map is built."""
+    if not isinstance(basemap, dict):
+        return ""
+    night, day = basemap.get("night"), basemap.get("day")
+    inverted = bool(basemap.get("night_inverted"))
+    chosen = basemap.get("chosen_by") if isinstance(basemap.get("chosen_by"), dict) else {}
+    maps = [(m, s, chosen.get(m) if isinstance(chosen.get(m), str) else None)
+            for m, s in (("night", night), ("day", day)) if isinstance(s, str) and s]
+    if not maps:
+        return ""
+    if len(maps) == 2 and maps[0][1:] == maps[1][1:]:
+        if night == "osm":
+            desc = ("OpenStreetMap standard tiles%s, %s"
+                    % (" (night map colour-inverted)" if inverted else "",
+                       _basemap_osm_role(maps[0][2])))
+        else:
+            desc = _BASEMAP_BOTH.get(night, str(night))
+    elif len(maps) == 1:
+        desc = _basemap_one(maps[0][0], maps[0][1], inverted, maps[0][2])
+    else:
+        desc = "; ".join("%s map: %s" % (m, _basemap_one(m, s, inverted, b))
+                         for m, s, b in maps)
+    notes = [str(n) for n in (notes if isinstance(notes, (list, tuple)) else ()) if n]
+    return "Basemap: " + desc + "".join("; " + n for n in notes) + "."
+
+
 def build_radar_html(state):
     rad = ((state or {}).get("components", {}) or {}).get("radar")
     if not rad or not rad.get("enabled"):
@@ -2986,7 +3051,7 @@ def build_radar_html(state):
                % html.escape(night_path))
     else:
         img = ('<div class="lede" style="color:var(--muted)">Radar image not available '
-               'yet (generated on the first night-time poll).</div>')
+               'yet (generated on the next radar poll, within 5&nbsp;min).</div>')
 
     frame = html.escape(str(rad.get("frame_utc") or "?"))
     attribution = html.escape(str(rad.get("attribution") or ""))
@@ -3000,6 +3065,12 @@ def build_radar_html(state):
     if isinstance(_comp.get("hazards"), dict) or isinstance(_comp.get("hazard_info"), dict):
         source += (" Active NWS alert areas and other hazards are drawn over the radar when "
                    "present &mdash; the <b>Hazards</b> section below is their key.")
+    # Which basemap the maps actually show (CARTO / OpenStreetMap / none) and what to set
+    # for a better one, as the daemon reports it; an older daemon reports nothing here and
+    # the paragraph stays as it was. The attribution line below follows the same sources.
+    basemap_line = radar_basemap_summary(rad.get("basemap"), rad.get("basemap_notes"))
+    if basemap_line:
+        source += " " + html.escape(basemap_line)
 
     return (
         '  <h2>Radar (MRMS, %g km ring)</h2>\n'

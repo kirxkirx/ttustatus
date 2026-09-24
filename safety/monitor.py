@@ -616,6 +616,14 @@ class SafetyMonitor:
             reasons.append("rain on radar within %g km%s"
                            % (radar["trigger_km"],
                               "" if near is None else " (nearest %g km)" % near))
+        # Basemap configuration problems (a CARTO key CARTO did not accept, a User-Agent
+        # OpenStreetMap blocks or that lacks a contact): shown as warnings, NEVER a veto —
+        # the basemap is decoration, the rain check never reads it.
+        bw = radar.get("basemap_warnings")
+        if isinstance(bw, list):
+            for w in bw:
+                if isinstance(w, str) and w and w not in warnings:
+                    warnings.append(w)
 
         # Connectivity watchdog (loss of internet). HARD veto after the offline threshold.
         if self.conn is not None:

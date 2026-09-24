@@ -171,6 +171,18 @@ def main(argv=None):
         log.warning("CONFIG: %s", w)
         # each message says what is used instead (default, clamped value, kept name)
         eventlog.record("CONFIG", reason=w, result="check configuration")
+    # (a placeholder contact is already a CONFIG warning above)
+    if not cfg.ua_has_real_email(cfg.NWS_USER_AGENT) and not cfg.ua_has_placeholder(
+            cfg.NWS_USER_AGENT):
+        log.warning("TTU_SAFETY_NWS_UA=%r has no contact e-mail — set it to e.g. "
+                    "'ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; "
+                    "you@example.org)' with you@example.org replaced by YOUR real address: "
+                    "NWS asks for a contact, and OpenStreetMap (the backup basemap) wants a "
+                    "User-Agent that identifies the app", cfg.NWS_USER_AGENT)
+    if radar is not None:
+        # which basemap chain runs and whether a key is configured — never the key itself
+        log.info("radar basemap: TTU_SAFETY_RADAR_BASEMAP=%s, CARTO key %s",
+                 cfg.RADAR_BASEMAP, "set" if cfg.CARTO_API_KEY else "not set")
     eventlog.record("STARTUP", detail=f"{cfg.SERVER_NAME} v{cfg.DRIVER_VERSION}",
                     result=f"http {cfg.HTTP_HOST}:{cfg.HTTP_PORT}",
                     site=f"{cfg.GEOCODE[0]},{cfg.GEOCODE[1]} ({cfg.GEOCODE_SOURCE})")
