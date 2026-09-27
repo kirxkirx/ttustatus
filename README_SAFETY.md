@@ -252,7 +252,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent of the NWS, IEM radar, hazard-feed and map-tile requests (WU, GLM and the connectivity probe send their own). **Absolutely crucial: put a REAL e-mail address in it**: `ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)` with `you@example.org` replaced by your own address (double-quoted in `ttustatus.env`). OpenStreetMap blocks a placeholder like `you@example.org` — the daemon then requests no OSM tiles, and a map with no CARTO basemap (cached or keyed) has no basemap — and NWS asks for a contact. The default names the app but has no contact (warned at startup, and on the page when OSM is used) |
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
 | `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min) |
-| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `45` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour) |
+| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `60` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour) |
 | `TTU_SAFETY_GLM` | `1` | enable the GLM lightning component (`0` disables) |
 | `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE |
 | `TTU_SAFETY_GLM_COOLOFF_HOURS` | `0.5` | freeze time (h) after the last nearby flash |
@@ -443,7 +443,7 @@ never forces unsafe on its own; "no flashes" is never proof of safety.
 
 A pre-emptive layer: every 15 min the daemon pulls the free **NWS gridpoint forecast**
 (api.weather.gov, no key) and flags **UNSAFE if THIS hour or NEXT hour** exceeds any of:
-cloud cover > 45%, precip probability > 20%, thunder probability > 15%. A fetch error or a
+cloud cover > 60%, precip probability > 20%, thunder probability > 15%. A fetch error or a
 stale forecast is treated as *unavailable* (does not by itself flip unsafe — it's a
 forecast, not a local sensor); a breach in a fresh forecast does. Both the daemon's
 `/setup` page and the observatory status page show the inputs, the conclusion, and (on the
