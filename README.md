@@ -21,6 +21,17 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
 Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
 **[README_SAFETY.md](README_SAFETY.md)** for the full design and reference.
 
+## Sister projects
+
+- [local-weather-awareness](https://github.com/kirxkirx/local-weather-awareness): local
+  weather pages for any list of US places, from public data: NWS forecasts and alerts, MRMS
+  radar maps, New Mexico emergency road closures. It is derived from this repository (the
+  page style, the MRMS radar and basemap code, the NWS client). Example:
+  https://tau.kirx.net/myweather/.
+- [vlbaweather](https://github.com/kirxkirx/vlbaweather): the weather at the ten VLBA
+  antenna sites, with a GOOD / BAD verdict per antenna that applies this repository's weather
+  cuts to public data. Live page: https://tau.kirx.net/vlbaweather/.
+
 ## Hardware (TTU Skyview deployment)
 
 A **Raspberry Pi** single-board computer running Raspberry Pi OS, on an SD card, with:
@@ -159,3 +170,10 @@ venv/bin/flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety
 CI (GitHub Actions) runs the same on every push. `make_status_page.py` is smoke-tested with
 its Raspberry Pi hardware libraries (`board`, `adafruit_dht`, `gps`, `astropy`) mocked, so it
 lints and its page-rendering functions run without a Pi.
+
+## License
+
+[0BSD](LICENSE), the BSD Zero Clause License: anyone may use, copy, modify and distribute
+this code for any purpose, with or without fee and with no conditions attached; it comes
+without any warranty. The weather data and map tiles it fetches are not covered by this:
+they come from their providers under their own terms.
