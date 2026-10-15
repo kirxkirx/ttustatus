@@ -29,8 +29,8 @@ Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
   page style, the MRMS radar and basemap code, the NWS client). Example:
   https://tau.kirx.net/myweather/.
 - [vlbaweather](https://github.com/kirxkirx/vlbaweather): the weather at the ten VLBA
-  antenna sites, with a GOOD / BAD verdict per antenna that applies this repository's weather
-  cuts to public data. Live page: https://tau.kirx.net/vlbaweather/.
+  antenna sites, the VLA and the GBT, with a GOOD / BAD verdict per site that applies this
+  repository's weather cuts to public data. Live page: https://tau.kirx.net/vlbaweather/.
 
 ## Hardware (TTU Skyview deployment)
 
