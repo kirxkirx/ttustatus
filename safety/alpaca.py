@@ -16,6 +16,9 @@ from flask import Flask, jsonify, request
 from . import __version__
 from .radar import basemap_summary
 
+# The /setup page links to the source code (make_status_page.py has its own SOURCE_URL).
+SOURCE_URL = "https://github.com/kirxkirx/ttustatus"
+
 ERR_OK = 0
 ERR_NOT_IMPLEMENTED = 0x400
 ERR_INVALID_VALUE = 0x401
@@ -335,6 +338,8 @@ def _setup_html(monitor, cfg) -> str:
         reasons += ('<p style="color:#666;font-size:.85em">Site: %s, %s (%s)</p>'
                     % (geo.get("lat"), geo.get("lon"), html.escape(str(geo.get("source")))))
     events = "".join(f"<li>{html.escape(e)}</li>" for e in st.get("events_tail", []))
+    source = '<a href="%s" rel="noopener">%s</a>' % (
+        html.escape(SOURCE_URL), html.escape(SOURCE_URL.split("://", 1)[-1]))
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>{html.escape(cfg.SERVER_NAME)}</title>
@@ -351,7 +356,8 @@ background:{badge_col}}}code{{background:#f3f3f3;padding:.1rem .3rem}}</style></
 {hazards_html}
 <h2>Recent events</h2><ul>{events}</ul>
 <p>ASCOM Alpaca SafetyMonitor · device {cfg.DEVICE_NUMBER} · IsSafe at
-<code>/api/v1/safetymonitor/{cfg.DEVICE_NUMBER}/issafe</code></p>
+<code>/api/v1/safetymonitor/{cfg.DEVICE_NUMBER}/issafe</code><br>
+Source code: {source}</p>
 </body></html>"""
 
 

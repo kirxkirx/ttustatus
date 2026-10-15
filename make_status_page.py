@@ -91,6 +91,10 @@ CACHE_MAX_AGE_GPS = 604800
 REFRESH_SECONDS_DEFAULT = 90
 REFRESH_SECONDS_ENV_VAR = "STATUS_PAGE_INTERVAL"
 
+# The footer links to the source code (a fork points this at its own copy; the /setup
+# page has its own SOURCE_URL in safety/alpaca.py).
+SOURCE_URL = "https://github.com/kirxkirx/ttustatus"
+
 CHRONY_CMD = ["chronyc", "sources", "-v"]
 CHRONY_CMD_STR = "chronyc sources -v"
 
@@ -1816,6 +1820,7 @@ PAGE_CSS = """  body { margin: 0; }
   details .cmdrow { font-size: 13px; color: var(--muted); margin: 6px 0; }
   details .cmdrow code { background: var(--codebg); border: 1px solid var(--line); padding: 2px 6px; border-radius: 4px; }
   .foot { font-size: 12px; color: var(--faint); margin-top: 22px; }
+  .foot a { color: inherit; }
 
   /* hazards section: NWS alerts (the only hazard input that can veto) + info-only feeds.
      Red is kept for borders/badges with white text: red TEXT on the night card is unreadable. */
@@ -4009,7 +4014,8 @@ def write_html(
 
     parts.append(build_details_html(chrony, ntp_info, camera_info))
 
-    parts.append('  <p class="foot">%s</p>\n' % html.escape(footer))
+    parts.append('  <p class="foot">%s<br>Source code: <a href="%s" rel="noopener">%s</a></p>\n' % (
+        html.escape(footer), html.escape(SOURCE_URL), html.escape(SOURCE_URL.split("://", 1)[-1])))
     parts.append('</div>\n</section>\n')
     parts.append('<script>\n')
     parts.append(PAGE_JS)

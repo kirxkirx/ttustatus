@@ -213,3 +213,10 @@ def test_status_json_carries_both_hazard_components(tmp_path, monkeypatch):
     assert body["is_safe"] is False
     assert body["components"]["hazards"]["veto"][0]["event"] == "Tornado Warning"
     assert body["components"]["hazard_info"]["info_only"] is True
+
+
+def test_setup_page_links_to_the_source_code(tmp_path, monkeypatch):
+    c, _ = _client(tmp_path, monkeypatch)
+    page = c.get("/setup").get_data(as_text=True)
+    assert ('<br>\nSource code: <a href="https://github.com/kirxkirx/ttustatus" rel="noopener">'
+            'github.com/kirxkirx/ttustatus</a></p>\n</body></html>') in page

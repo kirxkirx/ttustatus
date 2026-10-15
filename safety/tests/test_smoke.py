@@ -266,3 +266,17 @@ def test_sudo_chronyc_fallback_is_throttled(tmp_path, monkeypatch):
     assert msp.get_chrony_clients_count() is None     # next run, marker fresh
     assert msp.CHRONY_CLIENTS_SUDO_CMD not in calls, \
         "sudo fallback retried within the hour despite a recorded denial"
+
+
+def test_page_footer_links_to_the_source_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(msp, "SAFETY_STATE_FILE", str(tmp_path / "no_state.json"))
+    monkeypatch.setattr(msp, "HTML_VIA_SHM", False)
+    monkeypatch.setattr(msp, "HTML_FILE", str(tmp_path / "status.html"))
+    msp.write_html(20.0, 40.0, "2026-10-15 12:00:00 CDT", "chronyc failed", None, None, None,
+                   None, {"available": False}, False, {"mode": "disabled", "error": None}, None)
+    page = (tmp_path / "status.html").read_text(encoding="utf-8")
+    foot = page[page.rindex('<p class="foot">'):].split("</p>", 1)[0]
+    assert foot.startswith('<p class="foot">Generated 2026-10-15 12:00:00 CDT · ')
+    assert foot.endswith('<br>Source code: <a href="https://github.com/kirxkirx/ttustatus" '
+                         'rel="noopener">github.com/kirxkirx/ttustatus</a>')
+    assert ".foot a { color: inherit; }" in page     # the default blue is unreadable at night
