@@ -1,3 +1,5 @@
+[![CI](https://github.com/kirxkirx/ttustatus/actions/workflows/ci.yml/badge.svg)](https://github.com/kirxkirx/ttustatus/actions/workflows/ci.yml)
+
 # ttustatus
 
 Software running on the observatory Raspberry Pi. Two cooperating pieces:
