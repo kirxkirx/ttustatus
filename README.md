@@ -79,9 +79,11 @@ redraw when the hazard overlays change; like the page, they go to `/dev/shm` beh
 symlink by default — see README_SAFETY.md). The NWS-warning latch
 (`~/safety_hazard_latch.json`) is written only when a vetoing warning starts, changes or
 ends; NWS zone outlines are cached once per zone in `~/.cache/ttu-hazards/`; the hazard
-information feeds keep everything in RAM. Consider `logrotate` (or a
-size cap) for `~/statuspage.log` and `~/safety_monitor.log` if you use the shell
-launchers.
+information feeds keep everything in RAM. The weather log collects its rows in
+`/dev/shm` and appends them to monthly CSV files in `/var/www/html/weather_log/` once a
+day, in daytime, and when the daemon is stopped (README_SAFETY.md, "Weather log").
+Consider `logrotate` (or a size cap) for `~/statuspage.log` and `~/safety_monitor.log` if
+you use the shell launchers.
 
 ## Layout
 
@@ -93,6 +95,8 @@ run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd)
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
   hazard_feeds.py        information-only hazard feeds (HMS, NIFC, SPC, LSR)
+  dew.py                 the dew monitor: Alpaca device 1, the rain-sensor override for the dome driver
+  weatherlog.py          weather log (CSV): collected in RAM, copied to the SD card once a day
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
 ttustatus.env.example    template for the secrets file (WU key, User-Agent contact, CARTO key)
 ```
@@ -160,6 +164,11 @@ only `sudo systemctl restart ttu-safety`; rerun the installer if the unit file c
 
 Then connect NINA to the Alpaca SafetyMonitor (device 0, port 11111). If NINA and the Pi are
 on different subnets, see README_SAFETY.md ("Connecting NINA").
+
+The daemon also serves **device 1, the dew monitor**: a second SafetyMonitor that tells
+the dome driver when a wet rain sensor is dew, so that dew does not close the roof. It
+is for the dome driver, not for NINA. See README_SAFETY.md ("Dew monitor") for the rule
+and ("Weather log") for the downloadable CSV log that goes with it.
 
 ## Develop / test
 

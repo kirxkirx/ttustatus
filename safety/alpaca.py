@@ -4,12 +4,18 @@ Exposes the aggregated verdict as a standard Alpaca SafetyMonitor device (device
 NINA connects natively and reads a single IsSafe boolean. Every reply uses the standard
 envelope with an echoed ClientTransactionID and an incrementing ServerTransactionID. A
 human-readable /setup page (and /status JSON) is served too.
+
+A SECOND standard SafetyMonitor, device 1, is the dew monitor (safety/dew.py): its IsSafe
+means "a WET reading of the dome's rain sensor right now is dew — the rain sensor may be
+ignored". It is for the dome driver, NOT for NINA; it has its own Connected flag, and it
+is absent (no such device) when the dew monitor is switched off.
 """
 from __future__ import annotations
 
 import html
 import re
 import threading
+import time
 
 from flask import Flask, jsonify, request
 
@@ -51,6 +57,19 @@ def create_app(monitor, cfg) -> Flask:
     txn = _Txn()
     dev = cfg.DEVICE_NUMBER
     driver_info = f"{cfg.SERVER_NAME} v{__version__}"
+    # device number -> what a client is told about it and where its IsSafe comes from
+    devices = {dev: {"name": cfg.SERVER_NAME, "info": driver_info,
+                     "unique_id": cfg.UNIQUE_ID, "is_safe": monitor.is_safe}}
+    if getattr(monitor, "dew", None) is not None:
+        def dew_is_safe():
+            monitor.note_dew_read()
+            return monitor.is_dew_safe()
+        devices[cfg.DEW_DEVICE_NUMBER] = {
+            "name": cfg.DEW_SERVER_NAME,
+            "info": (f"{cfg.DEW_SERVER_NAME} v{__version__} - IsSafe means: a WET reading "
+                     "of the dome rain sensor is dew, the rain sensor may be ignored. For "
+                     "the dome driver; NOT an observing-safety monitor, do not use in NINA"),
+            "unique_id": cfg.DEW_UNIQUE_ID, "is_safe": dew_is_safe}
 
     def client_txn() -> int:
         src = request.form if request.method == "PUT" else request.args
@@ -94,22 +113,23 @@ def create_app(monitor, cfg) -> Flask:
     @app.get("/management/v1/configureddevices")
     def configured_devices():
         return ok([
-            {"DeviceName": cfg.SERVER_NAME, "DeviceType": "SafetyMonitor",
-             "DeviceNumber": dev, "UniqueID": cfg.UNIQUE_ID},
-        ])
+            {"DeviceName": d["name"], "DeviceType": "SafetyMonitor",
+             "DeviceNumber": number, "UniqueID": d["unique_id"]}
+            for number, d in sorted(devices.items())])
 
     # --- SafetyMonitor device: GET properties -------------------------------
     @app.get("/api/v1/safetymonitor/<int:d>/<action>")
     def get_prop(d, action):
-        if d != dev:
+        device = devices.get(d)
+        if device is None:
             return fail(ERR_NOT_IMPLEMENTED, "no such device number")
         a = action.lower()
         if a == "connected":
-            return ok(monitor.is_connected())
+            return ok(monitor.is_connected(d))
         if a == "name":
-            return ok(cfg.SERVER_NAME)
+            return ok(device["name"])
         if a in ("description", "driverinfo"):
-            return ok(driver_info)
+            return ok(device["info"])
         if a == "driverversion":
             return ok(cfg.DRIVER_VERSION)
         if a == "interfaceversion":
@@ -117,22 +137,22 @@ def create_app(monitor, cfg) -> Flask:
         if a == "supportedactions":
             return ok([])
         if a == "issafe":
-            if not monitor.is_connected():
+            if not monitor.is_connected(d):
                 return fail(ERR_NOT_CONNECTED, "device not connected")
-            return ok(bool(monitor.is_safe()))
+            return ok(bool(device["is_safe"]()))
         return fail(ERR_NOT_IMPLEMENTED, f"unknown or unsupported property: {action}")
 
     # --- SafetyMonitor device: PUT methods ----------------------------------
     @app.put("/api/v1/safetymonitor/<int:d>/<action>")
     def put_prop(d, action):
-        if d != dev:
+        if d not in devices:
             return fail(ERR_NOT_IMPLEMENTED, "no such device number")
         a = action.lower()
         if a == "connected":
             raw = _ci_get(request.form, "Connected")
             if raw is None:
                 return fail(ERR_INVALID_VALUE, "missing required parameter 'Connected'")
-            monitor.set_connected(str(raw).strip().lower() == "true")
+            monitor.set_connected(str(raw).strip().lower() == "true", d)
             return ok()
         return fail(ERR_NOT_IMPLEMENTED, f"cannot set: {action}")
 
@@ -340,6 +360,8 @@ def _setup_html(monitor, cfg) -> str:
     events = "".join(f"<li>{html.escape(e)}</li>" for e in st.get("events_tail", []))
     source = '<a href="%s" rel="noopener">%s</a>' % (
         html.escape(SOURCE_URL), html.escape(SOURCE_URL.split("://", 1)[-1]))
+    dew_html = _dew_html(st.get("dew"), row)
+    wlog_html = _weather_log_html(st.get("weather_log"))
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>{html.escape(cfg.SERVER_NAME)}</title>
@@ -353,12 +375,110 @@ background:{badge_col}}}code{{background:#f3f3f3;padding:.1rem .3rem}}</style></
 {reasons}
 <h2>Inputs</h2><table>{''.join(rows)}</table>
 {basemap_line}
+{dew_html}
 {hazards_html}
+{wlog_html}
 <h2>Recent events</h2><ul>{events}</ul>
 <p>ASCOM Alpaca SafetyMonitor · device {cfg.DEVICE_NUMBER} · IsSafe at
 <code>/api/v1/safetymonitor/{cfg.DEVICE_NUMBER}/issafe</code><br>
 Source code: {source}</p>
 </body></html>"""
+
+
+# --- dew monitor (device 1) and weather log on /setup ---------------------------------
+def _dew_html(dew, row) -> str:
+    """The device 1 section: what it answers, the answer, and each check with its numbers.
+    Worded as 'rain sensor ignored / trusted' — SAFE/UNSAFE would read as a weather
+    verdict, which this is not."""
+    if not isinstance(dew, dict) or not dew.get("enabled"):
+        return ""
+    th = dew.get("thresholds") if isinstance(dew.get("thresholds"), dict) else {}
+    checks = dew.get("checks") if isinstance(dew.get("checks"), dict) else {}
+    fc = dew.get("forecast") if isinstance(dew.get("forecast"), dict) else {}
+    al = dew.get("alpaca") if isinstance(dew.get("alpaca"), dict) else {}
+    safe = bool(dew.get("is_safe"))
+
+    def num(v, unit, digits=1):
+        return "no data" if not isinstance(v, (int, float)) else "%.*f%s" % (digits, v, unit)
+
+    def lim(key, default):
+        v = th.get(key)
+        return "%g" % (v if isinstance(v, (int, float)) else default)
+
+    def check(key):
+        return checks.get(key) is True, checks.get(key) is None
+
+    rows = []
+    ok, unknown = check("device0")
+    rows.append(row("Safety monitor (device 0)",
+                    "unknown" if unknown else ("SAFE" if ok else "UNSAFE"), ok,
+                    unknown=unknown))
+    ok, unknown = check("spread")
+    rows.append(row("Dew-point spread (WU stations, median)",
+                    "%s of %s station(s) (needs ≤ %s °C)"
+                    % (num(dew.get("spread_c"), " °C"), dew.get("stations_used", 0),
+                       lim("spread_max_c", 5)), ok, unknown=unknown))
+    ok, unknown = check("wind")
+    rows.append(row("Wind (WU stations, median)",
+                    "%s of %s station(s) (calm ≤ %s mph, until above %s mph)"
+                    % (num(dew.get("wind_mph"), " mph"), dew.get("stations_wind", 0),
+                       lim("wind_max_mph", 8), lim("wind_unsafe_above_mph", 9)),
+                    ok, unknown=unknown))
+    ok, unknown = check("cloud")
+    rows.append(row("Forecast cloud cover (this / next hour)",
+                    "%s / %s (needs < %s%%)"
+                    % (num(fc.get("cloud_now"), "%", 0), num(fc.get("cloud_next"), "%", 0),
+                       lim("cloud_below_pct", 30)), ok, unknown=unknown))
+    ok, unknown = check("precip")
+    rows.append(row("Forecast precipitation probability (this / next hour)",
+                    "%s / %s (needs < %s%%)"
+                    % (num(fc.get("precip_now"), "%", 0), num(fc.get("precip_next"), "%", 0),
+                       lim("precip_below_pct", 5)), ok, unknown=unknown))
+    verdict = ("IsSafe = true: rain sensor may be IGNORED (dew likely)" if safe
+               else "IsSafe = false: rain sensor TRUSTED")
+    why = ""
+    if not safe and dew.get("reasons"):
+        why = "<ul>%s</ul>" % "".join("<li>%s</li>" % html.escape(_txt(r, 200))
+                                      for r in dew["reasons"])
+    age = dew.get("last_read_age_s")
+    asked = ("never asked since the daemon started" if not isinstance(age, (int, float))
+             else "last asked %d s ago" % age)
+    number = html.escape(str(al.get("device_number", 1)))
+    return (
+        "<h2>Dew monitor (device %s)</h2>"
+        '<p style="color:#666;font-size:.85em">A second SafetyMonitor for the dome driver, '
+        "not for NINA. Its IsSafe answers: <i>if the dome rain sensor reads WET right now, "
+        "is that dew?</i> True only while every line below holds; missing data counts as "
+        "false.</p>"
+        "<p><b>%s</b></p>%s<table>%s</table>"
+        '<p style="color:#666;font-size:.85em">IsSafe at <code>%s</code> · client %s, %s</p>'
+        % (number, html.escape(verdict), why, "".join(rows),
+           html.escape(str(al.get("issafe_path", "/api/v1/safetymonitor/1/issafe"))),
+           "connected" if dew.get("connected") else "not connected", html.escape(asked)))
+
+
+def _weather_log_html(wl) -> str:
+    if not isinstance(wl, dict) or not wl.get("enabled"):
+        return ""
+    archives = [a for a in wl.get("archives") or [] if isinstance(a, dict)]
+    current = [c for c in wl.get("current") or [] if isinstance(c, dict)]
+    total = wl.get("total_bytes")
+    lines = ["Archive: %s — %d file(s), %s" % (
+        _txt(wl.get("dir"), 200), len(archives),
+        "%.1f MB" % (total / 1048576.0) if isinstance(total, (int, float)) else "size unknown")]
+    lines.append("Not archived yet (in RAM): " + (", ".join(
+        "%s %s row(s)" % (_txt(c.get("name"), 60),
+                          (c.get("rows") or 0) + (c.get("waiting") or 0))
+        for c in current) or "nothing"))
+    last = wl.get("last_flush_ts")
+    if isinstance(last, (int, float)):
+        lines.append("Last archived: %s" % time.strftime("%Y-%m-%d %H:%M:%S",
+                                                         time.localtime(last)))
+    for key, label in (("error", "ARCHIVE NOT WRITTEN"), ("ram_error", "RAM file problem")):
+        if wl.get(key):
+            lines.append("%s: %s" % (label, _txt(wl[key], 200)))
+    return "<h2>Weather log</h2><ul>%s</ul>" % "".join(
+        "<li>%s</li>" % html.escape(ln) for ln in lines)
 
 
 # --- hazards section of /setup ------------------------------------------------------

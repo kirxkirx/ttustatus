@@ -47,6 +47,23 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """An on/off setting that says so when it does not understand its value: 1/true/yes/on
+    and 0/false/no/off/disabled are accepted (any case); unset or empty is the default;
+    anything else is ALSO the default, with a startup warning. (The older switches in
+    this file read every unknown word as "on", silently — not good enough for a switch
+    like TTU_SAFETY_DEW, where `=off` must not leave the thing running.)"""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("1", "true", "yes", "on", "enabled"):
+        return True
+    if raw in ("0", "false", "no", "off", "disabled"):
+        return False
+    if raw:
+        CONFIG_WARNINGS.append(f"{name}={os.environ[name]!r} is not on/off (use 1 or 0) — "
+                               f"using the default ({'on' if default else 'off'})")
+    return default
+
+
 def _clamp(name: str, value, lo, hi=None):
     """Bound a parsed value LOUDLY: an out-of-range setting is corrected with a startup
     warning, never silently obeyed (a 0 s poll interval would hammer api.weather.gov, a
@@ -648,3 +665,94 @@ LOCATION = _env_str("TTU_SAFETY_LOCATION", "TTU Observatory, Lubbock TX")
 UNIQUE_ID = "ttu-safetymonitor-0-9f2a7c31"   # stable per-device id for Alpaca
 DRIVER_VERSION = "0.1.0"
 EVAL_INTERVAL = _env_int("TTU_SAFETY_EVAL_INTERVAL", 30)  # evaluator cadence (s)
+
+# --- dew monitor: a SECOND Alpaca SafetyMonitor (device 1) ------------------
+# Not an observing-safety verdict and NOT for NINA. Its IsSafe answers one question for
+# the dome driver: "if the dome's own rain sensor reads WET right now, is that dew?" —
+# true (rain sensor may be ignored) only while ALL of these hold; anything missing or
+# stale counts as false, so every failure hands control back to the rain sensor:
+#   * the main monitor (device 0) is SAFE;
+#   * dew-point spread (air temperature minus dew point), median of the WU stations,
+#     is at most DEW_SPREAD_MAX_C;
+#   * wind speed, median of the WU stations, is calm: at most DEW_WIND_MAX_MPH, and it
+#     stays "calm" until it exceeds DEW_WIND_UNSAFE_ABOVE_MPH (a small dead band, so
+#     wind hovering at the limit does not flip the answer with every station update);
+#   * the NWS forecast for THIS hour and the NEXT one has cloud cover below
+#     DEW_CLOUD_BELOW_PCT and precipitation probability below DEW_PRECIP_BELOW_PCT.
+# There is no lower spread limit (fog is not treated as dangerous), no delay and no
+# memory. UNITS: the spread is in degrees CELSIUS, the wind limits in MILES PER HOUR
+# (WU reports degF and mph, NWS degC and km/h: every conversion is in safety/dew.py).
+DEW_ENABLED = _env_flag("TTU_SAFETY_DEW", True)
+DEW_DEVICE_NUMBER = 1
+DEW_SERVER_NAME = _env_str("TTU_SAFETY_DEW_NAME", "TTU Dew Monitor")
+DEW_UNIQUE_ID = "ttu-dewmonitor-1-5c81d2e4"     # stable per-device id for Alpaca
+DEW_SPREAD_MAX_C = _clamp("TTU_SAFETY_DEW_SPREAD_MAX_C",
+                          _env_float("TTU_SAFETY_DEW_SPREAD_MAX_C", 5.0), 0.0, 50.0)
+DEW_WIND_MAX_MPH = _clamp("TTU_SAFETY_DEW_WIND_MAX_MPH",
+                          _env_float("TTU_SAFETY_DEW_WIND_MAX_MPH", 8.0), 0.0, 200.0)
+DEW_WIND_UNSAFE_ABOVE_MPH = _clamp(
+    "TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH",
+    _env_float("TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH", 9.0), 0.0, 200.0)
+if DEW_WIND_UNSAFE_ABOVE_MPH < DEW_WIND_MAX_MPH:
+    CONFIG_WARNINGS.append(
+        f"TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH={DEW_WIND_UNSAFE_ABOVE_MPH:g} is below "
+        f"TTU_SAFETY_DEW_WIND_MAX_MPH={DEW_WIND_MAX_MPH:g} — using {DEW_WIND_MAX_MPH:g} "
+        "for both (no dead band)")
+    DEW_WIND_UNSAFE_ABOVE_MPH = DEW_WIND_MAX_MPH
+DEW_CLOUD_BELOW_PCT = _clamp("TTU_SAFETY_DEW_CLOUD_BELOW_PCT",
+                             _env_float("TTU_SAFETY_DEW_CLOUD_BELOW_PCT", 30.0), 0.0, 101.0)
+DEW_PRECIP_BELOW_PCT = _clamp("TTU_SAFETY_DEW_PRECIP_BELOW_PCT",
+                              _env_float("TTU_SAFETY_DEW_PRECIP_BELOW_PCT", 5.0), 0.0, 101.0)
+# Fewer stations with a usable reading than this = no data = rain sensor trusted.
+DEW_MIN_STATIONS = _clamp("TTU_SAFETY_DEW_MIN_STATIONS",
+                          _env_int("TTU_SAFETY_DEW_MIN_STATIONS", 3), 1, 50)
+# A station counts while its latest observation is at most this old (the same limit the
+# rain layer applies to a reading) — so ONE failed WU poll does not flip the answer.
+DEW_OBS_MAX_AGE_MIN = _clamp("TTU_SAFETY_DEW_OBS_MAX_AGE_MIN",
+                             _env_float("TTU_SAFETY_DEW_OBS_MAX_AGE_MIN", float(MAX_OBS_AGE_MIN)),
+                             1.0, 240.0)
+# The forecast counts while the last GOOD download is at most this old. The default
+# tolerates exactly one failed NWS poll (api.weather.gov does hiccup): two poll intervals
+# plus ten minutes. At most 240: a download keeps six hours from its own hour on
+# (nws_forecast.OUTLOOK_HOURS), and the rule needs "this hour and the next" out of them.
+DEW_FORECAST_MAX_AGE_MIN = _clamp(
+    "TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN",
+    _env_float("TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN",
+               min(240.0, 2.0 * NWS_POLL_INTERVAL / 60.0 + 10.0)),
+    1.0, 240.0)
+
+# --- weather log -------------------------------------------------------------
+# What the daemon already knows (station medians, forecast, radar, enclosure sensor, both
+# monitors' verdicts) as CSV rows — the data for tuning the dew monitor. SD-CARD WEAR
+# comes first: rows are appended to files in RAM (WEATHER_LOG_RAM_DIR, /dev/shm) and
+# copied to the SD card in ONE append per file once every WEATHER_LOG_FLUSH_HOURS, in
+# daytime only (sun above WEATHER_LOG_FLUSH_SUN_ABOVE_DEG; with the sun's altitude
+# unknown the copy waits, for at most one further interval) — plus when the daemon is
+# stopped in an orderly way. A power cut loses at most the rows not yet copied.
+WEATHER_LOG_ENABLED = _env_flag("TTU_SAFETY_WEATHER_LOG", True)
+# The archive: monthly files (weather_YYYY-MM.csv, stations_YYYY-MM.csv) ON THE SD CARD,
+# inside the web root so the status page can link to them; it also holds two symlinks to
+# the not-yet-archived RAM files.
+WEATHER_LOG_DIR = _env_str("TTU_SAFETY_WEATHER_LOG_DIR", "/var/www/html/weather_log")
+WEATHER_LOG_RAM_DIR = _env_str("TTU_SAFETY_WEATHER_LOG_RAM_DIR", _SHM + "/ttu_weather_log")
+# One summary row this often, plus one whenever either monitor's verdict changes.
+WEATHER_LOG_INTERVAL_SEC = _clamp("TTU_SAFETY_WEATHER_LOG_INTERVAL",
+                                  _env_int("TTU_SAFETY_WEATHER_LOG_INTERVAL", 300), 30)
+# One row per WU station per WU poll (night only: that is when WU is polled).
+WEATHER_LOG_STATIONS = _env_flag("TTU_SAFETY_WEATHER_LOG_STATIONS", True)
+WEATHER_LOG_FLUSH_HOURS = _clamp("TTU_SAFETY_WEATHER_LOG_FLUSH_HOURS",
+                                 _env_float("TTU_SAFETY_WEATHER_LOG_FLUSH_HOURS", 24.0),
+                                 0.25, 24.0 * 31)
+WEATHER_LOG_FLUSH_SUN_ABOVE_DEG = _env_float("TTU_SAFETY_WEATHER_LOG_FLUSH_SUN_ABOVE", 0.0)
+# Growth cap for the archive: when the files together exceed this, the OLDEST months are
+# deleted (never the current month). At roughly 0.2 MB a day the default 6 GB is decades;
+# it is a guarantee, not a routine.
+WEATHER_LOG_MAX_MB = _clamp("TTU_SAFETY_WEATHER_LOG_MAX_MB",
+                            _env_float("TTU_SAFETY_WEATHER_LOG_MAX_MB", 6144.0), 1.0)
+# RAM limits: above the first the files are archived at once (day or night); above the
+# second — the archive has been failing for weeks — the oldest unarchived rows are dropped.
+WEATHER_LOG_RAM_FLUSH_MB = _clamp("TTU_SAFETY_WEATHER_LOG_RAM_FLUSH_MB",
+                                  _env_float("TTU_SAFETY_WEATHER_LOG_RAM_FLUSH_MB", 8.0), 0.01)
+WEATHER_LOG_RAM_MAX_MB = _clamp("TTU_SAFETY_WEATHER_LOG_RAM_MAX_MB",
+                                _env_float("TTU_SAFETY_WEATHER_LOG_RAM_MAX_MB", 32.0),
+                                WEATHER_LOG_RAM_FLUSH_MB)

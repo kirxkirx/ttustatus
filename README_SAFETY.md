@@ -5,6 +5,11 @@ alongside `make_status_page.py`. It aggregates several inputs into a single `IsS
 boolean that NINA (and any Alpaca client) can read, and the status page shows the same
 information plus the recent safety-event log.
 
+The same daemon serves a second SafetyMonitor, **device 1, the dew monitor**, for the dome
+driver only (it tells the driver when a wet rain sensor is dew: see
+[Dew monitor](#dew-monitor-alpaca-device-1)), and keeps a
+[weather log](#weather-log) for tuning it.
+
 ## Architecture (two cooperating processes)
 
 `make_status_page.py` is **ephemeral** (spawned every 90 s by the daemon), so the
@@ -12,7 +17,8 @@ persistent Alpaca server and the rain poller live in a **separate long-running d
 `safety_monitor.py`. They share small JSON files:
 
 ```
-make_status_page.py  --writes-->  /dev/shm/safety_inputs.json  (sun altitude, humidity)
+make_status_page.py  --writes-->  /dev/shm/safety_inputs.json  (sun altitude, humidity,
+                                                                enclosure temperature)
 safety_monitor.py    --reads--/
 safety_monitor.py    --writes-->  /dev/shm/safety_state.json   (IsSafe + inputs + events)
 make_status_page.py  --reads--/   (renders the "Safety monitor" page section)
@@ -49,6 +55,147 @@ reboot keeps it.
 
 More inputs (cloud sensor, ceilometer, radar, plate-solve failures) can be added later as
 extra components in `safety/monitor.py`.
+
+## Dew monitor (Alpaca device 1)
+
+**The problem.** The dome's own rain sensor is a bare plate under the night sky. On a
+clear, calm, humid night dew forms on it, it reads WET, and the dome controller closes the
+roof in perfectly good weather. The dome driver ([merlino-dome](https://github.com/kirxkirx/merlino-dome))
+can ignore its rain sensor, but it has to be told when that is reasonable, and the
+weather knowledge is here.
+
+**The answer** is a second, entirely standard Alpaca SafetyMonitor on the same address and
+port, **device number 1**. The dome driver polls it like any other SafetyMonitor:
+
+| `IsSafe` of device 1 | Meaning | Status page shows |
+|---|---|---|
+| `true` | a WET reading of the rain sensor right now is dew: **the rain sensor may be ignored** | RAIN SENSOR IGNORED |
+| `false` | **trust the rain sensor** (the normal state) | RAIN SENSOR TRUSTED |
+
+It is **not an observing-safety verdict and must not be selected in NINA**: on a clear,
+windy night it reads `false` although observing is perfectly safe. Selected by mistake it
+errs to the cautious side, because it can never be `true` while device 0 is not. It never
+opens or closes anything; `false` only hands the decision back to the rain sensor.
+
+`IsSafe(1) = true` only while **all** of these hold:
+
+| Check | Limit | Data |
+|---|---|---|
+| The main monitor | device 0 is SAFE | this daemon (every rain, lightning, radar, forecast and daylight check above) |
+| Dew-point spread (air temperature minus dew point) | **at most 5 °C** | median of the WU stations |
+| Wind speed | calm: **at most 8 mph**, and it stays "calm" until the wind is **above 9 mph** | median of the WU stations |
+| Forecast cloud cover | **below 30 %**, this hour and the next | NWS gridpoint forecast |
+| Forecast precipitation probability | **below 5 %**, this hour and the next | NWS gridpoint forecast |
+
+Deliberately simple: there is no lower limit on the spread (fog is not treated as
+dangerous to the equipment), no delay before the answer turns true and no memory of
+earlier dew. The only state is the 8–9 mph dead band, so wind hovering at the limit does
+not flip the answer with every station update; after a restart the wind must be seen at
+8 mph or below once.
+
+**Why spread, and why wind.** The plate radiates to the sky and runs a few degrees colder
+than the air, so it collects dew once the spread is smaller than that cooling, long
+before the air is saturated (5 °C of spread is roughly 70 % relative humidity). Wind keeps
+the plate at air temperature. The humidity sensor of the main monitor cannot be used for
+this: it sits inside the enclosure.
+
+**Units.** The spread limit is in degrees Celsius and the wind limits are in miles per
+hour. WU reports °F and mph, NWS °C and km/h; every conversion is in `safety/dew.py`
+(a temperature *difference* converts without the 32° offset), and the tests pin them.
+
+**Missing data is `false`.** Each of these alone gives "trust the rain sensor":
+
+- fewer than 3 stations (`TTU_SAFETY_DEW_MIN_STATIONS`) with a fresh temperature and dew
+  point, or fewer than 3 with a fresh wind reading. A station counts while its latest
+  observation is at most 30 min old, so one failed WU poll changes nothing; a station
+  without a hygrometer or an anemometer simply does not count for that check, and
+  neither does an implausible value (a failed sensor's −99.9 and the like, a dew point
+  well above the temperature) or an observation time-stamped in the future;
+- no forecast: the last good NWS download is older than 40 min (two poll intervals plus
+  ten minutes, so one failed download is tolerated), or it lacks a value for one of the
+  two hours;
+- daytime: WU is polled only when the sun is below 5°, and device 0 is UNSAFE anyway;
+- the dew monitor itself failing. Whatever goes wrong in it, device 0 is unaffected.
+
+**Where to see it.** The status page has a "Dew monitor" card with each check's number
+and limit and, while the answer is `false`, the reasons. It also shows whether the dome
+driver is connected and when it last asked. `/setup` has the same as a table, and
+`/status` (JSON) carries it under `dew`. Changes of the verdict go to the daemon log
+(`journalctl -u ttu-safety | grep 'dew monitor'`) and, with all the numbers behind them,
+to the weather log; they are not written to `~/safety_events.log`, which is on the SD
+card.
+
+- IsSafe: `http://<pi>:11111/api/v1/safetymonitor/1/issafe` (after `PUT .../1/connected`
+  with `Connected=true`; device 1 has its own Connected flag)
+- Switch it off with `TTU_SAFETY_DEW=0`: device 1 then does not exist, and a driver
+  polling it gets an error and keeps trusting its rain sensor.
+
+The thresholds are a first guess to be checked against the weather log. On 8 November
+2026 the roof was closed by dew at 22:07 local; Lubbock airport reported 4.4 °C of spread
+and 4.6 mph of wind at 21:53, but also broken cirrus at 25,000 ft. So on nights like that
+one, compare the logged `fc_cloud_pct` with the 30 % limit.
+
+## Weather log
+
+For every moment of a night, the log records the numbers the two verdicts were made
+from. Nothing is fetched for it: these are data the daemon already has.
+
+Two CSV tables, each file starting with a header line:
+
+- **weather**: one row every 5 min, plus one at once whenever the verdict of device 0 or
+  device 1 changes (column `event`: `interval`, `device0`, `device1`, `start`). Columns:
+  UTC and local time, sun altitude, both verdicts (`safe0`, `safe1`), the station medians
+  device 1 used (`spread_c`, `wind_mph`, `gust_mph`, `temp_c`, `dewpoint_c`, `rh_pct`) and
+  how many stations they come from, each device 1 check (`check_spread`, `check_wind`,
+  `check_cloud`, `check_precip`: 1 passes, 0 fails, blank = no data), the forecast for
+  this hour and the next (`fc_cloud_pct`, `fc_precip_pct`, `fc_temp_c`, `fc_dewpoint_c`,
+  `fc_wind_mph`, ...), rain latch, radar and lightning state, the enclosure sensor
+  (`encl_temp_c`, `encl_rh_pct`) and both lists of reasons.
+- **stations**: one row per WU station per WU poll (temperature, dew point, spread,
+  humidity, wind, gust, rain rate, distance, age of the observation), to see which
+  stations are representative of the site. WU is polled at night only, so there are no
+  daytime rows.
+
+Units are in the column names: temperatures in °C, wind in mph, the rain rate in inches
+per hour as WU reports it. The forecast wind arrives in km/h and is logged in mph.
+
+**Download.** The status page has a "Weather log" block with links to every file; the
+directory is inside the web root:
+
+```
+/var/www/html/weather_log/
+  weather_2026-11.csv   stations_2026-11.csv     one pair per month (UTC), on the SD card
+  weather_current.csv   stations_current.csv     the rows not archived yet (symlinks into /dev/shm)
+```
+
+**SD-card wear.** Rows are appended to files in RAM (`/dev/shm/ttu_weather_log/`). A
+separate thread copies them to the SD card in one append per monthly file:
+
+- once every 24 h (`TTU_SAFETY_WEATHER_LOG_FLUSH_HOURS`), and only while the sun is above
+  the horizon. If the sun's altitude is not known (the page script is down, or the first
+  minute after a reboot) it waits, for at most a further 24 h;
+- when the daemon is stopped in an orderly way: `systemctl stop` / `restart` and a reboot
+  send SIGTERM, which the daemon now handles;
+- at once, day or night, if the RAM files ever exceed 8 MB (a normal day is about
+  0.2 MB).
+
+A crash or restart of the daemon loses nothing, because `/dev/shm` survives it. A power
+cut loses the rows not copied yet, at most a day. The copy is all-or-nothing and never
+duplicates rows, even if the daemon is killed in the middle: a run that did not finish
+is rolled back and repeated, and a row torn by a power cut at the end of a file is cut
+off before the next append.
+
+If the archive cannot be written (the daemon's user must be able to create
+`/var/www/html/weather_log`), the page and `/setup` say so, the rows stay in RAM and the
+copy is retried every 10 min in daytime; beyond 32 MB of RAM the oldest unarchived rows
+are dropped.
+
+**Growth limit.** When the archive exceeds 6 GB (`TTU_SAFETY_WEATHER_LOG_MAX_MB`) the
+oldest months are deleted, never the current one, with a `WEATHER-LOG` line in the event
+log. At about 0.2 MB a day that is decades away; the limit is a guarantee, not a routine.
+
+If a later version changes the columns in the middle of a month, that month continues in
+`weather_2026-11_b.csv`, so every file stays one consistent table.
 
 ## Deploy on the Pi
 
@@ -182,6 +329,8 @@ The Pi runs 24/7 from an SD card on imperfect power, so every recurring write ma
 | `~/safety_latch.json`, `~/safety_glm_latch.json`, `~/safety_radar_latch.json` | only on rain/lightning events | SD (must survive reboot) |
 | `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning; written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
 | `~/safety_events.log` (audit trail) | only on events | SD (its purpose) |
+| `/dev/shm/ttu_weather_log/` (weather-log rows not archived yet) | every 5 min, plus every WU poll | RAM |
+| `/var/www/html/weather_log/*.csv` (weather-log archive) | one append per monthly file every 24 h, in daytime, and when the daemon is stopped | SD (its purpose; about 0.2 MB a day) |
 | `~/.cache/ttu-radar/` basemaps | once ever (per site, theme and source — CARTO or OpenStreetMap; never a partial one, never one with a refused tile) | SD (avoids re-fetching map tiles per boot) |
 | `~/.cache/ttu-hazards/zones/<type>_<ID>.json` (NWS zone outlines), `points_<lat>_<lon>.json` (the site's zones) | once per zone (never re-fetched while the site stays put); the site's zones only if NWS changes them | SD (~200 KB for a three-state event: simplified outlines near the map, bounding boxes far away) |
 
@@ -224,6 +373,10 @@ Equipment → Safety Monitor → **ASCOM Alpaca**. Discovery (UDP 32227) should 
 `TTU Safety Monitor`; otherwise enter the Pi's IP and port **11111**, device **0**.
 Then in the Advanced Sequencer add the **"Unsafe" trigger** (park mount / close dome) so
 NINA reacts automatically.
+
+Discovery also lists `TTU Dew Monitor` (device **1**). **Do not select it in NINA**: it is
+the rain-sensor override for the dome driver, not a weather verdict (see
+[Dew monitor](#dew-monitor-alpaca-device-1)).
 
 - IsSafe:   `http://<pi>:11111/api/v1/safetymonitor/0/issafe`
 - Setup/status page: `http://<pi>:11111/setup`   ·   debug JSON: `/status`
@@ -287,6 +440,23 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_HAZARD_FEEDS` | `1` | enable the information-only hazard feeds (`0` disables them) |
 | `TTU_SAFETY_HAZARD_FEEDS_POLL_SEC` | `600` | information-feed cadence (min 60; each feed also has its own minimum, see below) |
 | `TTU_SAFETY_HAZARD_LSR_HOURS` | `24` | storm-report look-back, hours (1-168) |
+| `TTU_SAFETY_DEW` | `1` | enable the dew monitor, Alpaca device 1 (`0` or `off`: no such device; a value that is neither on nor off is reported at startup and the default is used) |
+| `TTU_SAFETY_DEW_SPREAD_MAX_C` | `5` | dew-point spread limit, **degrees Celsius**: true only at or below |
+| `TTU_SAFETY_DEW_WIND_MAX_MPH` / `_WIND_UNSAFE_ABOVE_MPH` | `8` / `9` | wind limits, **miles per hour**: calm at or below the first, no longer calm above the second (set them equal for no dead band) |
+| `TTU_SAFETY_DEW_CLOUD_BELOW_PCT` / `_PRECIP_BELOW_PCT` | `30` / `5` | forecast cloud cover and precipitation probability must be **below** these, this hour and the next |
+| `TTU_SAFETY_DEW_MIN_STATIONS` | `3` | WU stations needed for the spread median, and for the wind median |
+| `TTU_SAFETY_DEW_OBS_MAX_AGE_MIN` | `30` | a station's observation counts this long |
+| `TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN` | `40` | the last good NWS download counts this long (two poll intervals + 10 min; at most 240) |
+| `TTU_SAFETY_DEW_NAME` | `TTU Dew Monitor` | Alpaca name of device 1 |
+| `TTU_SAFETY_WEATHER_LOG` | `1` | enable the weather log (`0` disables it) |
+| `TTU_SAFETY_WEATHER_LOG_DIR` | `/var/www/html/weather_log` | the archive, on the SD card; inside the web root so the page can link to it |
+| `TTU_SAFETY_WEATHER_LOG_RAM_DIR` | `/dev/shm/ttu_weather_log` | where rows wait in RAM |
+| `TTU_SAFETY_WEATHER_LOG_INTERVAL` | `300` | seconds between summary rows (min 30) |
+| `TTU_SAFETY_WEATHER_LOG_STATIONS` | `1` | also log one row per WU station per poll |
+| `TTU_SAFETY_WEATHER_LOG_FLUSH_HOURS` | `24` | hours between copies to the SD card |
+| `TTU_SAFETY_WEATHER_LOG_FLUSH_SUN_ABOVE` | `0` | copy only while the sun is above this altitude (degrees) |
+| `TTU_SAFETY_WEATHER_LOG_MAX_MB` | `6144` | archive size limit; above it the oldest months are deleted |
+| `TTU_SAFETY_WEATHER_LOG_RAM_FLUSH_MB` / `_RAM_MAX_MB` | `8` / `32` | RAM size that forces a copy at once / beyond which the oldest unarchived rows are dropped |
 
 Out-of-range hazard settings are corrected to the nearest allowed value, with a warning
 at startup (log + `CONFIG` event).
@@ -305,6 +475,8 @@ defaults; when deploying this change, update the page and the daemon together (a
 pair fails safe: the daemon just sees missing inputs and reports UNSAFE until both match).
 Make sure the user running the page loop can write `/var/www/html` (e.g.
 `sudo chown kirx /var/www/html`), and consider logrotate for the shell-launcher logs.
+The daemon needs the same right to create `/var/www/html/weather_log` for the weather
+log.
 
 ### Connectivity watchdog
 

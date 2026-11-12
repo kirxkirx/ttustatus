@@ -9,6 +9,8 @@ Threads:
                    veto, every HAZARD_POINT_POLL_SEC) and area query (map + list).
   * hazard-feeds — every ~60 s: if due, the INFORMATION-ONLY hazard feeds (smoke, fires,
                    SPC, storm reports).
+  * weather-log  — every ~60 s: if due (once a day, in daytime), copy the weather-log
+                   rows collected in RAM to the SD card. The only thread that does.
   * discovery    — UDP responder so NINA can auto-find us.
   * main thread  — waitress serving the Alpaca HTTP API.
 """
@@ -25,12 +27,14 @@ import time
 from . import config, discovery, glm_lightning, radar as radar_mod
 from .alpaca import create_app
 from .connectivity import ConnectivityWatch
+from .dew import DewMonitor
 from .eventlog import EventLog
 from .monitor import (HAZARD_FEEDS_IMPORT_ERROR, NWS_ALERTS_IMPORT_ERROR, RainPoller,
                       SafetyMonitor, hazard_feeds, nws_alerts)
 from .nws_forecast import NwsForecastPoller
 from .glm_lightning import GlmLightningPoller
 from .radar import RadarPoller
+from .weatherlog import WeatherLog
 
 log = logging.getLogger("ttu.safety")
 
@@ -138,6 +142,43 @@ def build_hazard_layers(cfg, eventlog, errors=None):
     return hazards, hazard_info
 
 
+def _make_optional(factory, label, eventlog, consequence):
+    """Create the dew monitor or the weather log, or report why not and return None:
+    neither may ever keep the daemon — and with it IsSafe — from starting."""
+    try:
+        return factory()
+    except Exception as e:  # noqa: BLE001
+        log.error("%s could not be created (%s: %s) — %s", label, type(e).__name__, e,
+                  consequence, exc_info=True)
+        eventlog.record("CONFIG", reason=f"{label} failed: {type(e).__name__}: {e}",
+                        result=consequence)
+        return None
+
+
+def install_sigterm_handler():
+    """Turn SIGTERM (systemctl stop / restart, a reboot) into the same orderly exit as
+    Ctrl-C, so main()'s `finally` runs: without it the process just dies, and the
+    weather-log rows still in RAM would be lost on every reboot. Returns True if the
+    handler was installed (only possible in the main thread)."""
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+        return True
+    except (ValueError, OSError, AttributeError):
+        return False
+
+
+def ignore_stop_signals():
+    """Ignore further SIGTERM / SIGINT (used once the shutdown has begun)."""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError, AttributeError):
+            pass                        # not the main thread: nothing to protect from
+
+
 def overlay_sources(*layers):
     """The zero-arg overlay callables the radar map draws (each layer's overlays())."""
     return [layer.overlays for layer in layers
@@ -162,10 +203,19 @@ def main(argv=None):
     radar = (RadarPoller(cfg, eventlog, overlay_sources=sources or None)
              if cfg.RADAR_ENABLED else None)
     conn = ConnectivityWatch(cfg) if cfg.CONN_ENABLED else None   # monotonic-internal
+    # Alpaca device 1 (the dew monitor) and the weather log: neither is an input of IsSafe.
+    dew = (_make_optional(lambda: DewMonitor(cfg), "dew monitor", eventlog,
+                          "Alpaca device %d absent — the dome keeps trusting its rain "
+                          "sensor" % cfg.DEW_DEVICE_NUMBER)
+           if cfg.DEW_ENABLED else None)
+    weatherlog = (_make_optional(lambda: WeatherLog(cfg, eventlog), "weather log", eventlog,
+                                 "no weather log (IsSafe unaffected)")
+                  if cfg.WEATHER_LOG_ENABLED else None)
     monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn,
                             hazards=hazards, hazard_feeds=hazard_info,
                             hazards_error=layer_errors.get("hazards"),
-                            hazard_feeds_error=layer_errors.get("hazard_info"))
+                            hazard_feeds_error=layer_errors.get("hazard_info"),
+                            dew=dew, weatherlog=weatherlog)
 
     for w in cfg.CONFIG_WARNINGS:
         log.warning("CONFIG: %s", w)
@@ -233,7 +283,8 @@ def main(argv=None):
                                  step, step / 86400.0)
                     eventlog.record("CLOCK-STEP", reason=f"{step:+.0f}s",
                                     result="latches re-checked, all layers re-polled")
-                    for comp in (poller, nws, glm, radar, hazards, hazard_info):
+                    for comp in (poller, nws, glm, radar, hazards, hazard_info, dew,
+                                 weatherlog):
                         if comp is not None:
                             try:
                                 comp.clock_stepped(last_wall, wall)
@@ -299,6 +350,20 @@ def main(argv=None):
                 log.exception("hazard feeds poll failed")
             stop.wait(HAZARD_FEEDS_LOOP_WAKE_SEC)
 
+    def weatherlog_loop():
+        # The ONLY place the weather log touches the SD card: the evaluator and the HTTP
+        # threads just append rows to RAM. Due once a day, in daytime (see weatherlog.py).
+        try:
+            weatherlog.prepare()
+        except Exception:
+            log.exception("weather log start-up failed")
+        while not stop.is_set():
+            try:
+                weatherlog.maybe_flush(_fresh_sun(monitor, cfg), time.time())
+            except Exception:
+                log.exception("weather log archive run failed")
+            stop.wait(60)
+
     def conn_loop():
         # Probe internet reachability day and night so the "offline > 1 h" clock is accurate.
         while not stop.is_set():
@@ -346,6 +411,24 @@ def main(argv=None):
         _start_thread(conn_loop, "conn-probe")
     else:
         log.warning("connectivity watchdog disabled (TTU_SAFETY_CONN=0)")
+    if dew is not None:
+        log.info("dew monitor: Alpaca SafetyMonitor device %d — IsSafe while device %d is "
+                 "SAFE, spread <= %g degC, wind <= %g mph (until > %g mph), forecast cloud "
+                 "< %g%% and precipitation probability < %g%% this hour and next",
+                 cfg.DEW_DEVICE_NUMBER, cfg.DEVICE_NUMBER, cfg.DEW_SPREAD_MAX_C,
+                 cfg.DEW_WIND_MAX_MPH, cfg.DEW_WIND_UNSAFE_ABOVE_MPH,
+                 cfg.DEW_CLOUD_BELOW_PCT, cfg.DEW_PRECIP_BELOW_PCT)
+    elif not cfg.DEW_ENABLED:
+        log.warning("dew monitor disabled (TTU_SAFETY_DEW=0) — no Alpaca device %d",
+                    cfg.DEW_DEVICE_NUMBER)
+    if weatherlog is not None:
+        _start_thread(weatherlog_loop, "weather-log")
+        log.info("weather log: a row every %d s in RAM (%s), archived to %s every %g h in "
+                 "daytime and on shutdown, at most %g MB kept",
+                 cfg.WEATHER_LOG_INTERVAL_SEC, cfg.WEATHER_LOG_RAM_DIR, cfg.WEATHER_LOG_DIR,
+                 cfg.WEATHER_LOG_FLUSH_HOURS, cfg.WEATHER_LOG_MAX_MB)
+    elif not cfg.WEATHER_LOG_ENABLED:
+        log.warning("weather log disabled (TTU_SAFETY_WEATHER_LOG=0)")
     if cfg.PAGE_ENABLED:
         _start_thread(page_loop, "page-runner")
         log.info("status page runner: %s every %ds", cfg.PAGE_SCRIPT, cfg.PAGE_INTERVAL)
@@ -356,6 +439,9 @@ def main(argv=None):
     app = create_app(monitor, cfg)
     log.info("Serving Alpaca SafetyMonitor on http://%s:%d (device %d)",
              cfg.HTTP_HOST, cfg.HTTP_PORT, cfg.DEVICE_NUMBER)
+    if not install_sigterm_handler():
+        log.warning("could not install the SIGTERM handler — a `systemctl stop` will not "
+                    "archive the weather-log rows still in RAM")
     try:
         from waitress import serve
         serve(app, host=cfg.HTTP_HOST, port=cfg.HTTP_PORT, threads=8)
@@ -363,6 +449,17 @@ def main(argv=None):
         pass
     finally:
         stop.set()
+        # From here on a second SIGTERM / Ctrl-C (an impatient `systemctl stop`, a double
+        # Ctrl-C) must not interrupt the last write: it would abandon the archive run
+        # below half-way, and a reboot would then lose those rows.
+        ignore_stop_signals()
+        if weatherlog is not None:
+            # an orderly stop: what is in RAM goes to the SD card now, day or night
+            # (a reboot would wipe /dev/shm)
+            try:
+                weatherlog.flush("shutdown")
+            except Exception:
+                log.exception("weather log could not be archived at shutdown")
         eventlog.record("SHUTDOWN")
 
 

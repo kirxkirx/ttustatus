@@ -88,6 +88,11 @@ def daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "HAZARD_CACHE_DIR", str(tmp_path / "zones"))
     for flag in ("NWS_ENABLED", "GLM_ENABLED", "CONN_ENABLED", "PAGE_ENABLED"):
         monkeypatch.setattr(config, flag, False)
+    # main() must not reach the real /dev/shm, the web root or this process's signal
+    # handlers (the weather log and SIGTERM wiring have their own tests)
+    monkeypatch.setattr(config, "WEATHER_LOG_ENABLED", False)
+    monkeypatch.setattr(server, "install_sigterm_handler", lambda: True)
+    monkeypatch.setattr(server, "ignore_stop_signals", lambda: None)
     monkeypatch.setattr(config, "RADAR_ENABLED", True)
     monkeypatch.setattr(server, "nws_alerts", types.SimpleNamespace(NwsAlertsPoller=_Alerts))
     monkeypatch.setattr(server, "hazard_feeds",

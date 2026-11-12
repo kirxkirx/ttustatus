@@ -24,8 +24,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from . import (connectivity as conn_mod, glm_lightning, nws_forecast,
-               radar as radar_mod, wu_poll)
+from . import (connectivity as conn_mod, dew as dew_mod, glm_lightning, nws_forecast,
+               radar as radar_mod, weatherlog as weatherlog_mod, wu_poll)
 
 log = logging.getLogger("ttu.safety.monitor")
 
@@ -461,7 +461,7 @@ class SafetyMonitor:
 
     def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None, radar=None,
                  conn=None, hazards=None, hazard_feeds=None, hazards_error=None,
-                 hazard_feeds_error=None):
+                 hazard_feeds_error=None, dew=None, weatherlog=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
@@ -480,9 +480,16 @@ class SafetyMonitor:
         self._last_veto: list = []
         self._last_veto_ts = None
         self._comp_err_logged: dict = {}   # component name -> (message, monotonic ts)
+        # The dew monitor (Alpaca device 1, safety/dew.py) and the weather log. Neither
+        # is an input of IsSafe: device 1 only READS the verdict made here, and the log
+        # only records. None = switched off.
+        self.dew = dew                  # DewMonitor or None
+        self.weatherlog = weatherlog    # WeatherLog or None
+        self._last_dew_safe = None      # for transition logging
+        self._dew_last_read = None      # monotonic time a client last read IsSafe(1)
         self._lock = threading.Lock()
         self._eval_lock = threading.Lock()   # serialize whole evaluations
-        self._connected = False
+        self._connected: dict = {}      # Alpaca device number -> its Connected flag
         # Fail-safe start: assume humidity-unsafe until a fresh reading below the clear
         # threshold proves otherwise (the in-memory hysteresis latch isn't persisted, so
         # a restart in the 93-95% hold band must not silently report safe).
@@ -508,6 +515,9 @@ class SafetyMonitor:
         return {"sun_alt": _finite(d.get("sun_altitude_deg")),
                 "humidity": _finite(d.get("humidity_pct")),
                 "humidity_age_s": _finite(d.get("humidity_age_s")),
+                # enclosure temperature, same DHT reading as the humidity (weather log
+                # only; absent from an older page script)
+                "temperature": _finite(d.get("temperature_c")),
                 "lat": _finite(d.get("lat")), "lon": _finite(d.get("lon")),
                 "ts": ts, "age": age}
 
@@ -661,6 +671,11 @@ class SafetyMonitor:
                        and glm_safe and radar_safe and conn_safe and hazards_safe
                        and not stale)
 
+        # Device 1, the dew monitor. It comes AFTER the decision above and is no part of
+        # it: it reads is_safe, never the other way round (tests pin this).
+        outlook = self._forecast_outlook(now)
+        dew = self._dew_component(is_safe, rain, outlook, now)
+
         state = {
             "ts": now,
             "is_safe": is_safe,
@@ -672,6 +687,10 @@ class SafetyMonitor:
                 "name": self.cfg.SERVER_NAME,
                 "issafe_path": f"/api/v1/safetymonitor/{self.cfg.DEVICE_NUMBER}/issafe",
             },
+            # Alpaca device 1: "a WET rain-sensor reading right now is dew". Kept apart
+            # from "components" on purpose — it is not one of this monitor's inputs.
+            "dew": dew,
+            "weather_log": self._weatherlog_status(),
             "reasons": [] if is_safe else reasons,
             "warnings": warnings,       # visible but non-vetoing (e.g. GPS/config mismatch)
             "geocode": {"lat": self.cfg.GEOCODE[0], "lon": self.cfg.GEOCODE[1],
@@ -697,10 +716,106 @@ class SafetyMonitor:
         }
 
         self._log_transition(is_safe, reasons)
+        self._log_dew_transition(dew)
         with self._lock:
             self._state = state
         self._maybe_write_state(state, now)
+        if self.weatherlog is not None:
+            # RAM only. The enclosure reading is logged only while it is current (the
+            # same staleness rule as the humidity check above). observe() catches its
+            # own errors; the guard here is for a log object broken beyond that — the
+            # verdict above is already made and must be returned whatever happens.
+            try:
+                current = inp is not None and not stale and humidity is not None
+                self.weatherlog.observe(state, now, outlook=outlook, inputs={
+                    "temperature": inp.get("temperature") if current else None,
+                    "humidity": humidity if current else None})
+            except Exception as e:
+                self._log_component_error("weather_log", e)
         return state
+
+    # -- dew monitor (Alpaca device 1) and weather log ---------------------------
+    def _forecast_outlook(self, now):
+        """NwsForecastPoller.outlook() for the dew monitor and the weather log, or None
+        (forecast layer off, or a poller without it)."""
+        fn = getattr(self.nws, "outlook", None)
+        if not callable(fn):
+            return None
+        try:
+            out = fn(now, self.cfg.DEW_FORECAST_MAX_AGE_MIN * 60.0)
+            if not isinstance(out, dict):
+                raise TypeError("outlook is %s, not a dict" % type(out).__name__)
+            return out
+        except Exception as e:
+            self._log_component_error("forecast outlook", e)
+            return {"available": False, "why": "forecast outlook error: %s" % str(e)[:120],
+                    "age_s": None, "this_hour": None, "next_hour": None}
+
+    def _dew_component(self, is_safe, rain, outlook, now) -> dict:
+        """The device 1 block of the state. Whatever goes wrong in there, the answer is
+        'not safe' = the rain sensor is trusted — and IsSafe (device 0) is unaffected."""
+        cfg = self.cfg
+        if self.dew is None:
+            comp = dew_mod.unavailable_component(cfg)
+        else:
+            try:
+                self.dew.update_stations(rain.get("results"), now)
+                comp = self.dew.evaluate(is_safe, outlook, now)
+                if not isinstance(comp, dict) or not isinstance(comp.get("is_safe"), bool):
+                    raise TypeError("malformed dew component (%s)" % type(comp).__name__)
+                comp = _json_clean(comp)
+            except Exception as e:
+                self._log_component_error("dew", e)
+                comp = dew_mod.unavailable_component(
+                    cfg, "dew monitor error: %s" % str(e)[:200])
+                comp["enabled"] = True
+        with self._lock:
+            read = self._dew_last_read
+        comp["connected"] = self.is_connected(cfg.DEW_DEVICE_NUMBER)
+        # how long ago a client (the dome driver) last asked: tells the operator, from
+        # this side, whether the driver is polling at all
+        comp["last_read_age_s"] = None if read is None else round(time.monotonic() - read)
+        comp["alpaca"] = {
+            "device_number": cfg.DEW_DEVICE_NUMBER, "name": cfg.DEW_SERVER_NAME,
+            "issafe_path": f"/api/v1/safetymonitor/{cfg.DEW_DEVICE_NUMBER}/issafe"}
+        return comp
+
+    def _log_dew_transition(self, dew) -> None:
+        """A line in the daemon log when the device 1 verdict changes. Deliberately NOT
+        an event-log record: that file is on the SD card, and this verdict may change
+        several times a night. The weather log (RAM) has every change with its inputs."""
+        if self.dew is None:
+            return
+        value = bool(dew.get("is_safe"))
+        with self._lock:
+            prev, self._last_dew_safe = self._last_dew_safe, value
+        if prev is value:
+            return
+        try:
+            if value:
+                def n(key):
+                    v = _finite(dew.get(key))
+                    return "?" if v is None else "%.1f" % v
+                log.info("dew monitor (device %d): SAFE — dew likely, the rain sensor may "
+                         "be ignored (spread %s °C, wind %s mph)",
+                         self.cfg.DEW_DEVICE_NUMBER, n("spread_c"), n("wind_mph"))
+            else:
+                reasons = dew.get("reasons")
+                reasons = reasons if isinstance(reasons, (list, tuple)) else []
+                log.info("dew monitor (device %d): UNSAFE — rain sensor trusted (%s)",
+                         self.cfg.DEW_DEVICE_NUMBER,
+                         "; ".join(str(r) for r in reasons) or "no reason given")
+        except Exception as e:      # a log line must never cost an evaluation
+            self._log_component_error("dew transition log", e)
+
+    def _weatherlog_status(self) -> dict:
+        if self.weatherlog is None:
+            return weatherlog_mod.unavailable_status()
+        try:
+            return _json_clean(self.weatherlog.status())
+        except Exception as e:
+            self._log_component_error("weather_log", e)
+            return weatherlog_mod.unavailable_status("weather log error: %s" % str(e)[:200])
 
     # -- hazard layers ---------------------------------------------------------
     def _hazards_component(self, now) -> dict:
@@ -796,9 +911,13 @@ class SafetyMonitor:
         needs writing when the DECISION changed, or as a slow heartbeat so the status
         page's staleness gate still sees a live daemon."""
         hz = state["components"].get("hazards") or {}
+        dew = state.get("dew") or {}
         sig = json.dumps({
             "is_safe": state["is_safe"], "reasons": state["reasons"],
             "warnings": state["warnings"], "connected": state["connected"],
+            # the device 1 verdict (and whether the dome driver is connected to it) is
+            # shown on the page: written at once when it changes
+            "dew": (dew.get("is_safe"), dew.get("connected"), dew.get("reasons")),
             "comp": {k: (c.get("safe"), c.get("latched"), c.get("available"),
                          c.get("enabled")) for k, c in state["components"].items()},
             # a change in WHICH warnings veto (or their end time: an extension) is written
@@ -806,8 +925,11 @@ class SafetyMonitor:
             "hazard_veto": sorted("%s|%s" % (v.get("key"), v.get("end_ts"))
                                   for v in hz.get("veto") or [] if isinstance(v, dict)),
         }, sort_keys=True)
+        # (0 <= : after the clock steps BACK the difference is negative for the length of
+        # the step — without the lower bound no heartbeat was written all that time, and
+        # the file on disk stayed dated in the future, which the page reads as "fresh")
         if (sig == self._last_state_sig
-                and (now - self._last_state_write) < self.cfg.STATE_WRITE_HEARTBEAT_SEC):
+                and 0 <= (now - self._last_state_write) < self.cfg.STATE_WRITE_HEARTBEAT_SEC):
             return
         self._last_state_sig = sig
         self._last_state_write = now
@@ -881,14 +1003,25 @@ class SafetyMonitor:
     def is_safe(self) -> bool:
         return self.evaluate()["is_safe"]
 
+    def is_dew_safe(self) -> bool:
+        """IsSafe of Alpaca device 1 (see safety/dew.py). False whenever in doubt."""
+        return bool((self.evaluate().get("dew") or {}).get("is_safe"))
+
+    def note_dew_read(self) -> None:
+        """A client read IsSafe(1) just now (shown on the status page)."""
+        with self._lock:
+            self._dew_last_read = time.monotonic()
+
     def state(self) -> dict:
         with self._lock:
             return dict(self._state)
 
-    def set_connected(self, value: bool):
+    def set_connected(self, value: bool, device=None):
+        """The Alpaca Connected flag of one device (default: the main monitor)."""
         with self._lock:
-            self._connected = bool(value)
+            self._connected[self.cfg.DEVICE_NUMBER if device is None else device] = bool(value)
 
-    def is_connected(self) -> bool:
+    def is_connected(self, device=None) -> bool:
         with self._lock:
-            return self._connected
+            return bool(self._connected.get(
+                self.cfg.DEVICE_NUMBER if device is None else device, False))

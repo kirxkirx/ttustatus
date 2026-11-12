@@ -36,8 +36,20 @@ WANTED = {
     "wind_speed_kmh": "windSpeed",
     "wind_dir_deg": "windDirection",
     "temp_c": "temperature",
+    # carried for the weather log only (the dew monitor takes spread and wind from the
+    # WU stations): degC, percent, km/h — the grid's own units, as for wind_speed_kmh
+    "dewpoint_c": "dewpoint",
+    "rh_pct": "relativeHumidity",
+    "wind_gust_kmh": "windGust",
 }
 _SAFETY_VIEW = ("cloud_cover_pct", "precip_prob_pct", "thunder_prob_pct", "qpf_mm")
+# The series added for the weather log. The main monitor never reads them, so a malformed
+# one must not be able to make the whole download "malformed" (which would take the
+# forecast the main monitor DOES read away with it): on any error it is simply absent.
+LOG_ONLY = ("dewpoint_c", "rh_pct", "wind_gust_kmh")
+# Hours kept (from the hour of the download on) for outlook(): enough to find "this hour
+# and the next" by the clock for as long as a download may stay in use.
+OUTLOOK_HOURS = 6
 
 
 def _iso(t):
@@ -62,6 +74,13 @@ def _expand(series):
         for k in range(_dur_hours(dur)):
             out[start + timedelta(hours=k)] = it["value"]
     return out
+
+
+def _expand_log_only(series):
+    try:
+        return _expand(series)
+    except Exception:  # noqa: BLE001 — information only
+        return {}
 
 
 def _get(url, ua):
@@ -108,7 +127,8 @@ def fetch(cfg):
     try:
         now = datetime.now(timezone.utc)
         hour0 = now.replace(minute=0, second=0, microsecond=0)
-        maps = {k: _expand(p.get(prop)) for k, prop in WANTED.items()}
+        maps = {k: (_expand_log_only if k in LOG_ONLY else _expand)(p.get(prop))
+                for k, prop in WANTED.items()}
 
         def at(h):
             return {k: maps[k].get(h) for k in WANTED}
@@ -132,6 +152,9 @@ def fetch(cfg):
             "now_hour": at(hour0),
             "next_hour": at(hour0 + timedelta(hours=1)),
             "hours": hours,
+            # for outlook(): the hour of the download and the hours from it on
+            "hour0_ts": hour0.timestamp(),
+            "outlook_hours": [at(hour0 + timedelta(hours=k)) for k in range(OUTLOOK_HOURS)],
         }
     except Exception as e:  # noqa: BLE001 — any malformed payload = unavailable
         return {"ok": False, "error": f"malformed forecast payload: {e!r}"}
@@ -178,12 +201,15 @@ class NwsForecastPoller:
         self.cfg = cfg
         self._lock = threading.Lock()
         self._latest = None
+        self._last_good = None          # the last ok download (see outlook())
         self._last_poll_ts = None
 
     def poll_now(self, now_ts=None):
         res = fetch(self.cfg)
         with self._lock:
             self._latest = res
+            if res.get("ok"):
+                self._last_good = res
             self._last_poll_ts = time.time() if now_ts is None else now_ts
         if res.get("ok"):
             log.info("NWS forecast updated (grid %s, age %s min)",
@@ -207,6 +233,51 @@ class NwsForecastPoller:
     def clock_stepped(self, pre_now: float, post_now: float) -> None:
         with self._lock:
             self._last_poll_ts = None       # re-fetch under the corrected clock
+            self._last_good = None          # its hours were picked under the wrong clock
+
+    def outlook(self, now=None, max_age_s=None) -> dict:
+        """The forecast for the hour that contains `now` and for the hour after it, from
+        the last GOOD download — for the dew monitor and the weather log.
+
+        Two differences from component(), whose now_hour / next_hour feed the main
+        monitor: the hours are found by the clock (component() keeps the two hours of the
+        moment of the download), and one failed poll does not blank it — the last good
+        download stays in use until it is max_age_s old (default: two poll intervals).
+        Anything else — no download yet, too old, a forecast NWS stopped updating, hours
+        it does not cover — is "not available", with the reason in 'why'. Each hour is a
+        dict of every WANTED key (None where the grid has no value)."""
+        if now is None:
+            now = time.time()
+        if max_age_s is None:
+            max_age_s = 2 * self.cfg.NWS_POLL_INTERVAL
+        with self._lock:
+            res = self._last_good
+        out = {"available": False, "why": None, "age_s": None, "update_time": None,
+               "grid": None, "this_hour": None, "next_hour": None}
+        if not res:
+            out["why"] = "no forecast downloaded yet"
+            return out
+        fetched, hour0 = res.get("fetched_ts"), res.get("hour0_ts")
+        hours = res.get("outlook_hours") or []
+        out["update_time"], out["grid"] = res.get("update_time"), res.get("grid")
+        if fetched is None or hour0 is None:
+            out["why"] = "forecast download has no timestamp"
+            return out
+        age = now - fetched
+        out["age_s"] = round(age)
+        if age > max_age_s or age < -120.0:
+            out["why"] = "last good forecast download is %d min old" % round(age / 60.0)
+            return out
+        issued = res.get("age_min")         # the forecast's own age when downloaded
+        if issued is None or issued > self.cfg.NWS_STALE_AFTER_MIN or issued < -2.0:
+            out["why"] = "forecast is stale (NWS has not updated it)"
+            return out
+        k = int((now - hour0) // 3600)
+        if k < 0 or k + 1 >= len(hours):
+            out["why"] = "forecast download does not cover this hour and the next"
+            return out
+        out.update(available=True, this_hour=dict(hours[k]), next_hour=dict(hours[k + 1]))
+        return out
 
     def component(self, now=None):
         with self._lock:

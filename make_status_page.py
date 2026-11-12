@@ -2587,7 +2587,7 @@ def build_details_html(chrony_raw, ntp_info, camera_info):
 
 
 def write_safety_inputs(sun_info, humidity, humidity_age_s=None, gps_data=None,
-                        gps_source=None):
+                        gps_source=None, temperature=None):
     alt = None
     if sun_info is not None:
         alt = sun_info.get("sun_altitude_deg")
@@ -2598,6 +2598,9 @@ def write_safety_inputs(sun_info, humidity, humidity_age_s=None, gps_data=None,
         # real age of the humidity measurement (cache fallback), so the daemon's
         # staleness fail-safe judges the reading, not just this file's timestamp
         "humidity_age_s": humidity_age_s,
+        # the same DHT reading's temperature (deg C, INSIDE the enclosure): only for the
+        # daemon's weather log, never part of the safety decision
+        "temperature_c": temperature,
     }
     # the daemon adopts these once at startup when TTU_SAFETY_LAT/LON are unset
     # (rounded to ~1 km there, so GPS jitter never re-derives grids/tiles/stations)
@@ -3884,6 +3887,278 @@ def build_forecast_html(state):
     )
 
 
+# ---- dew monitor (Alpaca device 1) -------------------------------------------------------
+# The daemon's second SafetyMonitor (safety/dew.py; state key "dew"): its IsSafe tells the
+# dome driver that a WET reading of the dome's rain sensor would be dew. Shown as "rain
+# sensor ignored / trusted" — never as SAFE / UNSAFE, which would read as a weather verdict.
+_DEW_IGNORED_BG = "#a2620d"       # amber: a protection is being bypassed
+_DEW_TRUSTED_BG = "#57606a"       # neutral: the normal state
+
+
+def _dew_num(v, digits=1):
+    """A finite number as text, or None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return "%.*f" % (digits, v)
+
+
+def build_dew_html(state):
+    dew = state.get("dew") if isinstance(state, dict) else None
+    if not isinstance(dew, dict) or not dew.get("enabled"):
+        return ""           # daemon down (its own card says so), older daemon, or off
+    th = dew.get("thresholds") if isinstance(dew.get("thresholds"), dict) else {}
+    checks = dew.get("checks") if isinstance(dew.get("checks"), dict) else {}
+    fc = dew.get("forecast") if isinstance(dew.get("forecast"), dict) else {}
+    al = dew.get("alpaca") if isinstance(dew.get("alpaca"), dict) else {}
+    ts = state.get("ts")
+    age = (time.time() - ts) if _dew_num(ts) is not None else None
+    # (a state dated in the future is not "fresh" either: the clock stepped, or the file
+    # is not what it seems)
+    stale = age is None or not (-60 <= age <= SAFETY_STATE_STALE_SEC)
+    ignored = dew.get("is_safe") is True and not stale
+
+    def lim(key, default):
+        v = th.get(key)
+        return "%g" % (v if _dew_num(v) is not None else default)
+
+    def sub(key, text):
+        if stale:
+            return safety_dot_html(False, unknown=True) + "state stale &mdash; last known"
+        ok = checks.get(key)
+        return safety_dot_html(ok is True, unknown=ok is None) + text
+
+    def value(text, unit=""):
+        if text is None:
+            return '<div class="v mono">N/A</div>'
+        return '<div class="v mono">%s%s</div>' % (
+            text, '<span class="u">%s</span>' % unit if unit else "")
+
+    def pair(a, b):
+        a, b = _dew_num(a, 0), _dew_num(b, 0)
+        if a is None and b is None:
+            return '<div class="v mono">N/A</div>'
+        return ('<div class="v mono" style="font-size:17px;line-height:1.35">now %s<br>'
+                'next %s</div>' % ("?" if a is None else a + "%", "?" if b is None else b + "%"))
+
+    n_used = dew.get("stations_used") if isinstance(dew.get("stations_used"), int) else 0
+    n_wind = dew.get("stations_wind") if isinstance(dew.get("stations_wind"), int) else 0
+    # a median of too few stations is not what the rule used: do not show it as a value
+    spread = _dew_num(dew.get("spread_c")) if checks.get("spread") is not None else None
+    wind = _dew_num(dew.get("wind_mph")) if checks.get("wind") is not None else None
+    items = [
+        ("Safety monitor",
+         value(None if checks.get("device0") is None
+               else ("SAFE" if checks.get("device0") is True else "UNSAFE")),
+         sub("device0", "device 0 must be SAFE")),
+        ("Dew-point spread", value(spread, "°C"),
+         sub("spread", "needs &le; %s °C &middot; %d station%s"
+             % (lim("spread_max_c", 5), n_used, "" if n_used == 1 else "s"))),
+        ("Wind", value(wind, "mph"),
+         sub("wind", "calm &le; %s mph, until &gt; %s &middot; %d station%s"
+             % (lim("wind_max_mph", 8), lim("wind_unsafe_above_mph", 9), n_wind,
+                "" if n_wind == 1 else "s"))),
+        ("Forecast cloud", pair(fc.get("cloud_now"), fc.get("cloud_next")),
+         sub("cloud", "needs &lt; %s%% this and next hour" % lim("cloud_below_pct", 30))),
+        ("Forecast precip.", pair(fc.get("precip_now"), fc.get("precip_next")),
+         sub("precip", "needs &lt; %s%% this and next hour" % lim("precip_below_pct", 5))),
+    ]
+    tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
+            '      <div class="s">%s</div>\n    </div>\n')
+    tiles = ('  <div class="tiles" style="grid-template-columns:'
+             'repeat(auto-fit,minmax(170px,1fr));margin-bottom:0">\n'
+             + "".join(tile % it for it in items) + '  </div>\n')
+
+    if stale:
+        bg, label = "#a2620d", "STALE"
+        detail = "no current state from the safety daemon"
+    elif ignored:
+        bg, label = _DEW_IGNORED_BG, "RAIN SENSOR IGNORED"
+        detail = ("dew is likely: a WET reading of the dome's rain sensor is treated as "
+                  "dew, not rain")
+    else:
+        bg, label = _DEW_TRUSTED_BG, "RAIN SENSOR TRUSTED"
+        detail = "normal: the dome acts on its own rain sensor"
+    badge = ('<span style="padding:.35rem .9rem;border-radius:8px;font-weight:700;'
+             'letter-spacing:.03em;color:#fff;background:%s">%s</span>' % (bg, label))
+    head = ('    <div style="display:flex;justify-content:space-between;'
+            'align-items:center;gap:12px;flex-wrap:wrap">\n'
+            '      <h2 style="margin:0">Dew monitor (rain-sensor override)</h2>\n'
+            '      %s\n    </div>\n' % badge)
+    line = 'style="margin:4px 0 10px;font-size:12.5px;color:var(--muted)"'
+    mono = 'style="font-family:ui-monospace,Consolas,monospace"'
+    asked = dew.get("last_read_age_s")
+    if stale:
+        client = "dome driver: unknown"
+    elif not dew.get("connected"):
+        client = "dome driver not connected"
+    elif _dew_num(asked) is None:
+        client = "dome driver connected"
+    else:
+        client = "dome driver last asked %s ago" % format_age_short(asked)
+    endpoint = ('    <div %s>%s &middot; ASCOM Alpaca SafetyMonitor device %s &middot; '
+                'IsSafe: <span %s>%s</span> &middot; %s</div>\n'
+                % (line, html.escape(detail), html.escape(str(al.get("device_number", 1))),
+                   mono, html.escape(str(al.get("issafe_path",
+                                                "/api/v1/safetymonitor/1/issafe"))),
+                   html.escape(client)))
+    reasons = ""
+    why = dew.get("reasons") if isinstance(dew.get("reasons"), (list, tuple)) else []
+    if not ignored and not stale and why:
+        reasons = ('    <ul style="margin:10px 0 0;padding-left:20px;font-size:13px;'
+                   'color:var(--muted)">\n'
+                   + "".join("        <li>%s</li>\n" % html.escape(str(r)) for r in why)
+                   + "    </ul>\n")
+    note = ('    <p style="margin:10px 0 0;font-size:12.5px;color:var(--faint)">For the dome '
+            'driver, not for NINA. It answers one question &mdash; <i>would a WET rain '
+            'sensor be dew right now?</i> &mdash; and is true only while every tile above '
+            'is green; missing data counts as no. It never opens or closes anything.</p>\n')
+    return ('  <section style="border:1px solid var(--line);border-radius:12px;'
+            'padding:16px 18px;margin:0 0 26px;background:var(--card)">\n'
+            + head + endpoint + tiles + reasons + note + '  </section>\n')
+
+
+def format_age_short(seconds):
+    """12 -> '12 s', 200 -> '3 min', 7500 -> '2 h'."""
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return "%d s" % seconds
+    if seconds < 5400:
+        return "%d min" % round(seconds / 60.0)
+    return "%d h" % round(seconds / 3600.0)
+
+
+# ---- weather log -----------------------------------------------------------------------
+_WLOG_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+\.csv")     # used with fullmatch
+
+
+def _wlog_size(n):
+    if isinstance(n, bool) or not isinstance(n, (int, float)) or n < 0:
+        return "?"
+    if n < 1000:
+        return "%d B" % n
+    if n < 1000 * 1000:
+        return "%.0f kB" % (n / 1000.0)
+    return "%.1f MB" % (n / 1e6)
+
+
+def _wlog_href_base(wl):
+    """The archive directory as a link prefix relative to the page ('weather_log/'), or
+    None when it is not inside the page's directory (then the files cannot be linked)."""
+    d = wl.get("dir")
+    if not isinstance(d, str) or not d:
+        return None
+    rel = os.path.relpath(os.path.abspath(d), os.path.dirname(os.path.abspath(HTML_FILE)))
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None
+    return "" if rel == os.curdir else rel.replace(os.sep, "/") + "/"
+
+
+def build_weather_log_html(state):
+    """Download links for the daemon's weather log (state key "weather_log"): the rows not
+    archived yet (two files in RAM) and the monthly CSV files on the SD card."""
+    wl = state.get("weather_log") if isinstance(state, dict) else None
+    if not isinstance(wl, dict) or not wl.get("enabled"):
+        return ""
+    base = _wlog_href_base(wl)
+
+    def link(name, text=None):
+        if not isinstance(name, str) or not _WLOG_NAME_RE.fullmatch(name):
+            return None
+        shown = html.escape(text or name)
+        if base is None:
+            return shown
+        return '<a href="%s%s" download>%s</a>' % (html.escape(base), name, shown)
+
+    def items(key):
+        """The list under `key`, whatever the state file actually holds there."""
+        value = wl.get(key)
+        return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
+    cur_items = []
+    for c in items("current"):
+        a = link(c.get("name"))
+        if a is None:
+            continue
+        rows = sum(v for v in (c.get("rows"), c.get("waiting"))
+                   if isinstance(v, int) and not isinstance(v, bool))
+        cur_items.append("%s <span style=\"color:var(--faint)\">(%d row%s)</span>"
+                         % (a, rows, "" if rows == 1 else "s"))
+
+    months = {}
+    for a in items("archives"):
+        if isinstance(a.get("month"), str) and re.fullmatch(r"\d{4}-\d{2}", a["month"]):
+            months.setdefault(a["month"], []).append(a)
+
+    def month_line(month):
+        cells = []
+        for a in sorted(months[month], key=lambda x: str(x.get("name"))):
+            ln = link(a.get("name"))
+            if ln is not None:
+                cells.append("%s <span style=\"color:var(--faint)\">(%s)</span>"
+                             % (ln, _wlog_size(a.get("bytes"))))
+        return "        <li><b>%s</b> &nbsp; %s</li>\n" % (html.escape(month),
+                                                          " &middot; ".join(cells))
+
+    order = sorted(months, reverse=True)
+    recent, older = order[:6], order[6:]
+    ul = '      <ul style="margin:6px 0 10px;padding-left:20px;font-size:13.5px;line-height:1.7">\n'
+    body = []
+    body.append('      <div style="font-size:13.5px"><b>Not archived yet</b> (still in RAM): '
+                '%s</div>\n' % (" &middot; ".join(cur_items) or "nothing"))
+    if recent:
+        body.append('      <div style="font-size:13.5px;margin-top:10px"><b>Monthly files'
+                    '</b></div>\n' + ul + "".join(month_line(m) for m in recent)
+                    + "      </ul>\n")
+    else:
+        body.append('      <div style="font-size:13.5px;margin-top:10px;color:var(--faint)">'
+                    'No monthly file yet: the first rows are archived in daytime.</div>\n')
+    if older:
+        body.append('      <details><summary style="font-size:13px;color:var(--muted);'
+                    'cursor:pointer">Older months (%d)</summary>\n' % len(older)
+                    + ul + "".join(month_line(m) for m in older) + "      </ul></details>\n")
+    if base is None:
+        body.append('      <div style="font-size:12.5px;color:var(--faint)">The files are in '
+                    '%s on the Pi (outside the web directory, so not linked).</div>\n'
+                    % html.escape(str(wl.get("dir"))))
+    for key, label in (("error", "The archive is NOT being written"),
+                       ("ram_error", "Weather log problem")):
+        if wl.get(key):
+            body.append('      <div style="font-size:13px;color:var(--warn);font-weight:600;'
+                        'margin-top:8px">&#9888; %s: %s</div>\n'
+                        % (label, html.escape(str(wl[key])[:300])))
+
+    def g(key, default):
+        v = wl.get(key)
+        return "%g" % (v if _dew_num(v) is not None else default)
+
+    cap_mb = wl.get("cap_mb") if _dew_num(wl.get("cap_mb")) is not None else 6144.0
+    cap = "%g GB" % round(cap_mb / 1024.0, 2) if cap_mb >= 1024 else "%g MB" % cap_mb
+    last = wl.get("last_flush_ts")
+    when = ("never yet" if _dew_num(last) is None
+            else time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(last)))
+    total = wl.get("total_bytes")
+    blurb = (
+        "CSV for a spreadsheet: one <b>weather</b> row every %s min and at every change of "
+        "the safety monitor or the dew monitor (station medians, forecast, radar, enclosure "
+        "sensor, both verdicts and their reasons), and one <b>stations</b> row per Weather "
+        "Underground station per poll (night only). Units are in the column names. To spare "
+        "the SD card the rows are collected in RAM and copied to the card every %s h, in "
+        "daytime, and when the daemon is stopped; a power cut loses the rows not copied "
+        "yet. Last copied: %s. Archive size: %s; above %s the oldest months are deleted."
+        % ("%g" % (wl["interval_s"] / 60.0 if _dew_num(wl.get("interval_s")) is not None
+                   else 5),
+           g("flush_hours", 24), html.escape(when), _wlog_size(total), cap))
+    return (
+        '  <h2>Weather log</h2>\n'
+        '  <div class="grid">\n'
+        '    <div>\n' + "".join(body) + '    </div>\n'
+        '    <div>\n'
+        '      <p class="lede" style="font-size:13.5px;margin-top:0">%s</p>\n'
+        '    </div>\n'
+        '  </div>\n' % blurb
+    )
+
+
 def write_html(
     t,
     h,
@@ -3969,6 +4244,10 @@ def write_html(
         parts.append('  <h2>Alpaca safety monitor</h2>\n'
                      '  <p class="lede">Safety section unavailable.</p>\n')
     try:
+        parts.append(build_dew_html(_safety_state))
+    except Exception:
+        pass
+    try:
         parts.append(build_radar_html(_safety_state))
     except Exception:
         pass
@@ -3985,6 +4264,10 @@ def write_html(
                          '(render error) &mdash; see the safety monitor card above.</p>\n')
     try:
         parts.append(build_forecast_html(_safety_state))
+    except Exception:
+        pass
+    try:
+        parts.append(build_weather_log_html(_safety_state))
     except Exception:
         pass
 
@@ -4080,7 +4363,7 @@ def main():
     # exactly during observing hours. Fresh inputs must never wait for the camera.
     try:
         write_safety_inputs(sun_info, h, humidity_age_s=h_age,
-                            gps_data=gps_data, gps_source=gps_source)
+                            gps_data=gps_data, gps_source=gps_source, temperature=t)
     except Exception:
         pass
 
