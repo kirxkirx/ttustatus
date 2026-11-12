@@ -3962,10 +3962,49 @@ def build_dew_html(state):
         ("Forecast precip.", pair(fc.get("precip_now"), fc.get("precip_next")),
          sub("precip", "needs &lt; %s%% this and next hour" % lim("precip_below_pct", 5))),
     ]
+    if "lightning" in checks:
+        # (a daemon from before this check existed sends no such key: no tile then,
+        # rather than a grey one beside a badge that says IGNORED)
+        lt = dew.get("lightning") if isinstance(dew.get("lightning"), dict) else {}
+        need = ("needs none within %s km for %s min"
+                % (lim("glm_km", 60), lim("glm_hold_min", 30)))
+
+        def km(v):
+            # one decimal, as the rule works: 60.3 km must not read "60 km" beside
+            # "within 60 km" (whole kilometres are enough from 100 km on)
+            return None if _dew_num(v) is None else _dew_num(v, 1 if abs(v) < 100 else 0)
+
+        def ago(seconds):
+            # whole minutes rounded down, like the reason line under the tiles
+            return "%d min" % (seconds // 60) if seconds >= 60 else "%d s" % seconds
+
+        seen, near = lt.get("recent_age_s"), km(lt.get("nearest_km"))
+        watched = lt.get("watched_s")
+        if checks.get("lightning") is False and _dew_num(seen) is not None and seen >= 0:
+            # the flash that keeps the answer false (not the nearest of the latest poll)
+            hit = km(lt.get("recent_km"))
+            shown = value("?" if hit is None else hit, "" if hit is None else "km")
+            need += " &middot; seen %s ago" % ago(seen)
+        elif lt.get("available") is not True:
+            shown = value(None)
+        else:
+            # nearest flash of the latest GLM poll, however far; "none": none anywhere
+            shown = value("none" if near is None else near, "" if near is None else "km")
+            if near is not None:
+                need = "nearest flash &middot; " + need
+            if (checks.get("lightning") is None and _dew_num(watched) is not None
+                    and watched >= 0):
+                # current data, but not yet a whole hold of it (daemon start, data gap)
+                need += " &middot; watched %s so far" % ago(watched)
+        items.append(("Lightning (GLM)", shown, sub("lightning", need)))
     tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>\n    </div>\n')
-    tiles = ('  <div class="tiles" style="grid-template-columns:'
-             'repeat(auto-fit,minmax(170px,1fr));margin-bottom:0">\n'
+    # Six tiles would leave one orphan under a row of five on the desktop wrap: cap them
+    # at three columns (3 + 3), exactly as the safety card does for its six tiles (the
+    # 1px of slack keeps sub-pixel rounding from dropping the grid to two columns).
+    cols = ("repeat(auto-fit,minmax(max(170px,calc((100% - 25px) / 3)),1fr))"
+            if len(items) == 6 else "repeat(auto-fit,minmax(170px,1fr))")
+    tiles = ('  <div class="tiles" style="grid-template-columns:%s;margin-bottom:0">\n' % cols
              + "".join(tile % it for it in items) + '  </div>\n')
 
     if stale:

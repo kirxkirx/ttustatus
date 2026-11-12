@@ -1,14 +1,20 @@
 # TTU Alpaca SafetyMonitor
 
-An ASCOM Alpaca **SafetyMonitor** for the observatory, running on the Raspberry Pi
-alongside `make_status_page.py`. It aggregates several inputs into a single `IsSafe`
-boolean that NINA (and any Alpaca client) can read, and the status page shows the same
-information plus the recent safety-event log.
+An ASCOM Alpaca **SafetyMonitor** daemon for the observatory, running on the Raspberry Pi
+alongside `make_status_page.py`. It exposes **two SafetyMonitor devices** on the same
+address and port:
 
-The same daemon serves a second SafetyMonitor, **device 1, the dew monitor**, for the dome
-driver only (it tells the driver when a wet rain sensor is dew: see
-[Dew monitor](#dew-monitor-alpaca-device-1)), and keeps a
-[weather log](#weather-log) for tuning it.
+- **Device 0, `TTU Safety Monitor`: the normal safety monitor.** It aggregates several
+  inputs into a single `IsSafe` boolean ("is it safe to observe?") for NINA and any other
+  observatory or dome control software; any Alpaca client can read it. The status page
+  shows the same information plus the recent safety-event log. Everything in this
+  document is about device 0 unless it says otherwise.
+- **Device 1, `TTU Dew Monitor`: a special-purpose monitor.** Its `IsSafe` is `true` only
+  while dew is expected to form. It is used only by this observatory's own custom
+  dome-control code, to temporarily disable the dome's rain sensor, which is susceptible
+  to dew. It is not a safety verdict and must not be selected in NINA or in any other
+  software: see [Dew monitor](#dew-monitor-alpaca-device-1). The daemon also keeps a
+  [weather log](#weather-log) for tuning it.
 
 ## Architecture (two cooperating processes)
 
@@ -60,9 +66,9 @@ extra components in `safety/monitor.py`.
 
 **The problem.** The dome's own rain sensor is a bare plate under the night sky. On a
 clear, calm, humid night dew forms on it, it reads WET, and the dome controller closes the
-roof in perfectly good weather. The dome driver ([merlino-dome](https://github.com/kirxkirx/merlino-dome))
-can ignore its rain sensor, but it has to be told when that is reasonable, and the
-weather knowledge is here.
+roof in perfectly good weather. The observatory's own dome-control software (custom code,
+called "the dome driver" below) can ignore its rain sensor, but it has to be told when
+that is reasonable, and the weather knowledge is here.
 
 **The answer** is a second, entirely standard Alpaca SafetyMonitor on the same address and
 port, **device number 1**. The dome driver polls it like any other SafetyMonitor:
@@ -86,12 +92,35 @@ opens or closes anything; `false` only hands the decision back to the rain senso
 | Wind speed | calm: **at most 8 mph**, and it stays "calm" until the wind is **above 9 mph** | median of the WU stations |
 | Forecast cloud cover | **below 30 %**, this hour and the next | NWS gridpoint forecast |
 | Forecast precipitation probability | **below 5 %**, this hour and the next | NWS gridpoint forecast |
+| Lightning | **no flash within 60 km** of the site in the last 30 min, with the GLM layer watching for all of that time | GOES-19 GLM, the main monitor's lightning layer |
 
 Deliberately simple: there is no lower limit on the spread (fog is not treated as
-dangerous to the equipment), no delay before the answer turns true and no memory of
+dangerous to the equipment), no waiting period once every line holds and no memory of
 earlier dew. The only state is the 8–9 mph dead band, so wind hovering at the limit does
-not flip the answer with every station update; after a restart the wind must be seen at
-8 mph or below once.
+not flip the answer with every station update (after a restart the wind must be seen at
+8 mph or below once), and the lightning record of the last 30 minutes described next.
+
+**Lightning.** This is the main monitor's lightning check with a wider ring. Device 0
+goes UNSAFE for a flash within 50 km (and device 1 is then false anyway); device 1 is
+also false for a flash between 50 and 60 km, because with the rain sensor ignored there
+is one protection fewer against a storm's rain. A flash counts for the same 30 minutes
+as the main latch (`TTU_SAFETY_GLM_COOLOFF_HOURS`), from the moment the daemon first
+sees it in a GLM poll: a storm does not flash every five minutes, and one quiet poll
+must not hand the roof back to "it is only dew". Distances are in kilometres from the
+site coordinates, and the limit is inclusive (exactly 60 km counts as inside; the GLM
+layer reports distances to 0.1 km).
+
+"No lightning" also has to be known, not assumed. Device 1 needs 30 minutes of good GLM
+polls behind it, none further apart than 15 minutes. After a daemon start, a correction
+of the system clock or a GLM outage nobody knows what happened in the minutes that were
+not watched, so device 1 stays `false` until 30 minutes have been watched again. (Every
+evening that is a few minutes after sunset, GLM polling having started when the sun
+passed 5°.) None of this is persisted: no file, no SD-card write, which is why a restart
+costs those 30 minutes. All of these times are measured on the monotonic clock: a system
+clock that is stepped neither shortens the 30 minutes nor makes old data look fresh.
+
+The check sees what the GLM polls have read and no more; see
+[GLM lightning component](#glm-lightning-component) for what one poll covers.
 
 **Why spread, and why wind.** The plate radiates to the sky and runs a few degrees colder
 than the air, so it collects dew once the spread is smaller than that cooling, long
@@ -114,7 +143,19 @@ hour. WU reports °F and mph, NWS °C and km/h; every conversion is in `safety/d
 - no forecast: the last good NWS download is older than 40 min (two poll intervals plus
   ten minutes, so one failed download is tolerated), or it lacks a value for one of the
   two hours;
-- daytime: WU is polled only when the sun is below 5°, and device 0 is UNSAFE anyway;
+- no lightning data: the last good GLM poll is older than 15 min (two poll intervals plus
+  five minutes, so one failed poll is tolerated). A good poll is one that read at least
+  10 of the granules of its 5-minute look-back (`TTU_SAFETY_DEW_GLM_MIN_GRANULES`; there
+  are up to 15): the GLM layer skips a granule it cannot download, and "no flash" in a
+  fraction of the data is not "no lightning". A flash, on the other hand, counts from
+  whatever poll shows it, and missing data never ends its 30 minutes;
+- lightning not watched for 30 minutes yet (a daemon start, a clock correction, good
+  polls more than 15 min apart: see "Lightning" above);
+- no GLM layer: `TTU_SAFETY_GLM=0`, numpy / netCDF4 not installed, or a site outside
+  GOES-East coverage. **Device 1 is then always `false`**, and the daemon says so at
+  startup. There is no setting that drops the lightning condition;
+- daytime: WU and GLM are polled only when the sun is below 5°, and device 0 is UNSAFE
+  anyway;
 - the dew monitor itself failing. Whatever goes wrong in it, device 0 is unaffected.
 
 **Where to see it.** The status page has a "Dew monitor" card with each check's number
@@ -147,10 +188,10 @@ Two CSV tables, each file starting with a header line:
   UTC and local time, sun altitude, both verdicts (`safe0`, `safe1`), the station medians
   device 1 used (`spread_c`, `wind_mph`, `gust_mph`, `temp_c`, `dewpoint_c`, `rh_pct`) and
   how many stations they come from, each device 1 check (`check_spread`, `check_wind`,
-  `check_cloud`, `check_precip`: 1 passes, 0 fails, blank = no data), the forecast for
-  this hour and the next (`fc_cloud_pct`, `fc_precip_pct`, `fc_temp_c`, `fc_dewpoint_c`,
-  `fc_wind_mph`, ...), rain latch, radar and lightning state, the enclosure sensor
-  (`encl_temp_c`, `encl_rh_pct`) and both lists of reasons.
+  `check_cloud`, `check_precip`, `check_lightning`: 1 passes, 0 fails, blank = no data),
+  the forecast for this hour and the next (`fc_cloud_pct`, `fc_precip_pct`, `fc_temp_c`,
+  `fc_dewpoint_c`, `fc_wind_mph`, ...), rain latch, radar and lightning state, the
+  enclosure sensor (`encl_temp_c`, `encl_rh_pct`) and both lists of reasons.
 - **stations**: one row per WU station per WU poll (temperature, dew point, spread,
   humidity, wind, gust, rain rate, distance, age of the observation), to see which
   stations are representative of the site. WU is polled at night only, so there are no
@@ -410,7 +451,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE |
 | `TTU_SAFETY_GLM_COOLOFF_HOURS` | `0.5` | freeze time (h) after the last nearby flash |
 | `TTU_SAFETY_GLM_POLL_INTERVAL` | `300` | seconds between GLM polls (night only) |
-| `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes fetched per poll |
+| `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes fetched per poll. With the default the granules still on their way to S3 at poll time (about one in seven) are read by no poll; `7` closes that gap for about 45 % more download (see "GLM lightning component") |
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
 | `TTU_SAFETY_RADAR_KM` | `30` | any echo within this radius → UNSAFE |
 | `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
@@ -447,6 +488,9 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_DEW_MIN_STATIONS` | `3` | WU stations needed for the spread median, and for the wind median |
 | `TTU_SAFETY_DEW_OBS_MAX_AGE_MIN` | `30` | a station's observation counts this long |
 | `TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN` | `40` | the last good NWS download counts this long (two poll intervals + 10 min; at most 240) |
+| `TTU_SAFETY_DEW_GLM_KM` | `60` | lightning ring of device 1, **kilometres**: a GLM flash at or within this distance makes it false for `TTU_SAFETY_GLM_COOLOFF_HOURS` (30 min). A ring no wider than `TTU_SAFETY_GLM_TRIGGER_KM` adds no distance (device 0 is UNSAFE there anyway; warned at startup), but device 1 still needs current GLM data: the lightning condition cannot be switched off |
+| `TTU_SAFETY_DEW_GLM_MAX_AGE_MIN` | `15` | the last good GLM poll counts this long, and good polls further apart than this are a gap in the 30-minute watch (default: two poll intervals + 5 min; at least one poll interval + 2 min, at most 120) |
+| `TTU_SAFETY_DEW_GLM_MIN_GRANULES` | `10` | granules a GLM poll must have read to count as lightning data for device 1 (default: two per minute of `TTU_SAFETY_GLM_WINDOW_MIN`, two thirds of the look-back) |
 | `TTU_SAFETY_DEW_NAME` | `TTU Dew Monitor` | Alpaca name of device 1 |
 | `TTU_SAFETY_WEATHER_LOG` | `1` | enable the weather log (`0` disables it) |
 | `TTU_SAFETY_WEATHER_LOG_DIR` | `/var/www/html/weather_log` | the archive, on the SD card; inside the web root so the page can link to it |
@@ -610,6 +654,18 @@ Needs `numpy` + `netCDF4` (`sudo apt install python3-numpy python3-netcdf4`); if
 is disabled and the other layers are unaffected. Both status pages show the trigger state and
 the distance to the nearest strike. Fail-safe: a fetch error never clears an active latch and
 never forces unsafe on its own; "no flashes" is never proof of safety.
+
+**What one poll covers.** GLM writes a granule every 20 s, and a granule reaches S3 some
+25–60 s after it starts. A poll reads the granules that started in the last
+`TTU_SAFETY_GLM_WINDOW_MIN` (5) minutes and are on S3 at that moment; a granule it
+cannot download is skipped. Polls are a little more than 5 minutes apart (the interval
+plus the time a poll takes), so with the default look-back the two or three newest
+granules at each poll, about one in seven overall, are read by no poll at all: a storm,
+with its many flashes, is seen all the same, but an isolated flash can be missed.
+`TTU_SAFETY_GLM_WINDOW_MIN=7` makes consecutive polls overlap and closes that gap, for
+about 45 % more download per poll (a flash read twice only renews the 30 minutes). This
+applies to device 0's latch and to the lightning check of the
+[dew monitor](#dew-monitor-alpaca-device-1) alike.
 
 ### NWS forecast component
 

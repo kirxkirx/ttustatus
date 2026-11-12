@@ -674,7 +674,7 @@ class SafetyMonitor:
         # Device 1, the dew monitor. It comes AFTER the decision above and is no part of
         # it: it reads is_safe, never the other way round (tests pin this).
         outlook = self._forecast_outlook(now)
-        dew = self._dew_component(is_safe, rain, outlook, now)
+        dew = self._dew_component(is_safe, rain, outlook, glm, now)
 
         state = {
             "ts": now,
@@ -751,15 +751,18 @@ class SafetyMonitor:
             return {"available": False, "why": "forecast outlook error: %s" % str(e)[:120],
                     "age_s": None, "this_hour": None, "next_hour": None}
 
-    def _dew_component(self, is_safe, rain, outlook, now) -> dict:
+    def _dew_component(self, is_safe, rain, outlook, glm, now) -> dict:
         """The device 1 block of the state. Whatever goes wrong in there, the answer is
-        'not safe' = the rain sensor is trusted — and IsSafe (device 0) is unaffected."""
+        'not safe' = the rain sensor is trusted — and IsSafe (device 0) is unaffected.
+        `rain` and `glm` are the components of this same evaluation: the dew monitor
+        reads the stations' observations and the nearest lightning out of them."""
         cfg = self.cfg
         if self.dew is None:
             comp = dew_mod.unavailable_component(cfg)
         else:
             try:
                 self.dew.update_stations(rain.get("results"), now)
+                self.dew.update_lightning(glm, now)
                 comp = self.dew.evaluate(is_safe, outlook, now)
                 if not isinstance(comp, dict) or not isinstance(comp.get("is_safe"), bool):
                     raise TypeError("malformed dew component (%s)" % type(comp).__name__)

@@ -71,6 +71,7 @@ SUMMARY_COLUMNS = (
     "stations_used", "stations_wind", "stations_live", "stations_total",
     # device 1's individual checks: 1 = passes, 0 = fails, blank = no data
     "wind_calm", "check_spread", "check_wind", "check_cloud", "check_precip",
+    "check_lightning",
     # NWS forecast for the hour containing this row, and the next hour
     "fc_cloud_pct", "fc_cloud_next_pct", "fc_precip_pct", "fc_precip_next_pct",
     "fc_thunder_pct", "fc_temp_c", "fc_dewpoint_c", "fc_rh_pct", "fc_wind_mph",
@@ -429,6 +430,7 @@ class WeatherLog:
             "check_wind": _flag(checks.get("wind")),
             "check_cloud": _flag(checks.get("cloud")),
             "check_precip": _flag(checks.get("precip")),
+            "check_lightning": _flag(checks.get("lightning")),
             "fc_cloud_pct": _num(this_hour.get("cloud_cover_pct"), 0),
             "fc_cloud_next_pct": _num(next_hour.get("cloud_cover_pct"), 0),
             "fc_precip_pct": _num(this_hour.get("precip_prob_pct"), 0),

@@ -13,6 +13,7 @@ is absent (no such device) when the dew monitor is switched off.
 from __future__ import annotations
 
 import html
+import math
 import re
 import threading
 import time
@@ -401,9 +402,12 @@ def _dew_html(dew, row) -> str:
     def num(v, unit, digits=1):
         return "no data" if not isinstance(v, (int, float)) else "%.*f%s" % (digits, v, unit)
 
+    def finite(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
     def lim(key, default):
         v = th.get(key)
-        return "%g" % (v if isinstance(v, (int, float)) else default)
+        return "%g" % (v if finite(v) else default)
 
     def check(key):
         return checks.get(key) is True, checks.get(key) is None
@@ -434,6 +438,30 @@ def _dew_html(dew, row) -> str:
                     "%s / %s (needs < %s%%)"
                     % (num(fc.get("precip_now"), "%", 0), num(fc.get("precip_next"), "%", 0),
                        lim("precip_below_pct", 5)), ok, unknown=unknown))
+    if "lightning" in checks:
+        lt = dew.get("lightning") if isinstance(dew.get("lightning"), dict) else {}
+        ok, unknown = check("lightning")
+        need = ("needs none within %s km for %s min"
+                % (lim("glm_km", 60), lim("glm_hold_min", 30)))
+
+        def km(v):
+            # one decimal, as the rule works (whole kilometres from 100 km on)
+            return "%.*f km" % (1 if abs(v) < 100 else 0, v)
+
+        seen, watched = lt.get("recent_age_s"), lt.get("watched_s")
+        if ok is False and not unknown and finite(seen) and seen >= 0:
+            hit = lt.get("recent_km")
+            found = "flash %s %d min ago" % (
+                km(hit) + " away" if finite(hit) else "at an unreadable distance",
+                seen // 60)
+        elif lt.get("available") is not True:
+            found = "no data" + (" — %s" % _txt(lt.get("why"), 160) if lt.get("why") else "")
+        else:
+            near = lt.get("nearest_km")
+            found = "nearest flash %s" % km(near) if finite(near) else "no flash seen"
+            if unknown and finite(watched) and watched >= 0:
+                found += ", watched for %d min so far" % (watched // 60)
+        rows.append(row("Lightning (GLM)", "%s (%s)" % (found, need), ok, unknown=unknown))
     verdict = ("IsSafe = true: rain sensor may be IGNORED (dew likely)" if safe
                else "IsSafe = false: rain sensor TRUSTED")
     why = ""

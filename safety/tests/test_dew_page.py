@@ -13,6 +13,7 @@ for _m in ["numpy", "board", "adafruit_dht", "gps", "astropy", "astropy.units",
     sys.modules.setdefault(_m, MagicMock())
 
 import make_status_page as msp        # noqa: E402  (must follow the sys.modules stubbing)
+from safety import config, dew        # noqa: E402
 
 GREEN, RED = "var(--good)", "#b42318"
 GREY = "var(--faint, #8b959c)"
@@ -22,14 +23,19 @@ def dew_block(is_safe=True, **over):
     block = {
         "enabled": True, "is_safe": is_safe, "reasons": [],
         "checks": {"device0": True, "spread": True, "wind": True, "cloud": True,
-                   "precip": True},
+                   "precip": True, "lightning": True},
         "spread_c": 4.44, "wind_mph": 4.6, "gust_mph": 7.0, "stations_used": 5,
         "stations_wind": 4, "wind_calm": True,
         "forecast": {"available": True, "cloud_now": 12, "cloud_next": 20,
                      "precip_now": 0, "precip_next": 1},
+        "lightning": {"available": True, "why": None, "age_s": 120, "nearest_km": None,
+                      "recent_km": None, "recent_age_s": None, "clear_in_s": None,
+                      "watched_s": 7200},
         "thresholds": {"spread_max_c": 5.0, "wind_max_mph": 8.0,
                        "wind_unsafe_above_mph": 9.0, "cloud_below_pct": 30.0,
-                       "precip_below_pct": 5.0, "min_stations": 3},
+                       "precip_below_pct": 5.0, "min_stations": 3, "glm_km": 60.0,
+                       "glm_hold_min": 30.0, "glm_max_age_min": 15.0,
+                       "glm_min_granules": 10},
         "connected": True, "last_read_age_s": 12,
         "alpaca": {"device_number": 1, "name": "TTU Dew Monitor",
                    "issafe_path": "/api/v1/safetymonitor/1/issafe"},
@@ -112,9 +118,182 @@ def test_device_0_unsafe_is_named_on_its_own_tile():
 def test_device_0_is_unknown_not_unsafe_when_the_dew_monitor_itself_failed():
     block = dew_block(is_safe=False, reasons=["dew monitor error: boom"])
     block["checks"] = {"device0": None, "spread": None, "wind": None, "cloud": None,
-                       "precip": None}
-    t = tile(msp.build_dew_html(state(block)), "Safety monitor")
+                       "precip": None, "lightning": None}
+    page = msp.build_dew_html(state(block))
+    t = tile(page, "Safety monitor")
     assert "N/A" in t and "UNSAFE" not in t and GREY in t
+    assert GREY in tile(page, "Lightning (GLM)") and GREEN not in page
+
+
+KM = '<span class="u">km</span>'
+
+
+def test_lightning_tile_shows_the_nearest_flash_and_the_ring():
+    t = tile(msp.build_dew_html(state()), "Lightning (GLM)")
+    assert ">none<" in t and KM not in t and GREEN in t
+    assert "needs none within 60 km for 30 min" in t and "nearest flash" not in t
+    block = dew_block()
+    block["lightning"]["nearest_km"] = 182.4                 # far away: still passes
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert ">182<" in t and KM in t and GREEN in t and "mph" not in t
+    assert "nearest flash &middot; needs none within 60 km for 30 min" in t
+
+
+def test_lightning_tile_agrees_with_the_verdict_at_the_ring():
+    # the rule works to 0.1 km and "within 60 km" is inclusive: 60.3 km passes and must
+    # not read "60 km" beside it; 59.6 km fails and must not read "60 km" either
+    block = dew_block()
+    block["lightning"]["nearest_km"] = 60.3
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert ">60.3<" in t and GREEN in t
+    block = dew_block(is_safe=False)
+    block["checks"]["lightning"] = False
+    block["lightning"].update(nearest_km=59.6, recent_km=59.6, recent_age_s=60,
+                              clear_in_s=1740)
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert ">59.6<" in t and RED in t and "seen 1 min ago" in t
+    block["lightning"].update(recent_km=0.4, recent_age_s=45)
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert ">0.4<" in t and "seen 45 s ago" in t
+
+
+def test_lightning_tile_names_the_flash_that_counts():
+    block = dew_block(is_safe=False, reasons=[
+        "GLM lightning 55.2 km away 12 min ago is within 60 km (counts for another 17 min)"])
+    block["checks"]["lightning"] = False
+    block["lightning"].update(nearest_km=310.0, recent_km=55.2, recent_age_s=12 * 60 + 40,
+                              clear_in_s=17 * 60 + 20)
+    page = msp.build_dew_html(state(block))
+    t = tile(page, "Lightning (GLM)")
+    # the flash that keeps the answer false, not the (distant) nearest of the latest poll
+    assert ">55.2<" in t and "310" not in t and RED in t
+    assert KM in t and '<span class="u">mi' not in t         # kilometres, never miles
+    # whole minutes, rounded down like the reason line under the tiles
+    assert "needs none within 60 km for 30 min &middot; seen 12 min ago" in t
+    assert "RAIN SENSOR TRUSTED" in page and "counts for another 17 min" in page
+    # a flash whose distance could not be read still shows as the flash that counts
+    block["lightning"]["recent_km"] = None
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert ">?<" in t and RED in t and "seen 12 min ago" in t and "310" not in t
+
+
+def test_lightning_tile_without_data_is_grey_and_shows_no_number():
+    block = dew_block(is_safe=False,
+                      reasons=["no current lightning data: the GLM lightning layer is off"])
+    block["checks"]["lightning"] = None
+    block["lightning"].update(available=False, why="the GLM lightning layer is off",
+                              age_s=None, nearest_km=44.0, watched_s=None)
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert "N/A" in t and "44" not in t and GREY in t
+
+
+def test_lightning_tile_says_when_it_has_not_watched_long_enough():
+    block = dew_block(is_safe=False, reasons=[
+        "GLM lightning watched for only 12 of the 30 min needed (after a daemon start, a "
+        "clock correction or a gap in the data)"])
+    block["checks"]["lightning"] = None
+    block["lightning"].update(nearest_km=412.6, watched_s=12 * 60 + 5)
+    page = msp.build_dew_html(state(block))
+    t = tile(page, "Lightning (GLM)")
+    assert ">413<" in t and GREY in t and GREEN not in t
+    assert "needs none within 60 km for 30 min &middot; watched 12 min so far" in t
+    assert "RAIN SENSOR TRUSTED" in page and "watched for only 12 of the 30 min" in page
+    block["lightning"].update(nearest_km=None, watched_s=20)
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert ">none<" in t and "watched 20 s so far" in t
+
+
+def _real_block(nearest, seen_ago_s=60, component_over=None, watched=True):
+    """The dew block as the daemon builds it (safety/dew.py), through JSON as the state
+    file carries it: the page must read the keys that module really writes. The last
+    GLM poll (nearest flash `nearest` km) was taken in `seen_ago_s` seconds ago, after an
+    hour of quiet polls unless watched=False."""
+    now, mono = time.time(), 90_000.0
+    mon = dew.DewMonitor(config)
+    mon.update_stations([{"station": s, "state": "live", "obs_ts": now - 120,
+                          "temp_f": 50.0, "dewpt_f": 45.0, "humidity_pct": 80.0,
+                          "wind_mph": 3.0, "gust_mph": 5.0} for s in ("S1", "S2", "S3")], now)
+
+    def poll(near, back, **over):
+        comp = {"enabled": True, "available": True, "last_poll_ts": now - back,
+                "granules_scanned": 14, "nearest_km": near, "polling_active": True}
+        comp.update(over)
+        mon.update_lightning(comp, now - back, mono - back)
+
+    if watched:
+        for back in range(3600 + int(seen_ago_s), int(seen_ago_s), -300):
+            poll(None, back)
+    poll(nearest, seen_ago_s, **(component_over or {}))
+    hour = {"cloud_cover_pct": 10, "precip_prob_pct": 0}
+    block = mon.evaluate(True, {"available": True, "why": None, "age_s": 60,
+                                "this_hour": hour, "next_hour": hour}, now, mono)
+    block.update(connected=True, last_read_age_s=5, alpaca={
+        "device_number": 1, "issafe_path": "/api/v1/safetymonitor/1/issafe"})
+    return json.loads(json.dumps(block))
+
+
+def test_the_page_reads_what_the_daemon_really_writes():
+    page = msp.build_dew_html(state(_real_block(None)))
+    assert "RAIN SENSOR IGNORED" in page and page.count('<div class="tile">') == 6
+    t = tile(page, "Lightning (GLM)")
+    assert ">none<" in t and GREEN in t and "needs none within 60 km for 30 min" in t
+    t = tile(msp.build_dew_html(state(_real_block(412.6))), "Lightning (GLM)")
+    assert ">413<" in t and GREEN in t
+    page = msp.build_dew_html(state(_real_block(57.3, seen_ago_s=250)))
+    t = tile(page, "Lightning (GLM)")
+    assert "RAIN SENSOR TRUSTED" in page and ">57.3<" in t and RED in t
+    assert "seen 4 min ago" in t
+    assert "GLM lightning 57.3 km away 4 min ago is within 60 km" in page
+    # a daemon that has just started: data, but not yet half an hour of it
+    page = msp.build_dew_html(state(_real_block(None, seen_ago_s=130, watched=False)))
+    t = tile(page, "Lightning (GLM)")
+    assert "RAIN SENSOR TRUSTED" in page and ">none<" in t and GREY in t
+    assert "watched 2 min so far" in t
+    assert "GLM lightning watched for only 2 of the 30 min needed" in page
+    # no lightning layer
+    page = msp.build_dew_html(state(_real_block(None, component_over={"enabled": False},
+                                                watched=False)))
+    t = tile(page, "Lightning (GLM)")
+    assert "RAIN SENSOR TRUSTED" in page and "N/A" in t and GREY in t
+    assert "no current lightning data: the GLM lightning layer is off" in page
+
+
+def test_lightning_tile_survives_odd_values_and_other_limits():
+    block = dew_block()
+    block["thresholds"].update(glm_km=80.0, glm_hold_min=45.0)
+    block["lightning"] = "nonsense"
+    t = tile(msp.build_dew_html(state(block)), "Lightning (GLM)")
+    assert "needs none within 80 km for 45 min" in t and "N/A" in t
+    odd_values = (float("nan"), float("inf"), "55", True, [55], None, -30)
+    for odd in odd_values:
+        for key in ("recent_km", "recent_age_s", "nearest_km", "watched_s", "available"):
+            for check in (False, None, True):
+                block = dew_block(is_safe=False)
+                block["checks"]["lightning"] = check
+                # (a valid flash beside the odd value, so every branch is reached)
+                block["lightning"].update(recent_km=55.0, recent_age_s=600, nearest_km=70.0)
+                block["lightning"][key] = odd
+                page = msp.build_dew_html(state(block))
+                t = tile(page, "Lightning (GLM)")
+                assert "needs none within 60 km" in t and "<script" not in page, (odd, key)
+                assert "nan" not in t and "inf" not in t, (odd, key, check)
+
+
+def test_state_of_a_daemon_from_before_the_lightning_check_shows_no_such_tile():
+    # between `git pull` and the daemon's restart the new page reads the old daemon's
+    # state: five checks, all true, IsSafe true. No grey sixth tile beside "IGNORED".
+    block = dew_block()
+    del block["checks"]["lightning"], block["lightning"]
+    for key in ("glm_km", "glm_hold_min", "glm_max_age_min"):
+        del block["thresholds"][key]
+    page = msp.build_dew_html(state(block))
+    assert "RAIN SENSOR IGNORED" in page and "Lightning" not in page
+    assert page.count('<div class="tile">') == 5
+    assert msp.build_dew_html(state()).count('<div class="tile">') == 6
+    # six tiles sit three to a row (no orphan under a row of five), like the safety card
+    three_columns = "minmax(max(170px,calc((100% - 25px) / 3)),1fr)"
+    assert three_columns in msp.build_dew_html(state()) and three_columns not in page
+    assert "repeat(auto-fit,minmax(170px,1fr))" in page
 
 
 def test_stale_state_never_claims_ignored():

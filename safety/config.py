@@ -678,10 +678,16 @@ EVAL_INTERVAL = _env_int("TTU_SAFETY_EVAL_INTERVAL", 30)  # evaluator cadence (s
 #     stays "calm" until it exceeds DEW_WIND_UNSAFE_ABOVE_MPH (a small dead band, so
 #     wind hovering at the limit does not flip the answer with every station update);
 #   * the NWS forecast for THIS hour and the NEXT one has cloud cover below
-#     DEW_CLOUD_BELOW_PCT and precipitation probability below DEW_PRECIP_BELOW_PCT.
-# There is no lower spread limit (fog is not treated as dangerous), no delay and no
-# memory. UNITS: the spread is in degrees CELSIUS, the wind limits in MILES PER HOUR
-# (WU reports degF and mph, NWS degC and km/h: every conversion is in safety/dew.py).
+#     DEW_CLOUD_BELOW_PCT and precipitation probability below DEW_PRECIP_BELOW_PCT;
+#   * no GLM lightning within DEW_GLM_KM of the site in the last GLM_COOLOFF_HOURS (the
+#     hold the main monitor's own lightning latch uses) — and the GLM layer must have
+#     been watching for that long: after a daemon start, a clock correction or a gap in
+#     its data the answer stays false until a whole hold has been watched.
+# There is no lower spread limit (fog is not treated as dangerous), no waiting period
+# once every line holds and no memory of earlier dew. UNITS: the spread is in degrees
+# CELSIUS, the wind limits in MILES PER HOUR (WU reports degF and mph, NWS degC and km/h:
+# every conversion is in safety/dew.py); the lightning ring is in KILOMETRES, like the
+# main monitor's.
 DEW_ENABLED = _env_flag("TTU_SAFETY_DEW", True)
 DEW_DEVICE_NUMBER = 1
 DEW_SERVER_NAME = _env_str("TTU_SAFETY_DEW_NAME", "TTU Dew Monitor")
@@ -720,6 +726,43 @@ DEW_FORECAST_MAX_AGE_MIN = _clamp(
     _env_float("TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN",
                min(240.0, 2.0 * NWS_POLL_INTERVAL / 60.0 + 10.0)),
     1.0, 240.0)
+# Lightning: a GLM flash at or within this many KILOMETRES of the site makes the answer
+# false, and keeps it false for GLM_COOLOFF_HOURS after it was seen. The ring is wider
+# than the main monitor's (GLM_TRIGGER_KM, inside which device 0 itself goes UNSAFE): with
+# the rain sensor ignored there is one protection fewer against a storm's rain. A ring no
+# wider than GLM_TRIGGER_KM adds no distance — but the condition is still there: device 1
+# needs current GLM data whatever the ring (it cannot be switched off).
+DEW_GLM_KM = _clamp("TTU_SAFETY_DEW_GLM_KM",
+                    _env_float("TTU_SAFETY_DEW_GLM_KM", 60.0), 0.0, 20000.0)
+if DEW_GLM_KM <= GLM_TRIGGER_KM:
+    CONFIG_WARNINGS.append(
+        f"TTU_SAFETY_DEW_GLM_KM={DEW_GLM_KM:g} is not wider than the main monitor's "
+        f"lightning ring (TTU_SAFETY_GLM_TRIGGER_KM={GLM_TRIGGER_KM:g}) — the dew "
+        "monitor's ring adds no distance (it still needs current GLM data)")
+# The lightning data counts while the last GOOD GLM poll is at most this old. The default
+# tolerates exactly one failed poll (S3 does hiccup): two poll intervals plus five minutes.
+# Never less than one poll interval plus two minutes: below that the data would go
+# "stale" between two perfectly good polls, and the answer would flip every few minutes.
+DEW_GLM_MAX_AGE_MIN = _clamp(
+    "TTU_SAFETY_DEW_GLM_MAX_AGE_MIN",
+    _env_float("TTU_SAFETY_DEW_GLM_MAX_AGE_MIN",
+               min(120.0, max(1.0, 2.0 * GLM_POLL_INTERVAL / 60.0 + 5.0))),
+    1.0, 120.0)
+if DEW_GLM_MAX_AGE_MIN * 60.0 < GLM_POLL_INTERVAL + 120.0:
+    _needed = (GLM_POLL_INTERVAL + 120.0) / 60.0
+    CONFIG_WARNINGS.append(
+        f"TTU_SAFETY_DEW_GLM_MAX_AGE_MIN={DEW_GLM_MAX_AGE_MIN:g} is shorter than one GLM "
+        f"poll interval plus two minutes — using {_needed:g} (the lightning data would "
+        "otherwise go stale between two good polls)")
+    DEW_GLM_MAX_AGE_MIN = _needed
+# What a GLM poll must have read of its look-back window to count as lightning data. GLM
+# writes a granule every 20 s; the GLM layer skips a granule it cannot download and still
+# reports "no flash", and "no flash" out of a fraction of the window is not "no
+# lightning". Default: two thirds of the window (a healthy poll reads all of it but the
+# newest two or three granules, which have not reached S3 yet).
+DEW_GLM_MIN_GRANULES = _clamp(
+    "TTU_SAFETY_DEW_GLM_MIN_GRANULES",
+    _env_int("TTU_SAFETY_DEW_GLM_MIN_GRANULES", max(1, 2 * GLM_WINDOW_MIN)), 1, 100000)
 
 # --- weather log -------------------------------------------------------------
 # What the daemon already knows (station medians, forecast, radar, enclosure sensor, both

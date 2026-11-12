@@ -46,7 +46,7 @@ def state(safe0=True, safe1=False, reasons0=(), reasons1=("wind 12 mph is above 
         "ts": NOV, "is_safe": safe0, "reasons": list(reasons0),
         "dew": {"enabled": True, "is_safe": safe1, "reasons": [] if safe1 else list(reasons1),
                 "checks": {"device0": safe0, "spread": True, "wind": safe1, "cloud": True,
-                           "precip": None},
+                           "precip": None, "lightning": True},
                 "spread_c": 4.4444, "wind_mph": 4.6, "gust_mph": 7.0, "temp_c": 11.25,
                 "dewpoint_c": 6.8, "rh_pct": 74.0, "stations_used": 5, "stations_wind": 4,
                 "wind_calm": safe1},
@@ -95,12 +95,27 @@ def test_rows_go_to_ram_and_nothing_touches_the_archive(wl, dirs):
     assert (r["safe0"], r["safe1"]) == ("1", "0")
     assert (r["spread_c"], r["wind_mph"], r["temp_c"]) == ("4.44", "4.6", "11.2")
     assert (r["check_spread"], r["check_wind"], r["check_precip"]) == ("1", "0", "")
+    assert r["check_lightning"] == "1"
+    assert SUMMARY_COLUMNS.index("check_lightning") == SUMMARY_COLUMNS.index("check_precip") + 1
     assert (r["fc_cloud_pct"], r["fc_cloud_next_pct"], r["fc_precip_next_pct"]) == ("12", "20", "2")
     # the forecast wind arrives in km/h and is logged in mph
     assert (r["fc_wind_mph"], r["fc_gust_mph"], r["fc_age_min"]) == ("8.0", "20.0", "9")
     assert (r["encl_temp_c"], r["encl_rh_pct"], r["sun_alt_deg"]) == ("14.0", "47", "-31.26")
     assert r["radar_nearest_km"] == "142.0" and r["glm_nearest_km"] == ""
     assert r["reasons1"] == "wind 12 mph is above 9 mph" and r["reasons0"] == ""
+
+
+def test_the_lightning_check_is_logged_as_pass_fail_or_no_data(wl, dirs):
+    _, ram = dirs
+    for i, value in enumerate((True, False, None, "absent")):
+        st = state()
+        if value == "absent":
+            del st["dew"]["checks"]["lightning"]             # a state without that check
+        else:
+            st["dew"]["checks"]["lightning"] = value
+        wl.observe(st, NOV + i * 300)
+    logged = [r["check_lightning"] for r in read(ram / "weather_current.csv")]
+    assert logged == ["1", "0", "", ""]
 
 
 def test_a_row_every_interval_and_at_once_on_a_verdict_change(wl, dirs):
@@ -703,6 +718,8 @@ def test_monitor_feeds_the_log_and_publishes_its_status(tmp_path, dirs, monkeypa
     assert len(row) == 1
     assert (row[0]["safe0"], row[0]["safe1"], row[0]["encl_temp_c"]) == ("1", "0", "13.0")
     assert row[0]["stations_used"] == "1" and "station(s)" in row[0]["reasons1"]
+    # (this monitor has no GLM layer: no lightning data, so that check is blank)
+    assert row[0]["check_lightning"] == "" and "lightning data" in row[0]["reasons1"]
     stations = read(ram / "stations_current.csv")
     assert len(stations) == 1 and stations[0]["temp_c"] == "10.0"
     with open(config.STATE_FILE, encoding="utf-8") as f:

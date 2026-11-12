@@ -2,10 +2,11 @@
 
 Why it exists. The dome's own rain sensor is a bare plate under the night sky. On a clear,
 calm, humid night dew forms on it, it reads WET, and the dome controller board closes the
-roof — while the weather is perfectly fine. The dome driver (merlino-dome) can be told to
-ignore its rain sensor, but it needs to know WHEN that is reasonable, and the weather
-knowledge is here on the Pi. So this daemon publishes the answer as a second, entirely
-standard Alpaca SafetyMonitor that the driver polls like any other:
+roof — while the weather is perfectly fine. The observatory's own dome-control software
+(the "dome driver") can be told to ignore its rain sensor, but it needs to know WHEN that
+is reasonable, and the weather knowledge is here on the Pi. So this daemon publishes the
+answer as a second, entirely standard Alpaca SafetyMonitor that the driver polls like any
+other:
 
     IsSafe(device 1) = True    "a WET reading of the rain sensor right now is dew —
                                 the rain sensor may be ignored"
@@ -23,10 +24,31 @@ The rule — the owner's, deliberately simple. True only while ALL hold:
                         stays calm until it is > DEW_WIND_UNSAFE_ABOVE_MPH (dead band)
     4. forecast cloud cover          < DEW_CLOUD_BELOW_PCT   this hour AND the next
     5. forecast precip. probability  < DEW_PRECIP_BELOW_PCT  this hour AND the next
+    6. no GLM lightning within DEW_GLM_KM of the site in the last GLM_COOLOFF_HOURS —
+       and the GLM layer must really have been watching for that long
 
-No lower limit on the spread (fog is not treated as dangerous), no delay, no memory of
-earlier dew. Missing or stale data for any line is "false": every failure hands control
-back to the rain sensor.
+No lower limit on the spread (fog is not treated as dangerous), no waiting period once
+every line holds, no memory of earlier dew. Missing or stale data for any line is "false":
+every failure hands control back to the rain sensor.
+
+Line 6 is the main monitor's lightning check with a wider ring. Device 0 already goes
+UNSAFE for a flash within GLM_TRIGGER_KM (and line 1 then makes this monitor false); with
+the rain sensor ignored there is one protection fewer against a storm's rain, hence the
+extra distance. A flash counts for the same time as that latch: a storm does not flash
+every five minutes, and one quiet poll must not hand the roof back to "it is only dew".
+"Missing data is false" here means three things, all read off the GLM layer's component:
+    * the latest GOOD poll is at most DEW_GLM_MAX_AGE_MIN old (one failed poll is
+      tolerated), a good poll being one that read at least DEW_GLM_MIN_GRANULES of its
+      look-back window — the GLM layer skips a granule it cannot download, and "no
+      flash" out of a fraction of the data is not "no lightning";
+    * good polls have been arriving, never further apart than that, for a whole hold:
+      after a daemon start, a clock correction or an outage nobody knows what happened
+      in the minutes not watched, so the answer stays false until a hold has been
+      watched again (nothing is persisted: no file, no SD write);
+    * evidence of a flash is never thrown away, whatever else is wrong with the poll
+      that showed it.
+Every age in line 6 is measured on the MONOTONIC clock: a wall clock that is stepped
+(NTP after a boot with a stale clock) must not shorten a hold or freshen old data.
 
 "Dew-point spread" is the air temperature minus the dew point. The plate radiates to the
 sky and runs a few degrees colder than the air, so it collects dew when the spread is
@@ -36,7 +58,8 @@ at air temperature, which is why calm air is part of the rule.
 UNITS — the one place they are converted. WU reports degrees Fahrenheit and miles per
 hour (units=e), NWS degrees Celsius and km/h. The thresholds are a spread in degrees
 CELSIUS and a wind speed in MILES PER HOUR. Mind that a temperature DIFFERENCE converts
-without the 32-degree offset (5 degF of spread is 2.78 degC, not -15).
+without the 32-degree offset (5 degF of spread is 2.78 degC, not -15). The lightning ring
+is in KILOMETRES, as the GLM layer reports its distances: nothing to convert.
 """
 from __future__ import annotations
 
@@ -116,26 +139,45 @@ def thresholds(cfg) -> dict:
             "precip_below_pct": cfg.DEW_PRECIP_BELOW_PCT,
             "min_stations": cfg.DEW_MIN_STATIONS,
             "obs_max_age_min": cfg.DEW_OBS_MAX_AGE_MIN,
-            "forecast_max_age_min": cfg.DEW_FORECAST_MAX_AGE_MIN}
+            "forecast_max_age_min": cfg.DEW_FORECAST_MAX_AGE_MIN,
+            "glm_km": cfg.DEW_GLM_KM,
+            "glm_hold_min": _lightning_hold_s(cfg) / 60.0,
+            "glm_max_age_min": cfg.DEW_GLM_MAX_AGE_MIN,
+            "glm_min_granules": cfg.DEW_GLM_MIN_GRANULES}
+
+
+def _lightning_hold_s(cfg) -> float:
+    """How long a flash inside the ring keeps the answer false, seconds: the cool-off of
+    the main monitor's lightning latch."""
+    return max(0.0, cfg.GLM_COOLOFF_HOURS * 3600.0)
+
+
+def _lightning_block(why=None) -> dict:
+    """The 'lightning' part of the state block, empty: no current data."""
+    return {"available": False, "why": why, "age_s": None, "nearest_km": None,
+            "recent_km": None, "recent_age_s": None, "clear_in_s": None,
+            "watched_s": None}
 
 
 def unavailable_component(cfg, why="dew monitor disabled (TTU_SAFETY_DEW=0)") -> dict:
     """The state block when the dew monitor is off or broke: never 'safe'."""
     return {"enabled": False, "is_safe": False, "reasons": [why],
             "checks": {"device0": None, "spread": None, "wind": None, "cloud": None,
-                       "precip": None},
+                       "precip": None, "lightning": None},
             "spread_c": None, "wind_mph": None, "gust_mph": None, "temp_c": None,
             "dewpoint_c": None, "rh_pct": None, "stations_used": 0, "stations_wind": 0,
             "stations": [], "wind_calm": False,
             "forecast": {"available": False, "why": why, "age_s": None,
                          "cloud_now": None, "cloud_next": None,
                          "precip_now": None, "precip_next": None},
+            "lightning": _lightning_block(why),
             "thresholds": thresholds(cfg)}
 
 
 class DewMonitor:
-    """Holds each station's latest observation and the wind dead-band state, and turns
-    them — with device 0's verdict and the forecast — into the device 1 verdict."""
+    """Holds each station's latest observation, the wind dead-band state and what the
+    GLM lightning layer last showed, and turns them — with device 0's verdict and the
+    forecast — into the device 1 verdict."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -144,6 +186,19 @@ class DewMonitor:
         # Wind dead band. Starts "not calm": after a restart the answer is false until
         # the wind has actually been seen at or below the lower limit.
         self._wind_calm = False
+        # Lightning: what the GLM layer has shown. Every time below is one of the
+        # MONOTONIC clock (as in the connectivity watchdog): a hold or a data age read
+        # off the wall clock is shortened, stretched or lost whenever that clock steps.
+        # Starts with nothing: false until GLM has been watched for a whole hold.
+        self._glm_id = None             # the last poll taken in (time stamp and content)
+        self._glm_poll_mono = None      # when the newest GOOD poll was made
+        self._glm_nearest = None        # ...its nearest flash, km (None: no flash at all)
+        self._glm_watch_mono = None     # since when good polls have come without a gap
+        self._glm_seen_mono = None      # when a flash inside the ring was last taken in
+        self._glm_seen_km = None        # ...how far it was (None: distance unreadable)
+        self._glm_flash_latest = False  # ...and whether it is still the latest GLM shows
+        self._glm_why = None            # why the component last passed in was no good poll
+        self._glm_idle = False          # ...and whether that is "nothing to poll" (day, off)
 
     # -- station observations ---------------------------------------------------
     def update_stations(self, results, now=None) -> None:
@@ -177,14 +232,165 @@ class DewMonitor:
                     "wind_mph": _plausible(r.get("wind_mph"), WIND_RANGE_MPH),
                     "gust_mph": _plausible(r.get("gust_mph"), WIND_RANGE_MPH)}
 
+    # -- lightning (GLM) ---------------------------------------------------------
+    def update_lightning(self, glm, now=None, mono=None) -> None:
+        """Take in the GLM lightning component of this evaluation
+        (GlmLightningPoller.component(), or the 'unavailable' block when that layer is
+        off). Passing the same poll again changes nothing, so the monitor simply passes
+        the component on every evaluation.
+
+        A GOOD poll is one that can vouch for "no lightning": the layer is on, the poll
+        succeeded and is current, it read enough of its look-back window
+        (DEW_GLM_MIN_GRANULES), its nearest flash has a readable distance and its time
+        stamp can be used. Anything less is not lightning data: the last good poll then
+        simply ages out (DEW_GLM_MAX_AGE_MIN), which is what makes one failed poll
+        harmless.
+
+        A FLASH at or inside the ring counts whatever else is wrong with the poll that
+        showed it (too few granules, a time stamp that cannot be used): evidence of
+        lightning is never thrown away.
+
+        `now` is the wall clock: the poll's own time stamp is compared with it, once, to
+        date the poll. `mono` is the monotonic clock all ages are measured on from then
+        on (default: time.monotonic())."""
+        now = time.time() if now is None else now
+        mono = time.monotonic() if mono is None else mono
+        cfg = self.cfg
+        ts = nearest = flash_km = None
+        good = flash = idle = False
+        if not isinstance(glm, dict) or not glm.get("enabled"):
+            why, idle = "the GLM lightning layer is off", True
+        elif glm.get("available") is not True:
+            if not glm.get("polling_active"):
+                why, idle = ("GLM is not polled now (daytime, or the sun's altitude is "
+                             "unknown)"), True
+            elif _finite(glm.get("last_poll_ts")) is None:
+                why = "no GLM poll yet"
+            else:
+                why = "the last GLM poll failed or is too old"
+        else:
+            ts = _finite(glm.get("last_poll_ts"))
+            raw = glm.get("nearest_km")
+            nearest = _finite(raw)
+            granules = _finite(glm.get("granules_scanned")) or 0.0
+            if raw is not None and (nearest is None or nearest < 0):
+                # there WAS a flash, at a distance that cannot be read: nobody can say
+                # it was outside the ring
+                why, flash, nearest = "the last GLM poll gave an unreadable distance", True, None
+            else:
+                flash = nearest is not None and nearest <= cfg.DEW_GLM_KM + _EPS
+                flash_km = nearest if flash else None
+                if ts is None or ts > now + FUTURE_TOLERANCE_SEC:
+                    why = "the last GLM poll has no usable time"
+                elif granules < cfg.DEW_GLM_MIN_GRANULES:
+                    why = ("the last GLM poll read only %d of the %d granules needed"
+                           % (granules, cfg.DEW_GLM_MIN_GRANULES))
+                else:
+                    why, good = None, True
+        with self._lock:
+            self._glm_why, self._glm_idle = why, idle
+            if not (good or flash):
+                return                          # nothing this component can tell
+            # The same poll is passed at every evaluation until the next one: it is
+            # taken in once. (Recognised by its time stamp AND what it says — two polls
+            # must never be mistaken for one because a clock repeated itself.)
+            poll_id = (ts, repr(glm.get("nearest_km")), repr(glm.get("granules_scanned")))
+            if poll_id == self._glm_id:
+                return
+            self._glm_id = poll_id
+            if flash:
+                # Counted from NOW, the moment the flash is first seen here — not from
+                # the poll's own time stamp, which a clock step in between falsifies.
+                self._glm_seen_mono, self._glm_seen_km = mono, flash_km
+                self._glm_flash_latest = True
+            if not good:
+                return
+            # When the poll was made, as far as its time stamp can be trusted: used for
+            # the data age only, where dating it too early errs to "older".
+            made = mono - max(0.0, now - ts)
+            if self._glm_poll_mono is not None and made < self._glm_poll_mono:
+                return                          # (dated before the poll already known)
+            # The watch — how long good polls have been coming without a gap — must err
+            # the other way, so it trusts no time stamp: the gap is measured up to NOW
+            # (it cannot have been longer), and a new record starts NOW.
+            if (self._glm_poll_mono is None
+                    or mono - self._glm_poll_mono > cfg.DEW_GLM_MAX_AGE_MIN * 60.0):
+                self._glm_watch_mono = mono     # the first good poll after a gap
+            self._glm_poll_mono, self._glm_nearest = made, nearest
+            if not flash:
+                self._glm_flash_latest = False
+
+    def _lightning(self, mono):
+        """(check, state block, reasons) for the lightning line of the rule. The check
+        is False while a flash inside the ring counts; None (unknown, which makes the
+        verdict false) without current data or before GLM has been watched for a whole
+        hold; True otherwise."""
+        cfg = self.cfg
+        ring, hold = cfg.DEW_GLM_KM, _lightning_hold_s(cfg)
+        max_age = cfg.DEW_GLM_MAX_AGE_MIN * 60.0
+        with self._lock:
+            made, nearest, watch = self._glm_poll_mono, self._glm_nearest, self._glm_watch_mono
+            seen, seen_km, latest = self._glm_seen_mono, self._glm_seen_km, self._glm_flash_latest
+            why, idle = self._glm_why, self._glm_idle
+        age = None if made is None else max(0.0, mono - made)
+        current = age is not None and age <= max_age
+        watched = (max(0.0, mono - watch) if watch is not None else 0.0) if current else None
+        seen_age = None if seen is None else max(0.0, mono - seen)
+        # A flash inside the ring counts for the hold time — and, whatever the hold, for
+        # as long as it is the latest thing the lightning data shows.
+        recent = seen_age is not None and (seen_age < hold or (current and latest))
+        short = current and watched < hold
+        block = _lightning_block()
+        block.update(available=current, age_s=None if age is None else round(age),
+                     nearest_km=nearest if current else None,
+                     watched_s=None if watched is None else round(watched))
+        reasons = []
+        if recent:
+            left = max(0.0, hold - seen_age)
+            block.update(recent_km=seen_km, recent_age_s=round(seen_age),
+                         clear_in_s=round(left))
+            # (whole minutes left, rounded down like the main monitor's "GLM latch N min
+            # left": the two lines stand side by side on the page)
+            if left >= 60.0:
+                until = "counts for another %d min" % (left // 60)
+            elif left > 0:
+                until = "counts for less than a minute more"
+            else:
+                until = "the latest lightning data"
+            where = ("%s km away %d min ago is" % (_g(seen_km), seen_age // 60)
+                     if seen_km is not None else
+                     "at an unreadable distance %d min ago is taken as" % (seen_age // 60))
+            reasons.append("GLM lightning %s within %s km (%s)" % (where, _g(ring), until))
+        if not current:
+            if made is None or idle:
+                block["why"] = why or "no GLM lightning data yet"
+            else:
+                block["why"] = ("no good GLM poll for %d min" % (age // 60)
+                                + (" (%s)" % why if why else ""))
+            reasons.append("no current lightning data: %s" % block["why"])
+        elif short:
+            block["why"] = ("GLM lightning watched for only %d of the %s min needed"
+                            % (watched // 60, _g(hold / 60.0)))
+            reasons.append(block["why"] + " (after a daemon start, a clock correction "
+                           "or a gap in the data)")
+        check = False if recent else (None if (not current or short) else True)
+        return check, block, reasons
+
     def clock_stepped(self, pre_now: float, post_now: float) -> None:
         """The system clock stepped: forget what was stored under the old clock (and
         the 'calm' state with it). The next evaluation takes the latest poll's results
         in again; their ages are then measured against the corrected clock, since each
-        observation carries the station's own time."""
+        observation carries the station's own time.
+
+        Lightning: the ages are on the monotonic clock, so a flash that counts keeps
+        counting for exactly the time it had left. But what the GLM layer fetched under
+        the old clock may be another day's data (it looks granules up by date), so the
+        last poll is forgotten, and with it the record of how long lightning has been
+        watched: the layer polls again at once, and that poll starts a new record."""
         with self._lock:
             self._obs.clear()
             self._wind_calm = False
+            self._glm_poll_mono = self._glm_nearest = self._glm_watch_mono = None
 
     def station_summary(self, now=None) -> dict:
         """Medians over the stations whose latest observation is fresh, in the units of
@@ -220,17 +426,21 @@ class DewMonitor:
                 "stations": used}
 
     # -- the verdict --------------------------------------------------------------
-    def evaluate(self, device0_safe, outlook, now=None) -> dict:
+    def evaluate(self, device0_safe, outlook, now=None, mono=None) -> dict:
         """The device 1 state block. `device0_safe` is the main monitor's verdict of this
         same evaluation; `outlook` is NwsForecastPoller.outlook() (or None when the
-        forecast layer is off)."""
+        forecast layer is off). The station and lightning data are what
+        update_stations() and update_lightning() last took in. `now` is the wall clock
+        (station and forecast times); `mono` the monotonic clock the lightning ages are
+        measured on (default: time.monotonic())."""
         cfg = self.cfg
         now = time.time() if now is None else now
+        mono = time.monotonic() if mono is None else mono
         summ = self.station_summary(now)
         need = cfg.DEW_MIN_STATIONS
         reasons = []
         checks = {"device0": bool(device0_safe), "spread": None, "wind": None,
-                  "cloud": None, "precip": None}
+                  "cloud": None, "precip": None, "lightning": None}
 
         if not device0_safe:
             reasons.append("the safety monitor (device 0) is UNSAFE")
@@ -298,6 +508,9 @@ class DewMonitor:
                                        % (name, _g(value), label, _g(limit)))
                 checks[key] = ok
 
+        checks["lightning"], lightning, why = self._lightning(mono)
+        reasons.extend(why)
+
         is_safe = all(v is True for v in checks.values())
         return {"enabled": True, "is_safe": is_safe,
                 "reasons": [] if is_safe else reasons,
@@ -308,4 +521,4 @@ class DewMonitor:
                 "stations_used": summ["stations_used"],
                 "stations_wind": summ["stations_wind"],
                 "stations": summ["stations"], "wind_calm": calm,
-                "forecast": fc, "thresholds": thresholds(cfg)}
+                "forecast": fc, "lightning": lightning, "thresholds": thresholds(cfg)}

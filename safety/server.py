@@ -414,10 +414,29 @@ def main(argv=None):
     if dew is not None:
         log.info("dew monitor: Alpaca SafetyMonitor device %d — IsSafe while device %d is "
                  "SAFE, spread <= %g degC, wind <= %g mph (until > %g mph), forecast cloud "
-                 "< %g%% and precipitation probability < %g%% this hour and next",
+                 "< %g%% and precipitation probability < %g%% this hour and next, and no "
+                 "GLM lightning within %g km in the last %g min (watched for that long)",
                  cfg.DEW_DEVICE_NUMBER, cfg.DEVICE_NUMBER, cfg.DEW_SPREAD_MAX_C,
                  cfg.DEW_WIND_MAX_MPH, cfg.DEW_WIND_UNSAFE_ABOVE_MPH,
-                 cfg.DEW_CLOUD_BELOW_PCT, cfg.DEW_PRECIP_BELOW_PCT)
+                 cfg.DEW_CLOUD_BELOW_PCT, cfg.DEW_PRECIP_BELOW_PCT, cfg.DEW_GLM_KM,
+                 max(0.0, cfg.GLM_COOLOFF_HOURS * 60.0))
+        if glm is None:
+            no_glm = "TTU_SAFETY_GLM=0"
+        elif not glm_lightning.deps_available():
+            no_glm = "numpy/netCDF4 not installed"
+        elif not glm_lightning.site_in_fov(*cfg.GEOCODE):
+            no_glm = "the site is outside GOES-East coverage"
+        else:
+            no_glm = None
+        if no_glm:
+            # the rule needs lightning data: without the GLM layer device 1 can never
+            # be true. Say so once, loudly — it would otherwise just look like "no dew".
+            log.warning("dew monitor: the GLM lightning layer is off (%s) — device %d will "
+                        "ALWAYS read false, i.e. the dome keeps trusting its rain sensor",
+                        no_glm, cfg.DEW_DEVICE_NUMBER)
+            eventlog.record("CONFIG", reason="dew monitor needs the GLM lightning layer, "
+                            "which is off", result="device %d always false"
+                            % cfg.DEW_DEVICE_NUMBER)
     elif not cfg.DEW_ENABLED:
         log.warning("dew monitor disabled (TTU_SAFETY_DEW=0) — no Alpaca device %d",
                     cfg.DEW_DEVICE_NUMBER)

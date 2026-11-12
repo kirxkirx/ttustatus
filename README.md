@@ -13,8 +13,8 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    **NWS forecast**, **GOES GLM lightning**, **MRMS radar**, **NWS warnings** (a Tornado,
    Dust Storm or High Wind Warning over the site, for the warning's duration) and an
    **internet-loss watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca
-   SafetyMonitor** so NINA can react (park/close on unsafe). The status page shows the
-   monitor's state, endpoint, inputs, radar map, and log, plus a **Hazards** section:
+   SafetyMonitor** (device 0) so NINA can react (park/close on unsafe). The status page
+   shows the monitor's state, endpoint, inputs, radar map, and log, plus a **Hazards** section:
    every active NWS alert on the map, and information-only smoke, wildfires, SPC outlook
    and mesoscale discussions and storm reports, also drawn on the radar map. Only those
    three (configurable) warnings can close the roof; everything else is shown, never
@@ -22,6 +22,40 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
 
 Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
 **[README_SAFETY.md](README_SAFETY.md)** for the full design and reference.
+
+## The two Alpaca SafetyMonitor devices
+
+The daemon exposes **two** ASCOM Alpaca SafetyMonitor devices on the same address and
+port (11111). They answer different questions, and only device 0 is a safety verdict.
+
+| | Device 0: `TTU Safety Monitor` | Device 1: `TTU Dew Monitor` |
+|---|---|---|
+| What it is | the normal safety monitor | a special-purpose monitor |
+| `IsSafe` is `true` | while it is safe to observe: the sun is down, the Pi's own readings are current and none of the checks (humidity, rain, forecast, lightning, radar, NWS warnings, internet link) reports a hazard | only while dew is expected to form: device 0 is SAFE **and** the night is clear, calm and humid, with no rain in the forecast and no lightning within 60 km |
+| Who uses it | **NINA and any other observatory or dome control software** | **only this observatory's own custom dome-control code** (the status page calls it "the dome driver") |
+| What for | parking the telescope and closing the roof when conditions turn unsafe | temporarily disabling the dome's rain sensor, which is susceptible to dew |
+
+**Device 0 is the one to select** in NINA and in any other software that needs to know
+whether observing is safe.
+
+**Device 1 is not a safety verdict.** The dome has a rain sensor of its own, a bare
+plate under the night sky. Dew forms on it on a clear, calm, humid night; the sensor
+then reads "wet" and the roof closes in perfectly good weather. Device 1 turns `true`
+only when dew is expected, and this observatory's own dome-control code reads it to
+disable (ignore) that rain sensor for as long as it stays `true`. Nothing else should
+use it, and in particular not the dome or safety-monitor settings of NINA:
+
+- Its `false` does not mean "unsafe". On a dry or windy night, in perfectly good
+  observing weather, it reads `false`.
+- Its `true` does not mean more than device 0's: it is never `true` while device 0 is
+  not. Selected by mistake as a safety monitor it therefore errs to the cautious side
+  (lost observing time, never a roof left open).
+- It never opens or closes anything. `false` only hands the decision back to the rain
+  sensor.
+- An observatory with no use for it removes it with `TTU_SAFETY_DEW=0`.
+
+The exact rule of each device is in README_SAFETY.md: "Safety logic" for device 0,
+"Dew monitor (Alpaca device 1)" for device 1.
 
 ## Sister projects
 
@@ -95,7 +129,7 @@ run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd)
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
   hazard_feeds.py        information-only hazard feeds (HMS, NIFC, SPC, LSR)
-  dew.py                 the dew monitor: Alpaca device 1, the rain-sensor override for the dome driver
+  dew.py                 the dew monitor (Alpaca device 1), for the observatory's own dome code
   weatherlog.py          weather log (CSV): collected in RAM, copied to the SD card once a day
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
 ttustatus.env.example    template for the secrets file (WU key, User-Agent contact, CARTO key)
@@ -162,13 +196,15 @@ only `sudo systemctl restart ttu-safety`; rerun the installer if the unit file c
 (Migrating from the old setup: remove the `@reboot` line from `crontab -e` and
 `pkill -f run_status_page.sh`.)
 
-Then connect NINA to the Alpaca SafetyMonitor (device 0, port 11111). If NINA and the Pi are
-on different subnets, see README_SAFETY.md ("Connecting NINA").
+Then connect NINA to the Alpaca SafetyMonitor **device 0** (`TTU Safety Monitor`, port
+11111). If NINA and the Pi are on different subnets, see README_SAFETY.md ("Connecting
+NINA").
 
-The daemon also serves **device 1, the dew monitor**: a second SafetyMonitor that tells
-the dome driver when a wet rain sensor is dew, so that dew does not close the roof. It
-is for the dome driver, not for NINA. See README_SAFETY.md ("Dew monitor") for the rule
-and ("Weather log") for the downloadable CSV log that goes with it.
+Alpaca discovery also lists **device 1**, `TTU Dew Monitor`. Do not select it in NINA: it
+is the special-purpose dew monitor described under
+[The two Alpaca SafetyMonitor devices](#the-two-alpaca-safetymonitor-devices), not a
+safety verdict. See README_SAFETY.md ("Dew monitor") for its rule and ("Weather log") for
+the downloadable CSV log that goes with it.
 
 ## Develop / test
 
