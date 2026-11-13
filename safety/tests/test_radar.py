@@ -641,7 +641,8 @@ def _xy(t, lat, lon):
 
 
 def _count(img, rgb):
-    return sum(1 for p in img.getdata() if p == tuple(rgb))
+    # rd._values, not img.getdata(): Pillow 14 removes getdata (see radar._values)
+    return sum(1 for p in rd._values(img) if p == tuple(rgb))
 
 
 def _near(img, xy, rgb, r=1):

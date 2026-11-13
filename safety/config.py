@@ -300,7 +300,10 @@ if not RADAR_AWS_URL.startswith(("http://", "https://")):
                            f"URL — using {_RADAR_AWS_DEFAULT}")
     RADAR_AWS_URL = _RADAR_AWS_DEFAULT
 # A poll that got no new frame (a source late or down) is retried this soon instead of
-# after a full RADAR_POLL_INTERVAL: a missed frame costs a minute, not five.
+# after a full RADAR_POLL_INTERVAL: a missed frame costs a minute, not five. Only the
+# first three misses in a row (radar.RETRY_QUICK_MAX) are retried this soon; after that
+# the regular interval applies until a new frame arrives, so a source that stays down or
+# stalled is not asked every minute for the whole outage.
 RADAR_RETRY_SEC = _clamp("TTU_SAFETY_RADAR_RETRY_SEC",
                          _env_int("TTU_SAFETY_RADAR_RETRY_SEC", 60), 30,
                          max(30, RADAR_POLL_INTERVAL))
@@ -695,6 +698,29 @@ CONN_PROBE_URLS = [
     "https://mesonet.agron.iastate.edu/",
     "https://noaa-goes19.s3.amazonaws.com/",
 ]
+
+# --- system clock (chrony) ---------------------------------------------------
+# HARD VETO until chrony confirms the clock (safety/timesync.py): device 0 reads UNSAFE
+# while `chronyc tracking` does not show synchronisation to a real time source — the GPS
+# reference clock or an NTP server; chrony's "local" self-reference does not count — with
+# chrony's own error bound within CLOCK_MAX_ERROR_SEC. Everything else is computed from
+# the clock (the sun's altitude above all), and a Pi can boot with a clock months off.
+# A failed check is tolerated for CLOCK_GRACE_SEC once the clock has been confirmed in
+# this run (a chronyd restart); a clock step ends that grace at once.
+CLOCK_SYNC_ENABLED = _env_flag("TTU_SAFETY_CLOCK_SYNC", True)
+if not CLOCK_SYNC_ENABLED:
+    CONFIG_WARNINGS.append("TTU_SAFETY_CLOCK_SYNC=0: the clock check is OFF — device 0 no "
+                           "longer waits for chrony, so a Pi booting with a wrong clock "
+                           "would compute the sun for the wrong time of day")
+CLOCK_CHECK_SEC = _clamp("TTU_SAFETY_CLOCK_CHECK_SEC",
+                         _env_int("TTU_SAFETY_CLOCK_CHECK_SEC", 30), 5, 600)
+# chrony's error bound on a synchronised Pi is microseconds (GPS) to tens of milliseconds
+# (NTP over the internet); seconds mean it is still correcting a large error
+CLOCK_MAX_ERROR_SEC = _clamp("TTU_SAFETY_CLOCK_MAX_ERROR_SEC",
+                             _env_float("TTU_SAFETY_CLOCK_MAX_ERROR_SEC", 5.0), 0.01, 60.0)
+CLOCK_GRACE_SEC = _clamp("TTU_SAFETY_CLOCK_GRACE_SEC",
+                         _env_int("TTU_SAFETY_CLOCK_GRACE_SEC", 600), 0, 3600)
+CLOCK_CHRONYC = _env_str("TTU_SAFETY_CHRONYC", "chronyc").strip() or "chronyc"
 
 # --- files ------------------------------------------------------------------
 # Transient (fine in /tmp): the page<->daemon exchange.

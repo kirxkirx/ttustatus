@@ -52,7 +52,6 @@ overlay on the map the PNG is pixel-identical to the pre-hazards thumbnail.
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import http.client
 import io
@@ -184,7 +183,18 @@ POLL_DEADLINE = 120             # s: no radar request of a poll starts later tha
 MIN_TIMEOUT = 3                 # s: floor of a timeout shortened by the poll's deadline
 LISTING_MAX_BYTES = 1 << 20     # an hour's listing is ~11 KB
 FRAME_MAX_BYTES = 32 << 20      # a frame is ~0.6 (IEM) or ~1 MB (AWS); more is no frame
+# The bucket's file is gzip'd GRIB2 whose payload is itself a PNG, so it barely shrinks:
+# ~1.2 MB inflated. gzip.decompress() has no output limit, and a malformed file of a few
+# MB of zeros would inflate to gigabytes and take the Pi's memory with it, so inflating
+# stops here and the file is refused.
+GRIB_MAX_BYTES = 16 << 20
 GRIB_TIME_TOL = 1               # s: a GRIB2 file's own time against its name's
+# A poll that got no new frame is retried after RADAR_RETRY_SEC, but only this many times
+# in a row: a source a minute late should cost a minute, while a source that stays down
+# or stalled would otherwise be asked every minute for as long as the outage lasts (IEM's
+# 20-min window walked every 60 s is ~480 requests an hour, five times the old rate).
+# After that the regular RADAR_POLL_INTERVAL applies until a new frame arrives.
+RETRY_QUICK_MAX = 3
 FRAME_BOX_MARGIN_DEG = 0.05     # around the cells the ring check and the maps read
 _mono = time.monotonic          # the poll's deadline clock (tests replace it)
 
@@ -240,6 +250,21 @@ def _errtext(e) -> str:
     return str(r if r is not None else e) or type(e).__name__
 
 
+def _check_complete(r, body, max_bytes):
+    """A reply cut short — the server closing the connection before Content-Length bytes
+    arrived — comes back from a bounded read() as a short body, with no error. It has to
+    count as a failed DOWNLOAD (asked again at the next try), not as a bad FILE: a
+    truncated gzip or PNG would otherwise be refused for its content and, as the same
+    file, never be downloaded again (RadarPoller._refused). Raises IncompleteRead (an
+    HTTPException: "no answer"). A body stopped by our own max_bytes is not cut short."""
+    try:
+        want = int(r.headers.get("Content-Length"))
+    except (TypeError, ValueError, AttributeError):
+        return                          # no length announced: nothing to compare with
+    if len(body) < want and (max_bytes is None or len(body) <= max_bytes):
+        raise http.client.IncompleteRead(body[:0], want - len(body))
+
+
 def _http(url, method="GET", timeout=META_TIMEOUT, max_bytes=None):
     """One request: ``(status, headers, body, received)``, ``received`` being this host's
     clock when the reply's headers arrived — what the reply's Date is compared with (a
@@ -254,6 +279,7 @@ def _http(url, method="GET", timeout=META_TIMEOUT, max_bytes=None):
             body = b""
             if method != "HEAD":
                 body = r.read(-1 if max_bytes is None else max_bytes + 1)
+                _check_complete(r, body, max_bytes)
             return (getattr(r, "status", None) or 200), r.headers, body, received
     except urllib.error.HTTPError as e:
         received = time.time()
@@ -271,10 +297,15 @@ class _PollNet:
     nothing more this poll, so a dead host costs one timeout, not one per frame probed)
     and the server clocks the replies carried (the wrong-clock guard)."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, clock_ok=None):
         self.deadline = _mono() + POLL_DEADLINE
         self.phase_end = None   # the current lookup's budget (phase), None: the deadline
         self.tol = clock_tolerance(cfg)
+        # The skew beyond which a reply is refused in THIS poll. It is the tolerance, or a
+        # little less while the previous polls found the clock wrong (``clock_ok`` False):
+        # without that margin a clock off by almost exactly the tolerance would be
+        # refused and accepted by turns (servertime.HYSTERESIS_SEC).
+        self.limit = servertime.limit(self.tol, clock_ok)
         self.down = {}          # host -> why it is asked nothing more this poll
         self.skews = []         # (source, server minus this host's clock in s) per reply
 
@@ -309,7 +340,7 @@ class _PollNet:
         skew = servertime.skew_s(headers, reply[3] if len(reply) > 3 else None)
         if skew is not None:
             self.skews.append((source, skew))
-            if self.tol and abs(skew) > self.tol:
+            if self.limit and abs(skew) > self.limit:
                 raise ClockMismatch(skew)
         if max_bytes is not None and len(body) > max_bytes:
             raise FrameError("reply larger than %d MB" % max(1, max_bytes >> 20))
@@ -477,6 +508,28 @@ def lcref_index(drs):
     return index
 
 
+def _values(img):
+    """An image's pixel values, row after row. Pillow 14 (due 2027-10) removes
+    Image.getdata() in favour of get_flattened_data(), which Pillow 12 introduced; the Pi
+    runs 11.1 (trixie), which has only getdata(). Using whichever exists keeps the decoder
+    working on both, and keeps CI (which installs the newest Pillow) green after 2027-10."""
+    flat = getattr(img, "get_flattened_data", None)
+    return flat() if callable(flat) else img.getdata()
+
+
+def _gunzip(data, limit):
+    """gzip-inflate ``data``, refusing output beyond ``limit`` bytes: gzip.decompress() has
+    no limit, so a malformed (not even malicious) file of a few MB could inflate to
+    gigabytes on the Pi. A stream cut short is refused too, as gzip.decompress() would."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)     # 16+: the gzip wrapper, CRC checked
+    out = d.decompress(data, limit)
+    if d.unconsumed_tail:
+        raise FrameError("the file inflates to more than %d MB" % (limit >> 20))
+    if not d.eof:
+        raise FrameError("unreadable GRIB2 (the gzip stream ends early)")
+    return out
+
+
 def aws_image(data, ts, box):
     """The bucket's SeamlessHSR file of time ``ts`` as an lcref image: an "L" image on the
     full lcref grid holding lcref's palette indices inside ``box`` (frame_box: the cells
@@ -485,7 +538,7 @@ def aws_image(data, ts, box):
     SeamlessHSR (AWS_PRODUCT_ID), of the time its name gives (GRIB_TIME_TOL) and on
     lcref's grid; anything else is a FrameError."""
     try:
-        raw = gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data
+        raw = _gunzip(data, GRIB_MAX_BYTES) if data[:2] == b"\x1f\x8b" else data
         meta = parse_grib2(raw)
     except (OSError, EOFError, ValueError, zlib.error, struct.error, IndexError) as e:
         raise FrameError("unreadable GRIB2 (%s)" % _errtext(e)) from e
@@ -513,17 +566,23 @@ def aws_image(data, ts, box):
         im = Image.open(io.BytesIO(meta["payload"]))
         if im.format != "PNG":
             raise ValueError("payload is %s, not PNG" % im.format)
+    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
+        raise FrameError("unreadable PNG payload (%s)" % _errtext(e)) from e
+    # Size and mode come from the PNG header, before a single pixel is decoded. Checking
+    # them BEFORE load() means a payload declaring some other, larger image is refused
+    # without first allocating it (a 13300x13300 one would cost ~340 MB on the Pi).
+    if im.size != (GRID_W, GRID_H) or im.mode not in ("I", "I;16", "I;16B", "I;16L", "L"):
+        raise FrameError("PNG payload of %dx%d in mode %s" % (im.size + (im.mode,)))
+    try:
         im.load()
     except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
         raise FrameError("unreadable PNG payload (%s)" % _errtext(e)) from e
-    if im.size != (GRID_W, GRID_H) or im.mode not in ("I", "I;16", "I;16B", "I;16L", "L"):
-        raise FrameError("PNG payload of %dx%d in mode %s" % (im.size + (im.mode,)))
     c0, r0, c1, r1 = box
     crop = im.crop((c0, r0, c1, r1))
     del im                              # the 98 MB grid goes here, before the 24.5 MB one
     try:
         index = lcref_index(drs)
-        cells = bytes(map(index, crop.getdata())) if crop.size[0] and crop.size[1] else b""
+        cells = bytes(map(index, _values(crop))) if crop.size[0] and crop.size[1] else b""
     except (ArithmeticError, ValueError, TypeError) as e:
         raise FrameError("values not convertible (%s)" % _errtext(e)) from e
     out = Image.new("L", (GRID_W, GRID_H), 0)
@@ -536,12 +595,17 @@ def lcref_image(data):
     """IEM's lcref PNG, checked: palette indices on the full lcref grid."""
     try:
         img = Image.open(io.BytesIO(data))
-        img.load()
     except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
         raise FrameError("unreadable PNG (%s)" % _errtext(e)) from e
+    # checked from the header, BEFORE decoding: a PNG of some other, larger size is
+    # refused without allocating it first (see aws_image)
     if img.mode not in ("P", "L") or img.size != (GRID_W, GRID_H):
         raise FrameError("PNG of %dx%d in mode %s (lcref is %dx%d palette indices)"
                          % (img.size + (img.mode, GRID_W, GRID_H)))
+    try:
+        img.load()
+    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
+        raise FrameError("unreadable PNG (%s)" % _errtext(e)) from e
     return img
 
 
@@ -552,6 +616,20 @@ def fetch_frame(cfg, net, source, url, ts, box):
     if status != 200:
         raise SourceError("HTTP %d for the frame of %s" % (status, _hhmm(ts)))
     return aws_image(body, ts, box) if source == "aws" else lcref_image(body)
+
+
+class _AtSite:
+    """``cfg`` seen from a fixed site: GEOCODE is the site given, every other setting is
+    read through from cfg. A radar poll hands this to frame_box() and check_rain() so that
+    the box it decodes and the ring it checks always describe the same place, even if the
+    GPS position is adopted half-way through the poll (see RadarPoller.poll_now)."""
+
+    def __init__(self, cfg, site):
+        self._cfg = cfg
+        self.GEOCODE = tuple(site)
+
+    def __getattr__(self, name):
+        return getattr(self._cfg, name)
 
 
 def frame_box(cfg, thumbs=()):
@@ -2378,6 +2456,15 @@ class RadarPoller:
         self._counted_ts = None
         self._source_state = {}        # source -> what the last poll learnt of it
         self._why = None               # why the last poll got no new frame (None: it did)
+        # polls in a row that got no new frame: only the first RETRY_QUICK_MAX of them are
+        # retried after RADAR_RETRY_SEC (see _no_new_frame)
+        self._misses = 0
+        # source -> (frame time, why) of the newest frame whose CONTENT was refused
+        # (FrameError: not MRMS's product, the wrong grid or time, unreadable). The same
+        # URL gives the same bytes, so such a file is not downloaded again on every retry
+        # — only a newer frame is. A frame that could not be DOWNLOADED (no answer, an
+        # HTTP error) is not recorded here and is tried again.
+        self._refused = {}
         self._clock_ok = None          # the wrong-clock guard's last verdict (None: none yet)
         self._clock_skew = None        # server minus this host's clock, s
         self._in_ring = False
@@ -2439,9 +2526,19 @@ class RadarPoller:
                 self.log.record("CONFIG", reason="site outside MRMS coverage",
                                 result="radar layer disabled")
             return {"ok": False, "error": "site outside MRMS coverage"}
-        net = _PollNet(self.cfg)
         with self._lock:
             held = self._frame_ts
+            clock_ok = self._clock_ok
+        net = _PollNet(self.cfg, clock_ok)
+        # ONE SITE FOR THE WHOLE POLL. The evaluator thread may adopt the GPS position
+        # (SafetyMonitor._update_geocode) while this poll is downloading. An AWS frame is
+        # decoded only inside frame_box, so a box made for the old site and a ring check
+        # made for the new one would read cells that were never decoded — all "no echo" —
+        # and call a rainy frame clear. The box and the check therefore both use the site
+        # as it was when the poll began, and a frame whose poll saw the site change is set
+        # aside (below) and fetched again for the new site at the next try.
+        site = tuple(self.cfg.GEOCODE)
+        at_site = _AtSite(self.cfg, site)
         # 1. What each source has: the bucket's listing, IEM's newest frame (a HEAD or
         # two). Both are asked every poll, so the page always shows whether the backup
         # works, not only when it is needed.
@@ -2468,17 +2565,30 @@ class RadarPoller:
         # The same frame from both: IEM's (a smaller download, a lighter decode). Frame
         # times less than SAME_FRAME_S apart are one frame (both archives name MRMS's
         # even minutes, but nothing else may make one frame count twice).
-        cands = sorted(((ts, src, url) for src, (ts, url) in found.items()
-                        if held is None or ts - held >= SAME_FRAME_S),
-                       key=lambda c: (-c[0], c[1] != "iem"))
-        box = frame_box(self.cfg, self._thumbs)
+        cands = []
+        skipped = False                 # a newer frame existed, but was refused before
+        for src, (ts, url) in found.items():
+            if held is not None and ts - held < SAME_FRAME_S:
+                continue
+            refused = self._refused.get(src)
+            if refused is not None and refused[0] == ts:
+                # this very file was refused before: say so again, do not fetch it again
+                states[src]["error"] = "frame %s: %s (not downloaded again)" % (
+                    _hhmm(ts), refused[1])
+                skipped = True
+                continue
+            cands.append((ts, src, url))
+        cands.sort(key=lambda c: (-c[0], c[1] != "iem"))
+        box = frame_box(at_site, self._thumbs)
         net.phase(None)                 # the downloads: what is left of the poll's deadline
         img = used = None
         for ts, src, url in cands:
             try:
                 img = fetch_frame(self.cfg, net, src, url, ts, box)
             except Exception as e:      # noqa: BLE001 - a bad frame never blocks the other
-                if not isinstance(e, SourceError):
+                if isinstance(e, FrameError):
+                    self._refused[src] = (ts, str(e))
+                elif not isinstance(e, SourceError):
                     log.exception("radar frame %s from %s: unexpected error", _hhmm(ts), src)
                     e = "unexpected error (%s: %s)" % (type(e).__name__, e)
                 states[src]["error"] = "frame %s: %s" % (_hhmm(ts), e)
@@ -2490,9 +2600,20 @@ class RadarPoller:
             break
         self._note_clock(net)
         if img is None:
-            return self._no_new_frame(now, held, states, bool(cands))
+            # (a refused newer frame counts as tried: the page must not say "no frame newer
+            # than ..." right before naming that newer frame and why it was refused)
+            return self._no_new_frame(now, held, states, bool(cands) or skipped)
+        if tuple(self.cfg.GEOCODE) != site:
+            # the site changed while the frame was downloading (see "ONE SITE" above):
+            # this frame was cut for the old site, so it is not checked; the next try
+            # fetches it again for the new one
+            img = None
+            log.info("site coordinates changed during the radar poll — frame %s set aside "
+                     "and fetched again for the new site", _hhmm(used[0]))
+            return self._no_new_frame(now, held, states, True,
+                                      note="the site changed during the poll")
         ts, src = used
-        in_ring, nearest, count = check_rain(self.cfg, img)
+        in_ring, nearest, count = check_rain(at_site, img)
         frame_txt = "MRMS %s · %s" % (_utc(ts).strftime("%Y-%m-%d %H:%MZ"), SOURCE_SHORT[src])
         # render every configured map (dark + optional light); primary = the first (dark)
         overlays = self._collect_overlays(now)
@@ -2508,6 +2629,7 @@ class RadarPoller:
             self._frame_utc = _utc(ts).isoformat()
             self._source_state = states
             self._why = None
+            self._misses = 0            # a new frame: the next miss is retried quickly again
             self._in_ring = in_ring
             self._nearest_km = nearest
             self._count = count
@@ -2562,11 +2684,14 @@ class RadarPoller:
                 "in_ring": in_ring, "nearest_km": nearest, "count": count,
                 "streak": streak, "confirmed": confirmed}
 
-    def _no_new_frame(self, now, held, states, tried):
+    def _no_new_frame(self, now, held, states, tried, note=None):
         """The end of a poll without a new frame: the held one stays (fresh by its own time
-        until RADAR_STALE_AFTER_SEC), the reason is kept for the page, and the next try
-        comes after RADAR_RETRY_SEC instead of a full RADAR_POLL_INTERVAL."""
-        parts = []
+        until RADAR_STALE_AFTER_SEC), the reason is kept for the page (``note`` first, when
+        given), and the next try comes after RADAR_RETRY_SEC instead of a full
+        RADAR_POLL_INTERVAL — for the first RETRY_QUICK_MAX misses in a row only: a
+        source that stays down or stalled is then asked at the regular interval, as
+        before the quick retry existed, instead of every minute for the whole outage."""
+        parts = [note] if note else []
         for src, st in states.items():
             if st["error"]:
                 parts.append("%s: %s" % (SOURCE_NAMES[src], st["error"]))
@@ -2574,9 +2699,11 @@ class RadarPoller:
                 parts.append("%s: newest frame %s" % (SOURCE_NAMES[src], _hhmm(st["newest_ts"])))
         why = ("no frame newer than %s; " % _hhmm(held) if held is not None and not tried
                else "") + "; ".join(parts)
-        retry = max(1, min(int(getattr(self.cfg, "RADAR_RETRY_SEC", 60)),
-                           int(self.cfg.RADAR_POLL_INTERVAL)))
+        interval = int(self.cfg.RADAR_POLL_INTERVAL)
+        quick = max(1, min(int(getattr(self.cfg, "RADAR_RETRY_SEC", 60)), interval))
         with self._lock:
+            self._misses += 1
+            retry = quick if self._misses <= RETRY_QUICK_MAX else interval
             self._poll_every = retry
             self._source_state = states
             prev, self._why = self._why, why
@@ -2587,11 +2714,13 @@ class RadarPoller:
     def _note_clock(self, net):
         """The wrong-clock guard's verdict on this poll's replies: the clock is right when
         one radar server's Date agrees with it, wrong when every server that sent one
-        disagrees by more than SERVER_CLOCK_TOL_SEC (their frames were refused). Changes
-        go to the log and the event log."""
-        if not net.skews or not net.tol:
+        disagrees by more than SERVER_CLOCK_TOL_SEC (their frames were refused) — less
+        servertime.HYSTERESIS_SEC while it is already wrong, the same limit the requests
+        of this poll were checked against (net.limit), so the verdict cannot flicker at
+        the edge. Changes go to the log and the event log."""
+        if not net.skews or not net.limit:
             return
-        agree = [s for _, s in net.skews if abs(s) <= net.tol]
+        agree = [s for _, s in net.skews if abs(s) <= net.limit]
         ok = bool(agree)
         skews = sorted(s for _, s in net.skews)
         skew = min(agree, key=abs) if ok else skews[len(skews) // 2]
@@ -2741,6 +2870,7 @@ class RadarPoller:
                 log.warning("radar post-rain freeze restarted across a clock step")
             self._last_poll_ts = None
             self._poll_every = self.cfg.RADAR_POLL_INTERVAL
+            self._misses = 0
             # The re-poll fetches the newest frame again and redraws it; one already
             # counted is not counted twice (frame times are the servers', not this
             # clock's). A count under a clock that ran far ahead is dropped with its

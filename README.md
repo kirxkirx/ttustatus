@@ -1,4 +1,5 @@
 [![CI](https://github.com/kirxkirx/ttustatus/actions/workflows/ci.yml/badge.svg)](https://github.com/kirxkirx/ttustatus/actions/workflows/ci.yml)
+[![Raspberry Pi OS](https://github.com/kirxkirx/ttustatus/actions/workflows/raspios.yml/badge.svg)](https://github.com/kirxkirx/ttustatus/actions/workflows/raspios.yml)
 
 # ttustatus
 
@@ -12,8 +13,9 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    that aggregates **sun altitude**, **humidity**, **Weather Underground rain**, the
    **NWS forecast**, **GOES GLM lightning**, **MRMS radar** (from NOAA's AWS bucket or the
    Iowa Environmental Mesonet, whichever has the newer frame), **NWS warnings** (a Tornado,
-   Dust Storm or High Wind Warning over the site, for the warning's duration) and an
-   **internet-loss watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca
+   Dust Storm or High Wind Warning over the site, for the warning's duration), an
+   **internet-loss watchdog** and a **clock check** (unsafe until chrony is synchronised
+   to the GPS or an NTP server) into a single `IsSafe` boolean, served as an ASCOM **Alpaca
    SafetyMonitor** (device 0) so NINA can react (park/close on unsafe). The status page
    shows the monitor's state, endpoint, inputs, radar map, and log, plus a **Hazards** section:
    every active NWS alert on the map, and information-only smoke, wildfires, SPC outlook
@@ -139,8 +141,11 @@ ttustatus.env.example    template for the secrets file (WU key, User-Agent conta
 ## Deploy (Raspberry Pi)
 
 ```bash
-# 1. dependencies (Raspberry Pi OS blocks system-wide pip; use apt)
-sudo apt update && sudo apt install -y python3-flask python3-waitress git
+# 1. dependencies (Raspberry Pi OS blocks system-wide pip; use apt). chrony is required:
+#    the safety monitor reads UNSAFE until `chronyc tracking` shows the clock synchronised
+#    to the GPS or an NTP server. python3-pil / -numpy / -netcdf4: the radar and GLM layers.
+sudo apt update && sudo apt install -y python3-flask python3-waitress git chrony \
+    python3-pil python3-numpy python3-netcdf4
 
 # 2. clone
 cd ~ && git clone https://github.com/kirxkirx/ttustatus.git   # public repo: no credentials needed

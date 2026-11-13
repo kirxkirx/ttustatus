@@ -1,0 +1,71 @@
+name: Raspberry Pi OS
+
+# The test suite and a deployment smoke test (ci/raspios_test.sh) inside real Raspberry Pi
+# OS (64-bit) images, run under QEMU by pguyot/arm-runner-action: the Pi's own Python,
+# Pillow, numpy, netCDF4 and chrony from apt, where normal CI (ci.yml) uses the newest pip
+# packages on x86. Two images:
+#   * pinned — Raspberry Pi OS trixie of 2026-06-18 (Debian 13.5). The observatory Pi runs
+#     trixie (Debian 13.6, aarch64); no image was published for 13.6 itself, and apt
+#     brings the packages the test installs up to date either way;
+#   * newest — whatever Raspberry Pi publishes as its latest image when the job runs
+#     (today 2026-10-06 trixie, Debian 13.7), so the next release is tested here before
+#     the Pi is upgraded to it.
+# Emulated ARM is slow (15-25 min a run), so this runs on pushes to main that change more
+# than documentation, weekly (new images appear without a push), and by hand.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  schedule:
+    - cron: "23 7 * * 1"           # Mondays, 07:23 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: raspios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  raspios:
+    name: ${{ matrix.name }}
+    # ubuntu-24.04's qemu (>= 8.2) reports the emulated CPU in /proc/cpuinfo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Raspberry Pi OS trixie 2026-06-18 (as on the Pi)
+            image: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz
+          - name: Raspberry Pi OS, newest image
+            image: latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image to test
+        id: image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          # "latest" is resolved to the file it stands for, so the log names the image
+          # actually tested (the action's raspios_lite_arm64:latest alias would not say)
+          if [ "$IMAGE" = latest ]; then
+            url=$(curl -sSfI https://downloads.raspberrypi.com/raspios_lite_arm64_latest \
+                  | sed -n 's/^[Ll]ocation: *//p' | tr -d '\r')
+          else
+            url=$IMAGE
+          fi
+          test -n "$url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "testing $url"
+
+      - name: Test and deploy inside the image
+        uses: pguyot/arm-runner-action@v2
+        with:
+          base_image: ${{ steps.image.outputs.url }}
+          cpu: max:cortex-a72           # the Raspberry Pi 4's CPU
+          image_additional_mb: 2048     # room for the packages apt installs (~400 MB)
+          optimize_image: no            # the image is thrown away afterwards
+          bind_mount_repository: true
+          shell: /bin/bash -eo pipefail
+          commands: |
+            bash ci/raspios_test.sh

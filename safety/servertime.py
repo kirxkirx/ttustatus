@@ -13,6 +13,31 @@ import email.utils
 import time
 from datetime import timezone
 
+# HYSTERESIS. A Date header has whole seconds, so a clock that is off by almost exactly
+# the tolerance measures just inside it on one reply and just outside on the next: the
+# verdict would flip poll after poll, and every flip writes a CLOCK event to the event
+# log on the SD card (a review counted 68 of them in six hours with a clock 59.6 s fast).
+# So once a clock has been found wrong, its replies must agree to within the tolerance
+# MINUS this margin before data is accepted again; a clock found right keeps the full
+# tolerance. A few seconds of drift can then no longer make the verdict flicker.
+HYSTERESIS_SEC = 10.0
+
+
+def limit(tolerance, clock_ok):
+    """The skew (s) beyond which a reply is refused right now: the tolerance itself while
+    the clock is believed right (or nothing is known yet), the tolerance minus
+    HYSTERESIS_SEC once it has been found wrong (never below half the tolerance). 0 means
+    the guard is off."""
+    try:
+        tol = float(tolerance or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not tol > 0.0:
+        return 0.0
+    if clock_ok is False:
+        return max(tol / 2.0, tol - HYSTERESIS_SEC)
+    return tol
+
 
 def skew_s(headers, now=None):
     """Seconds by which the server's clock is AHEAD of this host's (negative: behind),

@@ -3,9 +3,20 @@ import time
 
 import pytest
 
-from safety import config, wu_poll
+from safety import config, timesync, wu_poll
 from safety.eventlog import EventLog
 from safety.monitor import RainPoller, SafetyMonitor
+
+
+@pytest.fixture(autouse=True)
+def _no_real_chronyc(monkeypatch):
+    """No test asks the test machine's chrony. A test that starts the daemon
+    (server.main) would otherwise depend on that machine's clock state — synchronised on
+    a workstation, "chronyc not installed" on CI. Every ClockSyncWatch made without a
+    runner gets this one; the clock-check tests pass their own."""
+    def _absent(cfg):
+        raise FileNotFoundError("chronyc (not asked in tests)")
+    monkeypatch.setattr(timesync, "run_chronyc", _absent)
 
 
 @pytest.fixture
