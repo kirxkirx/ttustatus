@@ -655,7 +655,7 @@ def test_get_inflates_gzip_caps_size_and_maps_304(monkeypatch):
         hf._get("https://x/", "ua", max_bytes=1000)
     monkeypatch.setattr(hf.urllib.request, "urlopen",
                         lambda req, timeout: _Resp(b"x" * 5000, {}))
-    with pytest.raises(ValueError, match="larger"):
+    with pytest.raises(ValueError, match="over the limit"):
         hf._get("https://x/", "ua", max_bytes=1000)
     seen = {}
 

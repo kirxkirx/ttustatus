@@ -413,10 +413,13 @@ def test_http_notes_the_arrival_of_the_headers_not_the_end_of_the_body(monkeypat
 
         def __init__(self):             # the server stamps the reply as it starts it
             self.headers = {"Date": email.utils.formatdate(clock[0], usegmt=True)}
+            self.left = [b"frame"]
 
-        def read(self, n=-1):
+        def read(self, n=-1):           # the body, then the end of it (read in chunks)
+            if not self.left:
+                return b""
             clock[0] += 420
-            return b"frame"
+            return self.left.pop()
 
         def __enter__(self):
             return self

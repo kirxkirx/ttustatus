@@ -11,14 +11,19 @@ display / a future upwind-radar ring.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
+import math
 import re
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+from .isotime import parse_iso
+from .netio import read_capped
 
 try:
     from zoneinfo import ZoneInfo
@@ -28,6 +33,14 @@ except Exception:                      # pragma: no cover - zoneinfo is stdlib o
 log = logging.getLogger("ttu.safety.nws")
 
 BASE = "https://api.weather.gov"
+# The /points reply names the gridpoint URL to fetch; only one under this prefix is
+# followed (urllib would otherwise open a file:, data: or ftp: URL just as readily).
+GRIDPOINTS_PREFIX = BASE + "/gridpoints/"
+# A raw gridpoint forecast is a few hundred kB; anything over this is not one. The body
+# must arrive whole within the deadline (urlopen's timeout bounds each wait on the socket,
+# not the reply: safety/netio.py).
+MAX_REPLY_BYTES = 4 * 1024 * 1024
+READ_DEADLINE_S = 60.0
 WANTED = {
     "cloud_cover_pct": "skyCover",
     "precip_prob_pct": "probabilityOfPrecipitation",
@@ -53,7 +66,27 @@ OUTLOOK_HOURS = 6
 
 
 def _iso(t):
-    return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    """An NWS ISO 8601 time as an aware datetime. Read by safety.isotime.parse_iso, which
+    reads the same text alike on every Python (datetime.fromisoformat accepts far more on
+    3.11+ than on 3.9). Raises ValueError for anything it cannot read — the caller's
+    series (or the whole download, for updateTime) is then unusable, never misread."""
+    dt = parse_iso(t)
+    if dt is None:
+        raise ValueError("unreadable time %r" % (t,))
+    return dt
+
+
+def _num(x):
+    """A grid value as a finite float, or None (no value). The grid's values are numbers;
+    one sent as a string, a bool, NaN or anything else must not reach a comparison with a
+    threshold — a string there raised TypeError on every evaluation (IsSafe HTTP 500)."""
+    if x is None or isinstance(x, bool) or not isinstance(x, (int, float, str)):
+        return None
+    try:
+        v = float(x)
+    except (ValueError, OverflowError):
+        return None
+    return v if math.isfinite(v) else None
 
 
 def _dur_hours(dur):
@@ -72,7 +105,7 @@ def _expand(series):
         s, dur = it["validTime"].split("/")
         start = _iso(s).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         for k in range(_dur_hours(dur)):
-            out[start + timedelta(hours=k)] = it["value"]
+            out[start + timedelta(hours=k)] = _num(it["value"])
     return out
 
 
@@ -87,7 +120,8 @@ def _get(url, ua):
     req = urllib.request.Request(
         url, headers={"User-Agent": ua, "Accept": "application/geo+json"})
     with urllib.request.urlopen(req, timeout=25) as r:
-        return json.load(r)
+        raw = read_capped(r, MAX_REPLY_BYTES, READ_DEADLINE_S, what="NWS forecast")
+    return json.loads(raw)
 
 
 _tz_warned = False
@@ -115,9 +149,14 @@ def fetch(cfg):
         else:
             pts = _get(f"{BASE}/points/{cfg.GEOCODE[0]},{cfg.GEOCODE[1]}", ua)["properties"]
             url = pts["forecastGridData"]
+            if not isinstance(url, str) or not url.startswith(GRIDPOINTS_PREFIX):
+                return {"ok": False, "error": "the /points reply names a forecast URL "
+                                              "outside %s: %r" % (GRIDPOINTS_PREFIX,
+                                                                  str(url)[:120])}
             label = f"{pts['gridId']} {pts['gridX']},{pts['gridY']}"
         p = _get(url, ua)["properties"]
-    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError,
+            http.client.HTTPException) as e:
         return {"ok": False, "error": str(e)}
 
     # Post-processing sits in its OWN try: a payload that is valid JSON but the wrong
@@ -184,7 +223,7 @@ def evaluate(result, cfg, now_ts=None):
     reasons = []
     for label, hour in (("this hour", result["now_hour"]), ("next hour", result["next_hour"])):
         for key, limit, name in checks:
-            v = hour.get(key)
+            v = _num(hour.get(key))
             if v is not None and v > limit:
                 reasons.append(f"NWS {name} {v:g}% > {limit:g}% ({label})")
     return {"available": True, "safe": not reasons, "reasons": reasons, "stale": False}

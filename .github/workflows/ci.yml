@@ -4,15 +4,31 @@ on:
   push:
   pull_request:
 
+# The tests only read the checkout: the job's token gets no write access to anything.
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: actions/setup-python has Python 3.9 builds for Ubuntu 22.04
+    # and 24.04 only, so the 3.9 leg would fail once ubuntu-latest moves on.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the development host, 3.11 Raspberry Pi OS Bookworm (the Pi's system
+        # python3), 3.13 Raspberry Pi OS Trixie, 3.14 the current release: they catch what
+        # changed between versions (fromisoformat did by 3.11) and deprecations early.
+        python-version: ["3.9", "3.11", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      # Node 24 releases (checkout v4 and setup-python v5 run on the retired Node 20), pinned
+      # by commit: a tag can be moved to other code, a commit hash cannot. To update, look up
+      # the commit the tag names now and replace hash and comment together.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       # The daemon's core deps, plus Pillow: the radar layer's only dependency (apt
       # python3-pil on the Pi), so its frame decoding (IEM's PNG, the AWS bucket's GRIB2)
@@ -24,7 +40,13 @@ jobs:
         run: pip install flask waitress pytest flake8 pillow
 
       - name: Lint (flake8)
-        run: flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety
+        run: flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety make_status_page.py
 
       - name: Tests (daemon units + page/entrypoint smoke, hardware mocked)
         run: pytest safety/tests -q
+
+      - name: Shell script syntax
+        run: |
+          for f in deploy/install.sh run_safety_monitor.sh run_status_page.sh; do
+            bash -n "$f"
+          done

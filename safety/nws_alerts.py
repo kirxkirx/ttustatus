@@ -36,8 +36,13 @@ VETO LATCH. A veto is held until the alert's end (``ends``, else ``expires``), p
 HAZARD_LATCH_FILE (written only when the veto set changes) and restored at start-up. It is
 released EARLY only when a fresh point query AND a fresh area query both succeed after the
 alert's last sighting and neither lists it as covering the site (cancelled, expired, or its
-updated polygon moved off the site). Feed outage => held until its end, never beyond; no end
-time => held 60 min from the last sighting. A warning issued for a LATER period (a High Wind
+updated polygon moved off the site). No end time => held 60 min from the last sighting. A
+veto that cannot be confirmed gone does not hang on for ever: one that no fresh query has
+listed at the site for 24 h (UNSEEN_RELEASE_SEC; a feed outage, a wrong clock, an end time
+days away) is released whatever its end time, with a log line and a HAZARD-VETO event; a
+warning that keeps being listed keeps vetoing to its end (a long-fuse High Wind Warning
+runs about 2 days). Feed outage => held until its end or 24 h after its last sighting,
+whichever is sooner. A warning issued for a LATER period (a High Wind
 Warning "from 10 AM Friday") vetoes from its onset (minus a short lead), not from issuance:
 "for the duration of the warning", and the observatory must not close the night before.
 
@@ -56,9 +61,12 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import zlib
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+
+from .isotime import iso_ts
+from .netio import gunzip_capped, read_capped
+from .textclean import clean_text
 
 try:
     from zoneinfo import ZoneInfo
@@ -70,6 +78,10 @@ log = logging.getLogger("ttu.safety.hazards")
 BASE = "https://api.weather.gov"
 SOURCE = "NWS api.weather.gov active alerts"
 HTTP_TIMEOUT = 20                     # s per request
+# ... and a whole reply must be in within this (wall clock): the socket timeout bounds each
+# wait for a byte, so a server trickling a byte at a time would otherwise hold the poll
+# thread (and with it the veto's point query) for as long as it likes.
+HTTP_DEADLINE_SEC = 2 * HTTP_TIMEOUT
 
 # Contract defaults (config.py owns the env parsing; these apply to a cfg without them).
 DEFAULT_VETO_EVENTS = "Tornado Warning,Dust Storm Warning,High Wind Warning"
@@ -79,10 +91,17 @@ DEFAULT_STALE_AFTER_SEC = 600
 
 # A veto with no end time in the alert is held this long after its last sighting.
 NO_END_HOLD_SEC = 3600
-# Upper bound on how long ONE veto can be held from its first sighting when the feeds say
-# nothing more (feed outage, wrong clock). Long-fuse warnings (High Wind) run up to ~2 days
-# from issuance; a still-active alert is simply re-sighted by the next fresh query.
-MAX_VETO_SPAN_SEC = 72 * 3600
+# A held veto that no fresh query has listed at the site for this long is RELEASED, whatever
+# its end time: an alert that cannot be confirmed gone (feeds down, a wrong clock, an end
+# days away) must not hold the dome shut for ever. A warning that is still in effect is
+# simply listed again by the next fresh query, which renews the bound: a long-fuse High
+# Wind Warning (about 2 days) vetoes to its end as long as NWS keeps listing it.
+UNSEEN_RELEASE_SEC = 24 * 3600
+# The bound is kept as the veto's cap_ts (our clock), renewed by a sighting only once less
+# than UNSEEN_RELEASE_SEC of it is left, to now + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC. So it
+# falls between 24 h and 25 h after the last sighting (never sooner), and the SD-card latch
+# file is rewritten at most hourly while a long warning keeps being sighted.
+CAP_RENEW_SEC = 3600
 # A warning issued ahead of its onset vetoes from (onset - lead): time to park and close.
 ONSET_LEAD_SEC = 900
 # Zone-outline fetching per area poll: the POINT query is the veto's fast path and shares
@@ -91,6 +110,15 @@ ONSET_LEAD_SEC = 900
 ZONE_FETCH_BUDGET_SEC = 15.0
 ZONE_FETCH_MAX = 40
 ZONE_RETRY_SEC = 600                  # a failed zone fetch is retried after this (monotonic)
+# A zone whose reply has no usable outline is asked for again after a day (wall clock, kept
+# in the cache file): some zones really have none, but one odd reply must not cost a zone
+# its outline for ever.
+ZONE_NULL_TTL = 86400
+# No polygon of a zone outline is wider or taller than this (degrees of longitude, of
+# latitude; vlbaweather's bound): mainland Alaska, a whole state of some thirty zones,
+# measures about 38 by 20. A larger polygon is a wrong reply, and would put its alerts
+# over every site — it is not used (the zone then has no outline).
+ZONE_MAX_SPAN_DEG = (40.0, 25.0)
 POINTS_RETRY_SEC = 600                # /points failure retry
 POINTS_REFRESH_SEC = 86400            # re-check the site's zones daily (write only on change)
 NEAR_MARGIN_DEG = 0.5                 # zones within the map box + this keep their outline
@@ -188,24 +216,23 @@ def _finite(x) -> Optional[float]:
 
 
 def _parse_ts(s) -> Optional[float]:
-    """ISO-8601 (as the API writes it) -> epoch seconds, None when absent or malformed."""
-    if not isinstance(s, str) or not s.strip():
-        return None
-    try:
-        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return _finite(dt.timestamp())
+    """ISO-8601 (as the API writes it) -> epoch seconds, None when absent or malformed.
+    safety.isotime reads the same text alike on every Python (datetime.fromisoformat
+    reads more forms, and some of them differently, on 3.11+ than on 3.9); a text without
+    an offset is UTC."""
+    return _finite(iso_ts(s))
 
 
 def _text(v) -> str:
-    return v if isinstance(v, str) else ""
+    """A string from the feed, scrubbed (safety.textclean): a JSON escape such as \\ud83d
+    becomes a lone surrogate in Python, which no UTF-8 writer accepts — one such headline
+    would stop every status-page write and fail /setup. Non-strings read as ""."""
+    return clean_text(v) if isinstance(v, str) else ""
 
 
 def _text_or_none(v) -> Optional[str]:
-    return v if isinstance(v, str) and v.strip() else None
+    t = _text(v)
+    return t if t.strip() else None
 
 
 def _clip(s: Optional[str], n: int) -> Optional[str]:
@@ -316,8 +343,78 @@ def point_in_geometry(lon: float, lat: float, geometry) -> bool:
     return any(point_in_polygon(lon, lat, rings) for rings in iter_polygons(geometry))
 
 
+def _position_ok(p) -> bool:
+    """A GeoJSON position: a list that starts with two finite numbers (lon, lat). Numbers
+    sent as strings, nulls, NaN and a ring nested one level too deep are not positions."""
+    return (isinstance(p, (list, tuple)) and len(p) >= 2
+            and _finite(p[0]) is not None and _finite(p[1]) is not None)
+
+
+def ring_ok(ring) -> bool:
+    """A ring the point test can work with: a closed GeoJSON ring has at least 4 positions
+    (a triangle and its first point again), each two finite numbers."""
+    return (isinstance(ring, (list, tuple)) and len(ring) >= 4
+            and all(_position_ok(p) for p in ring))
+
+
+_NOT_AREAS = ("Point", "MultiPoint", "LineString", "MultiLineString")
+_GEOMETRY_DEPTH_MAX = 8                 # nested GeometryCollections (never seen beyond 1)
+
+
+def _rings_ok(rings) -> bool:
+    return (isinstance(rings, (list, tuple)) and len(rings) >= 1
+            and all(ring_ok(r) for r in rings))
+
+
+def _all_polygons(geometry, depth=0) -> Optional[list]:
+    """Every polygon of a geometry, or None when any member cannot be read as one: unlike
+    iter_polygons, which passes over such a member, this tells it apart (a MultiPolygon
+    with one member "x", a collection holding a string, a ring of strings). A point or a
+    line in a collection is no area and is passed over, as in iter_polygons."""
+    if not isinstance(geometry, dict) or depth > _GEOMETRY_DEPTH_MAX:
+        return None
+    t = geometry.get("type")
+    if t == "Polygon":
+        rings = geometry.get("coordinates")
+        return [rings] if _rings_ok(rings) else None
+    if t == "MultiPolygon":
+        polys = geometry.get("coordinates")
+        if not isinstance(polys, (list, tuple)) or not all(_rings_ok(p) for p in polys):
+            return None
+        return list(polys)
+    if t == "GeometryCollection":
+        members = geometry.get("geometries")
+        if not isinstance(members, (list, tuple)):
+            return None
+        out: list = []
+        for g in members:
+            if isinstance(g, dict) and g.get("type") in _NOT_AREAS:
+                continue
+            sub = _all_polygons(g, depth + 1)
+            if sub is None:
+                return None
+            out.extend(sub)
+        return out
+    return []
+
+
+def geometry_ok(geometry) -> bool:
+    """Whether a geometry holds at least one polygon, every member of it reads as a polygon
+    and every ring (the holes too) is ring_ok. One bad ring or member spoils the whole
+    geometry: a shape of which a part cannot be read answers neither "inside" nor "outside"
+    reliably. Never raises (ported from vlbaweather's weather/geo.py)."""
+    try:
+        polys = _all_polygons(geometry)
+    except RecursionError:
+        return False
+    return bool(polys)
+
+
 def ring_bbox(ring) -> Optional[Box]:
-    if not ring:
+    """Box of a ring; None for an empty ring and for one that holds anything but positions
+    of finite numbers (never raises: a box of strings would only fail later, in a
+    comparison far from here)."""
+    if not ring or not isinstance(ring, (list, tuple)) or not all(_position_ok(p) for p in ring):
         return None
     xs = [p[0] for p in ring]
     ys = [p[1] for p in ring]
@@ -356,8 +453,35 @@ def merge_geometries(geoms) -> Optional[dict]:
 
 
 def _polygon_geometry(g) -> Optional[dict]:
-    """Keep a geometry only if it has polygons (a Point or empty collection = no shape)."""
-    return g if isinstance(g, dict) and geometry_bbox(g) is not None else None
+    """Keep a geometry only if it has polygons that the point test can read (geometry_ok):
+    a Point or an empty collection is no shape, and neither is a polygon with coordinates
+    that are not finite numbers (strings, nulls, a ring nested too deep) or a ring of fewer
+    than 4 positions. The alert is then placed by its zones, never dropped. Never raises."""
+    try:
+        if isinstance(g, dict) and geometry_ok(g) and geometry_bbox(g) is not None:
+            return g
+    except Exception as e:  # noqa: BLE001 — an unreadable shape is no shape
+        log.warning("unreadable geometry (%s): treated as none", type(e).__name__)
+    return None
+
+
+def _has_shape(g) -> bool:
+    """Whether a raw geometry claims to be an area (so that dropping it is worth a log line)."""
+    return isinstance(g, dict) and g.get("type") in ("Polygon", "MultiPolygon",
+                                                     "GeometryCollection")
+
+
+_warned_once: set = set()
+_WARNED_ONCE_MAX = 200
+
+
+def _warn_once(key, msg, *args):
+    """Log a warning about one feed item once (polls run every minute), at most
+    _WARNED_ONCE_MAX distinct items per run."""
+    if key in _warned_once or len(_warned_once) >= _WARNED_ONCE_MAX:
+        return
+    _warned_once.add(key)
+    log.warning(msg, *args)
 
 
 def _simplify_ring(ring, tol: float) -> list:
@@ -670,7 +794,7 @@ def _param_values(params, key: str) -> List[str]:
         v = [v]
     if not isinstance(v, list):
         return []
-    return [x.strip() for x in v if isinstance(x, str) and x.strip()]
+    return [t for t in (_text(x).strip() for x in v) if t]
 
 
 # Impact-based-warning damage tags -> chip text, most serious first (the tag, not the event
@@ -724,6 +848,53 @@ _VTEC_RE = re.compile(r"([OTEX])\.([A-Z]{3})\.([A-Z0-9]{4})\.([A-Z0-9]{2})\.([A-
 _ZONE_URL_RE = re.compile(
     r"^https://api\.weather\.gov/zones/(forecast|county|fire|public)/([A-Z]{2}[CZ]\d{3})$")
 _ZONE_ID_RE = re.compile(r"^[A-Z]{2}[CZ]\d{3}$")
+
+
+def _valid_zone(d, zid: str) -> bool:
+    """A zone document that names the zone asked for: ``properties.id`` is the id, and where
+    the document gives its own address (``id``, ``properties.@id``) that address names the
+    same id. A reply about another zone is not this zone's outline (vlbaweather's
+    _valid_zone; the kind in the address is not compared)."""
+    if not isinstance(d, dict) or "geometry" not in d:
+        return False
+    props = d.get("properties") if isinstance(d.get("properties"), dict) else {}
+    named = False
+    if props.get("id") is not None:
+        if props.get("id") != zid:
+            return False
+        named = True
+    for ref in (d.get("id"), props.get("@id")):
+        m = _ZONE_URL_RE.match(ref.strip()) if isinstance(ref, str) else None
+        if m is None:
+            continue
+        if m.group(2) != zid:
+            return False
+        named = True
+    return named
+
+
+def _oversized(geom) -> bool:
+    """Whether a polygon of an outline is larger than any zone is (ZONE_MAX_SPAN_DEG)."""
+    for rings in iter_polygons(geom):
+        b = ring_bbox(rings[0])
+        if b is None or b[2] - b[0] > ZONE_MAX_SPAN_DEG[0] or b[3] - b[1] > ZONE_MAX_SPAN_DEG[1]:
+            return True
+    return False
+
+
+def _zone_entry_ok(d, zid: str) -> bool:
+    """A zone cache file this version can use: its own id (when given) is the zone's, its
+    box is None or four finite numbers, its outline None or a readable geometry."""
+    if not isinstance(d, dict) or "bbox" not in d:
+        return False
+    if d.get("id") is not None and d.get("id") != zid:
+        return False
+    b = d.get("bbox")
+    if b is not None and not (isinstance(b, list) and len(b) == 4
+                              and all(_finite(x) is not None for x in b)):
+        return False
+    g = d.get("geometry")
+    return g is None or geometry_ok(g)
 
 
 def _vtec(params) -> List[dict]:
@@ -791,6 +962,11 @@ def normalize(feature) -> dict:
     primary = (live_v or vt or [None])[0]
     cap_id = _text(props.get("id")) or _text(feature.get("id"))
     geometry = _polygon_geometry(feature.get("geometry"))
+    if geometry is None and _has_shape(feature.get("geometry")):
+        # a storm-based polygon that cannot be read: its zones (every county it touches)
+        # place it instead — the cautious side for a veto warning
+        _warn_once(("geometry", cap_id, event), "NWS %s (%s): its polygon cannot be read; "
+                   "placed by its zone(s) instead", event or "alert", cap_id or "no id")
     headlines = _param_values(params, "NWSheadline")
     ends, expires = _text_or_none(props.get("ends")), _text_or_none(props.get("expires"))
     ec = props.get("eventCode") if isinstance(props.get("eventCode"), dict) else {}
@@ -824,6 +1000,54 @@ def normalize(feature) -> dict:
         "geometry": geometry,
         "geometry_source": "polygon" if geometry is not None else None,
     }
+
+
+UNREAD_EVENT = "NWS alert (could not be read)"
+
+
+def _unread_stub(feature) -> dict:
+    """What is kept of a feature that normalize could not read: whatever plain strings it
+    has (event, id, ends/expires, sent/onset, status/messageType, VTEC), flagged "unread".
+    It must not vanish: the query would still look complete, and its silence could then
+    release a held veto. A stub has no shape and no zones; poll_point treats it as at the
+    site (NWS listed it there) and poll_area as an answer blind to its event (see
+    _blindness). With no readable event name its event_lc is "" (matches nothing)."""
+    feature = feature if isinstance(feature, dict) else {}
+    props = feature.get("properties")
+    props = props if isinstance(props, dict) else {}
+    keep = {k: props.get(k) for k in ("event", "id", "ends", "expires", "sent", "onset",
+                                      "effective", "status", "messageType")
+            if isinstance(props.get(k), str)}
+    if "id" not in keep and isinstance(feature.get("id"), str):
+        keep["id"] = feature["id"]
+    keep.setdefault("status", "Actual")
+    keep.setdefault("messageType", "Alert")
+    params = props.get("parameters")
+    vtec = params.get("VTEC") if isinstance(params, dict) else None
+    vtec = [v for v in vtec if isinstance(v, str)] if isinstance(vtec, list) else []
+    keep["parameters"] = {"VTEC": vtec}
+    rec = normalize({"properties": keep})       # plain strings only: cannot fail
+    rec["unread"] = True
+    if not rec["key"]:
+        rec["key"] = "unread:%s" % (rec["event_lc"] or "unnamed")
+    if not rec["event"]:
+        rec["event"] = UNREAD_EVENT            # shown; event_lc stays "" (matches nothing)
+    return rec
+
+
+def _blindness(recs, veto_set) -> Tuple[frozenset, bool]:
+    """(veto events these records' answer cannot rule out, blind to every one): an unread
+    feature of a veto event cannot be placed, and one whose event cannot be read could be
+    any of them."""
+    events, every = set(), False
+    for r in recs:
+        if not r.get("unread"):
+            continue
+        if not r.get("event_lc"):
+            every = True
+        elif r["event_lc"] in veto_set:
+            events.add(r["event_lc"])
+    return frozenset(events), every
 
 
 def is_live(rec: dict, now: float) -> bool:
@@ -864,7 +1088,7 @@ def _sighting(recs: List[dict]) -> dict:
     return {"event": r["event"], "headline": r.get("nws_headline") or r.get("headline", ""),
             "sender": r.get("sender", ""), "end_ts": r.get("end_ts"),
             "onset_ts": r.get("onset_ts"), "sent_ts": r.get("sent_ts"),
-            "geometry": r.get("geometry")}
+            "geometry": r.get("geometry"), "unread": bool(r.get("unread"))}
 
 
 def _group_sightings(recs: List[dict]) -> Dict[str, dict]:
@@ -887,15 +1111,6 @@ def _feed_skew(data, recs: List[dict], fetch_ts: float) -> float:
 
 
 # ---- network ------------------------------------------------------------------------------
-def _gunzip(raw: bytes, max_bytes: int) -> bytes:
-    """gzip -> bytes, refusing anything that inflates beyond max_bytes (a gzip bomb)."""
-    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    out = d.decompress(raw, max_bytes + 1)
-    if len(out) > max_bytes or d.unconsumed_tail:
-        raise ValueError("response inflates beyond %d bytes" % max_bytes)
-    return out
-
-
 def _get(url, ua, max_bytes=MAX_BODY_BYTES):
     """GET one api.weather.gov JSON document.
 
@@ -904,17 +1119,17 @@ def _get(url, ua, max_bytes=MAX_BODY_BYTES):
     and it is fetched ~30 times an hour. Every body is CAPPED, compressed and inflated:
     this runs inside the daemon that answers IsSafe, and a runaway answer (a captive
     portal, a proxy streaming garbage) must fail the query — a normal, logged failure —
-    never push the whole safety daemon out of memory on the Pi."""
+    never push the whole safety daemon out of memory on the Pi. The whole reply must also
+    be in within HTTP_DEADLINE_SEC (safety.netio.read_capped), and the gzip stream must
+    end where the body does (safety.netio.gunzip_capped, inflated step by step)."""
     req = urllib.request.Request(url, headers={"User-Agent": ua,
                                                "Accept": "application/geo+json",
                                                "Accept-Encoding": "gzip"})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-        raw = r.read(max_bytes + 1)
+        raw = read_capped(r, max_bytes, HTTP_DEADLINE_SEC, what="NWS reply")
         enc = (r.headers.get("Content-Encoding") or "").strip().lower()
-    if len(raw) > max_bytes:
-        raise ValueError("response larger than %d bytes" % max_bytes)
     if enc in ("gzip", "x-gzip"):
-        raw = _gunzip(raw, max_bytes)
+        raw = gunzip_capped(raw, max_bytes)
     elif enc not in ("", "identity"):
         raise ValueError("unexpected Content-Encoding %r" % enc)
     return json.loads(raw.decode("utf-8-sig"))
@@ -1014,8 +1229,10 @@ class NwsAlertsPoller:
         # end_ts/onset_ts are ABSOLUTE NWS times; first/last_seen and cap_ts are stamps of
         # OUR clock. shift (<= 0) maps the former into our clock's frame after a clock
         # step or a wrong-clock restore: our clock's equivalent of an NWS time = ts + shift.
+        # cap_ts: released then at the latest, unless sighted again (UNSEEN_RELEASE_SEC).
         return {"key": key, "event": event, "headline": headline or "", "sender": sender or "",
-                "end_ts": end_ts, "onset_ts": onset_ts, "sent_ts": None, "cap_ts": None,
+                "end_ts": end_ts, "onset_ts": onset_ts, "sent_ts": None,
+                "cap_ts": now + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC,
                 "shift": 0.0, "active": False,
                 "first_seen_ts": first_seen, "last_seen_ts": now, "geometry": None}
 
@@ -1061,6 +1278,8 @@ class NwsAlertsPoller:
             rec = self._new_rec(it["key"], _text(it.get("event")) or "NWS alert",
                                 _text(it.get("headline")), _text(it.get("sender")),
                                 end, onset, first, now)
+            # the file's cap (None in an older file; a 72 h span from the first sighting in
+            # one written before UNSEEN_RELEASE_SEC) is bounded below by the last sighting
             rec["cap_ts"] = _finite(it.get("cap_ts"))
             rec["shift"] = min(0.0, _finite(it.get("shift")) or 0.0)
             rec["active"] = it.get("active") is True
@@ -1079,7 +1298,10 @@ class NwsAlertsPoller:
             # never "seen" in the future: a last sighting beyond now (a wrong clock at the
             # time) counts as now — the hold then runs its full length from here
             rec["last_seen_ts"] = now if last is None else min(last, now)
-            self._bound_span(rec, now)
+            # never held beyond UNSEEN_RELEASE_SEC (+ the renewal step) after its last
+            # sighting, wherever the cap in the file says: a reboot loop during an NWS
+            # outage must not keep a veto alive past the bound
+            self._bound_unseen(rec, rec["last_seen_ts"])
             if self._hold_until(rec) <= now:
                 self._latch_dirty = True          # expired while we were down
                 continue
@@ -1100,11 +1322,23 @@ class NwsAlertsPoller:
         rec["first_seen_ts"] = min(rec["first_seen_ts"] + delta, now)
         self._latch_dirty = True
 
-    def _bound_span(self, rec, now):
-        """Never hold one veto longer than MAX_VETO_SPAN_SEC from now on stale information."""
-        if self._hold_until(rec) - now > MAX_VETO_SPAN_SEC:
-            rec["cap_ts"] = now + MAX_VETO_SPAN_SEC
+    def _bound_unseen(self, rec, base):
+        """The cap never lies more than UNSEEN_RELEASE_SEC + CAP_RENEW_SEC after ``base`` (a
+        stamp of our clock: the last sighting, or now when the stamps were just moved by a
+        clock step); a missing or unreadable cap is set to that."""
+        limit = base + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC
+        cap = rec.get("cap_ts")
+        if cap is None or cap > limit:
+            rec["cap_ts"] = limit
             self._latch_dirty = True
+
+    def _renew_cap(self, rec, now):
+        """A sighting (a fresh query lists the key at the site) is news: the veto may be
+        held UNSEEN_RELEASE_SEC from now again. Renewed in CAP_RENEW_SEC steps, so a warning
+        re-sighted every minute does not rewrite the latch file every minute."""
+        cap = rec.get("cap_ts")
+        if cap is None or cap - now < UNSEEN_RELEASE_SEC:
+            rec["cap_ts"] = now + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC
 
     def _latch_payload(self):
         out = []
@@ -1175,13 +1409,25 @@ class NwsAlertsPoller:
 
     # -- veto state (caller holds the lock) -----------------------------------------------
     @staticmethod
-    def _hold_until(rec) -> float:
+    def _own_end(rec) -> float:
+        """When the alert itself says the veto ends (in our clock's frame): its end time,
+        or NO_END_HOLD_SEC after the last sighting without one."""
         if rec["end_ts"] is not None:
-            end = rec["end_ts"] + rec.get("shift", 0.0)
-        else:
-            end = rec["last_seen_ts"] + NO_END_HOLD_SEC
+            return rec["end_ts"] + rec.get("shift", 0.0)
+        return rec["last_seen_ts"] + NO_END_HOLD_SEC
+
+    @classmethod
+    def _hold_until(cls, rec) -> float:
+        """The alert's own end, or the unseen bound (cap_ts) when that comes first."""
+        end = cls._own_end(rec)
         cap = rec.get("cap_ts")
         return end if cap is None else min(end, cap)
+
+    @classmethod
+    def _capped(cls, rec) -> bool:
+        """Whether the unseen bound, not the alert's own end, decides the release."""
+        cap = rec.get("cap_ts")
+        return cap is not None and cap < cls._own_end(rec)
 
     def _fmt(self, ts, now=None):
         return fmt_local(ts, self._tz(), now) or "?"
@@ -1207,7 +1453,6 @@ class NwsAlertsPoller:
                                     s["onset_ts"], now, now)
                 rec["sent_ts"] = s["sent_ts"]
                 rec["geometry"] = s["geometry"]
-                self._bound_span(rec, now)
                 self._veto[key] = rec
                 hold = self._hold_until(rec)
                 if self._in_effect(rec, now, skew):
@@ -1221,8 +1466,10 @@ class NwsAlertsPoller:
                 log.warning("HAZARD VETO: NWS %s over the site (%s, %s) — %s", s["event"],
                             key, source, result)
                 continue
-            newer = (s["sent_ts"] is None or rec.get("sent_ts") is None
-                     or s["sent_ts"] >= rec["sent_ts"])
+            # an unread stub (see _unread_stub) is a sighting, but knows too little to
+            # replace what an earlier, readable message said (its end time above all)
+            newer = not s.get("unread") and (s["sent_ts"] is None or rec.get("sent_ts") is None
+                                             or s["sent_ts"] >= rec["sent_ts"])
             if newer:
                 old_hold = self._hold_until(rec)
                 rec.update(event=s["event"], headline=s["headline"] or rec["headline"],
@@ -1233,25 +1480,20 @@ class NwsAlertsPoller:
                 changed = s["end_ts"] != rec["end_ts"]
                 if changed or rec["shift"]:
                     # fresh NWS times, read against the current clock, replace any clamp
+                    # (the cap is a stamp of OUR clock: the renewal below handles it)
                     rec["end_ts"] = s["end_ts"]
                     rec["shift"] = 0.0
-                    rec["cap_ts"] = None
-                    self._bound_span(rec, now)
+                    self._renew_cap(rec, now)
                 if changed:
                     events.append({"reason": "NWS %s updated" % s["event"], "source": source,
                                    "result": "unsafe until %s (was %s)" % (
                                        self._fmt(self._hold_until(rec), now),
                                        self._fmt(old_hold, now)), "key": key})
-            # A sighting is fresh news, so it renews the stale-information cap: the cap
-            # bounds how long a veto is held WITHOUT news, not how long a warning may last
-            # (a High Wind Warning can run past 72 h from its first sighting, and letting
-            # the cap run out mid-warning would release it until the next poll re-armed
-            # it). Renewed only once half of it is used: the SD-card latch file is then
-            # rewritten at most every 36 h for such a warning, not on every poll.
-            cap = rec.get("cap_ts")
-            if cap is not None and cap - now < MAX_VETO_SPAN_SEC / 2:
-                rec["cap_ts"] = None
-                self._bound_span(rec, now)
+            # A sighting is fresh news, so it renews the unseen bound: the cap bounds how
+            # long a veto is held WITHOUT news (UNSEEN_RELEASE_SEC), not how long a warning
+            # may last (a High Wind Warning runs about 2 days, and letting the cap run out
+            # mid-warning would release it until the next poll re-armed it).
+            self._renew_cap(rec, now)
             rec["last_seen_ts"] = max(rec["last_seen_ts"], now)
         return events
 
@@ -1268,8 +1510,13 @@ class NwsAlertsPoller:
         p, a = self._point, self._area
         if not (self._fresh(p, now) and self._fresh(a, now) and a.get("site_capable")):
             return False
-        if _norm_event(rec["event"]) in a.get("blind_events", frozenset()):
-            return False            # that area answer could not have seen it (civil query down)
+        if p.get("blind_all") or a.get("blind_all"):
+            return False            # a feature of unreadable event: it could be this one
+        ev = _norm_event(rec["event"])
+        if ev in a.get("blind_events", frozenset()) or ev in p.get("blind_events", frozenset()):
+            # that answer could not have seen it (civil query down, or a feature of this
+            # event that could not be read)
+            return False
         last = rec["last_seen_ts"]
         return (p["ts"] > last and a["ts"] > last
                 and rec["key"] not in p["site_keys"] and rec["key"] not in a["site_keys"])
@@ -1279,7 +1526,10 @@ class NwsAlertsPoller:
         for key in sorted(self._veto):
             rec = self._veto[key]
             hold = self._hold_until(rec)
-            if now >= hold:
+            if now >= hold and self._capped(rec):
+                why = ("not sighted for %d h, could not be confirmed gone"
+                       % (UNSEEN_RELEASE_SEC // 3600))
+            elif now >= hold:
                 why = ("ended %s" % self._fmt(hold, now) if rec["end_ts"] is not None
                        else "no end time given; %d min after the last sighting"
                        % (NO_END_HOLD_SEC // 60))
@@ -1304,7 +1554,9 @@ class NwsAlertsPoller:
                 delta = now - rec["first_seen_ts"]
                 self._reframe(rec, delta, now)
                 rec["last_seen_ts"] = min(rec["last_seen_ts"] + delta, now)
-            self._bound_span(rec, now)
+            # (with the tolerance: a poll renewing the cap a moment after this call's
+            # ``now`` was taken must not be trimmed, and the latch rewritten, for it)
+            self._bound_unseen(rec, now + CLOCK_TOLERANCE_SEC)
 
     def _emit(self, events):
         if self.log is None:
@@ -1326,17 +1578,27 @@ class NwsAlertsPoller:
     def _zone_path(self, ztype, zid):
         return os.path.join(self._cache_dir(), "zones", "%s_%s.json" % (ztype, zid))
 
-    def _make_zone_entry(self, geometry, near_box):
+    def _make_zone_entry(self, geometry, near_box, zid=""):
         geom = _polygon_geometry(geometry)
+        if geom is not None and _oversized(geom):
+            log.warning("zone %s: outline larger than any zone (over %g by %g degrees), not "
+                        "used", zid, ZONE_MAX_SPAN_DEG[0], ZONE_MAX_SPAN_DEG[1])
+            geom = None
         bbox = geometry_bbox(geom)
         near = bbox is not None and bbox_intersects(bbox, near_box)
         return {"bbox": list(bbox) if bbox else None,
-                "geometry": simplify_geometry(geom) if near else None}
+                "geometry": simplify_geometry(geom) if near else None,
+                "fetched_ts": time.time()}
 
     def _needs_refetch(self, ent, near_box) -> bool:
+        if ent.get("bbox") is None:
+            # no outline: asked again after ZONE_NULL_TTL (an entry without its fetch time,
+            # written by an older version, or stamped in the future: now)
+            ts, now = _finite(ent.get("fetched_ts")), time.time()
+            return (ts is None or now - ts >= ZONE_NULL_TTL
+                    or ts - now > CLOCK_TOLERANCE_SEC)
         # a far zone (bbox only) that the map now reaches (the site moved): fetch once more
-        return (ent.get("geometry") is None and ent.get("bbox") is not None
-                and bbox_intersects(ent["bbox"], near_box))
+        return ent.get("geometry") is None and bbox_intersects(ent["bbox"], near_box)
 
     def _zone(self, ztype, zid, url, budget, near_box):
         """The cached outline entry of one zone, fetching it (once, ever) within ``budget``.
@@ -1353,8 +1615,10 @@ class NwsAlertsPoller:
             try:
                 with open(self._zone_path(ztype, zid), encoding="utf-8") as f:
                     d = json.load(f)
-                if isinstance(d, dict) and "bbox" in d:
-                    ent = {"bbox": d.get("bbox"), "geometry": d.get("geometry")}
+                if not _zone_entry_ok(d, zid):
+                    raise ValueError("not a zone cache entry of %s" % zid)
+                ent = {"bbox": d.get("bbox"), "geometry": d.get("geometry"),
+                       "fetched_ts": d.get("fetched_ts")}
             except FileNotFoundError:
                 pass
             except Exception:
@@ -1363,22 +1627,29 @@ class NwsAlertsPoller:
                 self._zones[k] = ent
                 return ent
         if budget is None or budget["left"] <= 0 or time.monotonic() > budget["deadline"]:
+            if ent is not None and ent.get("bbox") is None:
+                return ent              # no outline, due again: still none until fetched
             return _DEFERRED
         budget["left"] -= 1
         try:
             data = _get(url, self._ua())
             if not isinstance(data, dict) or "geometry" not in data:
                 raise ValueError("no geometry member in zone payload")
+            if not _valid_zone(data, zid):
+                raise ValueError("the reply does not name zone %s" % zid)
+            # inside the try: an outline that breaks the entry code is a failed fetch
+            # (retried after ZONE_RETRY_SEC), not an exception out of every area poll
+            ent = self._make_zone_entry(data.get("geometry"), near_box, zid)
         except Exception as e:  # noqa: BLE001 — a zone is decoration; retry later
             log.warning("zone %s/%s outline unavailable: %s", ztype, zid, e)
             self._zones[k] = {"failed_mono": time.monotonic()}
             return None
-        ent = self._make_zone_entry(data.get("geometry"), near_box)
         self._zones[k] = ent
         try:   # written ONCE per zone (SD card): never re-fetched while the site stays put
             _atomic_write_json(self._zone_path(ztype, zid),
                                {"id": zid, "type": ztype, "bbox": ent["bbox"],
-                                "geometry": ent["geometry"]})
+                                "geometry": ent["geometry"],
+                                "fetched_ts": ent["fetched_ts"]})
         except Exception as e:  # noqa: BLE001
             if not self._cache_warned:
                 self._cache_warned = True
@@ -1485,8 +1756,24 @@ class NwsAlertsPoller:
             try:
                 recs.append(normalize(f))
             except Exception as e:  # noqa: BLE001 — one odd feature must not drop the rest
-                log.warning("skipping malformed alert feature: %s", e)
+                # ... nor vanish itself: kept as a stub (see _unread_stub)
+                stub = _unread_stub(f)
+                _warn_once(("unread", stub["key"], stub["id"]),
+                           "NWS alert feature could not be read (%s: %s): kept as %r (%s), "
+                           "which cannot be placed", type(e).__name__, e, stub["event"],
+                           stub["key"])
+                recs.append(stub)
         return recs, _feed_skew(data, recs, now)
+
+    def _unplaceable(self, r, e):
+        """One record whose shape broke the site or map test: no shape, not on the map
+        (the callers decide at_site without it). Logged once per alert."""
+        _warn_once(("place", r.get("id"), r.get("key")), "NWS %s (%s): cannot be placed by "
+                   "its shape (%s: %s); its zones decide", r.get("event"), r.get("id"),
+                   type(e).__name__, e)
+        r["geometry"] = None
+        r["geometry_source"] = None
+        r["on_map"] = False
 
     def _keep(self, recs, now, veto_set):
         out = []
@@ -1527,12 +1814,20 @@ class NwsAlertsPoller:
         box = map_box(self.cfg)
         near_box = _grow(box, NEAR_MARGIN_DEG)
         for r in recs:
-            self._attach_zone_geometry(r, None, near_box)   # cache only: stay fast
             r["at_site"] = True                             # NWS says so
-            r["on_map"] = touches_box(r.get("geometry"), box)
+            try:
+                self._attach_zone_geometry(r, None, near_box)   # cache only: stay fast
+                r["on_map"] = touches_box(r.get("geometry"), box)
+            except Exception as e:  # noqa: BLE001 — one alert's shape, not the query
+                self._unplaceable(r, e)
+        # Every listed feature is at the site (NWS decided): an unread one of a veto event
+        # vetoes as usual (by its key: the VTEC key when that can be read); one whose event
+        # cannot be read creates no veto, but this answer then cannot confirm that any
+        # veto is gone.
+        _blind, blind_all = _blindness(recs, veto_set)
         sightings = _group_sightings([r for r in recs if r["event_lc"] in veto_set])
         result = {"ok": True, "ts": now, "recs": recs, "site_keys": frozenset(sightings),
-                  "skew": skew, "site_capable": True}
+                  "skew": skew, "site_capable": True, "blind_all": blind_all, "unread": sum(1 for r in recs if r.get("unread"))}
         with self._lock:
             self._point = result
             self._point_error = None
@@ -1544,7 +1839,8 @@ class NwsAlertsPoller:
         return {"ok": True, "count": len(recs), "veto_keys": sorted(sightings)}
 
     def _poll_civil(self, now, codes, have_ids):
-        """The national query of CIVIL_EVENTS -> (records that can concern the map, ok).
+        """The national query of CIVIL_EVENTS -> (records that can concern the map, ok,
+        the events it is blind to: those of messages that could not be read).
 
         Kept: a message whose polygon touches the map, or (no polygon) whose zones — the
         SAME county codes, for IPAWS messages — lie in the map's states; the area pipeline
@@ -1554,6 +1850,7 @@ class NwsAlertsPoller:
             BASE, _QUERY_FILTER, urllib.parse.quote(",".join(CIVIL_EVENTS), safe=","))
         try:
             recs, _skew = self._parse_feed(_get(url, self._ua()), now)
+            recs = self._keep(recs, now, _veto_set(self.cfg))
         except Exception as e:  # noqa: BLE001 — information only; the area result stands
             msg = "%s: %s" % (type(e).__name__, e)
             with self._lock:
@@ -1563,20 +1860,28 @@ class NwsAlertsPoller:
             if last is None or mono - last >= 600:
                 self._fail_logged["civil"] = mono
                 log.warning("NWS alerts civil-message query failed: %s", msg)
-            return [], False
+            return [], False, frozenset()
         with self._lock:
             self._civil_error = None
         self._succeeded("civil")
-        box, states, out = map_box(self.cfg), set(codes), []
+        box, states, out, blind = map_box(self.cfg), set(codes), [], set()
         for r in recs:
-            if r["id"] in have_ids:
+            if r.get("unread"):
+                # cannot be placed: blind to its event (every civil event when the name
+                # cannot be read — the query asks for those only)
+                blind |= {r["event_lc"]} if r["event_lc"] else set(_CIVIL_LC)
+                continue
+            if r["id"] and r["id"] in have_ids:
                 continue                        # relayed by NWS: already in the area answer
-            if r.get("geometry") is not None:
-                if touches_box(r["geometry"], box):
+            try:
+                if r.get("geometry") is not None:
+                    if touches_box(r["geometry"], box):
+                        out.append(r)
+                elif any(zid[:2] in states for _t, zid, _u in r["zones"]):
                     out.append(r)
-            elif any(zid[:2] in states for _t, zid, _u in r["zones"]):
-                out.append(r)
-        return out, True
+            except Exception as e:  # noqa: BLE001 — one message, not the query
+                self._unplaceable(r, e)
+        return out, True, frozenset(blind)
 
     def poll_area(self, now=None):
         """Every alert of the states on the map: text list, overlay, and the local site test."""
@@ -1593,10 +1898,16 @@ class NwsAlertsPoller:
         except Exception as e:  # noqa: BLE001
             return self._fail("area", now, e)
         veto_set = _veto_set(self.cfg)
-        civil, civil_ok = self._poll_civil(now, codes, {r["id"] for r in recs})
+        civil, civil_ok, civil_blind = self._poll_civil(now, codes,
+                                                        {r["id"] for r in recs if r["id"]})
         recs += civil
         count_raw = len(recs)
         recs = self._keep(recs, now, veto_set)
+        # An unread feature cannot be placed, so this answer is blind to its event (to all
+        # of them when the event cannot be read): its silence must not release such a veto.
+        blind, blind_all = _blindness(recs, veto_set)
+        unread = sum(1 for r in recs if r.get("unread"))
+        recs = [r for r in recs if not r.get("unread")]
         # veto events first, then the most serious: they get the zone-fetch budget first
         recs.sort(key=lambda r: (r["event_lc"] not in veto_set, r["rank"]))
         box = map_box(self.cfg)
@@ -1604,9 +1915,14 @@ class NwsAlertsPoller:
         budget = {"deadline": time.monotonic() + ZONE_FETCH_BUDGET_SEC, "left": ZONE_FETCH_MAX}
         kept, deferred = [], 0
         for r in recs:
-            self._attach_zone_geometry(r, budget, near_box)
-            r["at_site"] = self._covers_site(r, site_zones)
-            r["on_map"] = touches_box(r.get("geometry"), box)
+            try:
+                self._attach_zone_geometry(r, budget, near_box)
+                r["at_site"] = self._covers_site(r, site_zones)
+                r["on_map"] = touches_box(r.get("geometry"), box)
+            except Exception as e:  # noqa: BLE001 — one alert's shape, not the query
+                self._unplaceable(r, e)
+                # by the zone match only (unplaced when the site's zones are unknown)
+                r["at_site"] = bool(site_zones and site_zones & r.get("zone_keys", frozenset()))
             if r["at_site"] or r["on_map"]:
                 kept.append(r)
             elif r.get("zones_deferred"):
@@ -1621,7 +1937,9 @@ class NwsAlertsPoller:
                   "count_raw": count_raw, "count_live": len(recs), "deferred": deferred,
                   # without the civil query this result is blind to IPAWS civil messages:
                   # its silence must not release a (configured) civil-event veto
-                  "blind_events": frozenset() if civil_ok else _CIVIL_LC}
+                  "blind_events": (frozenset() if civil_ok else _CIVIL_LC) | blind
+                  | civil_blind,
+                  "blind_all": blind_all, "unread": unread}
         with self._lock:
             self._area = result
             self._area_error = None
@@ -1658,10 +1976,21 @@ class NwsAlertsPoller:
             due_p = self._due(self._point_attempt_ts, p_every, now)
             due_a = self._due(self._area_attempt_ts, a_every, now)
         out = {}
+        # each query on its own: a bug that raises in one must not cost the other its
+        # round (the area query is the veto's second, independent source)
         if due_p:
-            out["point"] = self.poll_point(now)
+            try:
+                out["point"] = self.poll_point(now)
+            except Exception as e:  # noqa: BLE001
+                log.exception("NWS alerts point poll crashed")
+                out["point"] = self._fail("point", now, e)
         if due_a:
-            out["area"] = self.poll_area(now if explicit else time.time())
+            t = now if explicit else time.time()
+            try:
+                out["area"] = self.poll_area(t)
+            except Exception as e:  # noqa: BLE001
+                log.exception("NWS alerts area poll crashed")
+                out["area"] = self._fail("area", t, e)
         return out or None
 
     def clock_stepped(self, pre_now: float, post_now: float) -> None:
@@ -1676,9 +2005,11 @@ class NwsAlertsPoller:
         delta = post_now - pre_now
         with self._lock:
             for rec in self._veto.values():
+                # (the cap moves with the step in _reframe: the time left of the unseen
+                # bound is kept; it is not renewed, a clock step is no sighting)
                 self._reframe(rec, delta, post_now)
                 rec["last_seen_ts"] = post_now
-                self._bound_span(rec, post_now)
+                self._bound_unseen(rec, post_now)
             self._point_attempt_ts = None
             self._area_attempt_ts = None
             self._point = None
@@ -1736,6 +2067,9 @@ class NwsAlertsPoller:
             "vetoes": prim["key"] in active_keys,
             "veto_event": prim["event_lc"] in veto_set,
             "geometry_source": gsrc,
+            # a feature that could not be read (see _unread_stub): what is shown is all
+            # that could be read of it
+            "unread": bool(prim.get("unread")),
             "description": _clip(prim["description"], DESCRIPTION_MAX),
             "instruction": _clip(prim["instruction"], INSTRUCTION_MAX),
             "_sort": (prim["key"] not in active_keys, prim["rank"],
@@ -1782,6 +2116,14 @@ class NwsAlertsPoller:
                         reasons.append("NWS %s in effect for the site (no end time given; "
                                        "held until %s)%s" % (rec["event"], entry["end_local"],
                                                              who))
+                    elif self._capped(rec):
+                        # held to the unseen bound, which comes before the alert's end
+                        reasons.append("NWS %s in effect for the site until %s%s; held to %s "
+                                       "unless NWS lists it again (released %d h after its "
+                                       "last sighting)" % (
+                                           rec["event"], self._fmt(self._own_end(rec), now),
+                                           who, entry["end_local"],
+                                           UNSEEN_RELEASE_SEC // 3600))
                     else:
                         reasons.append("NWS %s in effect for the site until %s%s"
                                        % (rec["event"], entry["end_local"], who))
@@ -1798,12 +2140,15 @@ class NwsAlertsPoller:
                 lst.sort(key=lambda v: v["_sort"])
                 for v in lst:
                     del v["_sort"]
+            # a feature that could not be read is kept (see _unread_stub) and said here
+            unread = ["%s query: %d alert(s) could not be read" % (w, res["unread"])
+                      for w, res in (("point", p), ("area", a)) if res and res.get("unread")]
             errors = [("point query: " + self._point_error) if self._point_error else None,
                       ("area query: " + self._area_error) if self._area_error else None,
                       ("civil-message query: " + self._civil_error)
                       if self._civil_error else None,
                       ("latch file not written: " + self._persist_error)
-                      if self._persist_error else None]
+                      if self._persist_error else None] + unread
             comp = {
                 "safe": not veto,
                 "enabled": self._is_enabled(),

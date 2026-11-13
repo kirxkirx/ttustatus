@@ -441,27 +441,34 @@ def test_no_end_time_holds_sixty_minutes_from_the_last_sighting(env):
     assert p.component(NOW + 3601)["safe"] is True
 
 
-def test_a_warning_longer_than_the_stale_cap_is_never_released_mid_warning(env, monkeypatch):
-    # the 72 h cap bounds a hold on STALE information; fresh sightings renew it, so a
-    # long High Wind Warning never gets a SAFE gap when 72 h from its first sighting pass
+def test_a_warning_longer_than_the_unseen_bound_is_never_released_mid_warning(env, monkeypatch):
+    # the 24 h bound (UNSEEN_RELEASE_SEC) holds a veto on STALE information only; fresh
+    # sightings renew it, so a long High Wind Warning never gets a SAFE gap while NWS lists
+    # it, and it is released 24-25 h after its last sighting once nothing lists it any more
     ends = NOW + 100 * 3600
     env.nws.area = [derive(HWW, ends=ends, expires=ends)]
     p = env.new()
     both(p, NOW)
-    assert p.component(NOW)["veto"][0]["end_ts"] == NOW + na.MAX_VETO_SPAN_SEC   # capped
+    bound = na.UNSEEN_RELEASE_SEC + na.CAP_RENEW_SEC
+    assert p.component(NOW)["veto"][0]["end_ts"] == NOW + bound            # capped
     writes = []
     real = na._atomic_write_json
     monkeypatch.setattr(na, "_atomic_write_json",
                         lambda path, obj: (writes.append(path), real(path, obj)))
-    for h in (1, 2, 3):                                 # early sightings: no rewrite
-        both(p, NOW + h * 3600)
+    both(p, NOW + 1800)                                 # within the renewal step: no rewrite
     assert not [w for w in writes if w == env.cfg.HAZARD_LATCH_FILE]
-    both(p, NOW + 40 * 3600)                           # past half the cap: renewed once
+    both(p, NOW + 2 * 3600)                             # renewed: written once
     assert [w for w in writes if w == env.cfg.HAZARD_LATCH_FILE] == [env.cfg.HAZARD_LATCH_FILE]
+    for h in range(3, 41):                              # sighted hourly for 40 h: no gap
+        both(p, NOW + h * 3600)
+        assert p.component(NOW + h * 3600 + 1)["safe"] is False
     env.nws.down = {"point", "area", "points", "zones"}
-    c = p.component(NOW + 73 * 3600)
-    assert c["safe"] is False and c["veto"][0]["end_ts"] == ends
-    assert p.component(ends + 1)["safe"] is True
+    c = p.component(NOW + 40 * 3600 + na.UNSEEN_RELEASE_SEC - 1)
+    assert c["safe"] is False and c["veto"][0]["alert_end_ts"] == ends
+    assert "unless NWS lists it again" in c["reasons"][0]
+    assert p.component(NOW + 40 * 3600 + bound)["safe"] is True
+    assert env.log.vetoes()[-1]["result"] == ("released: not sighted for 24 h, could not be "
+                                              "confirmed gone")
 
 
 # ---- persistence, restart and the clock
@@ -1052,10 +1059,10 @@ def test_get_requests_gzip_and_caps_every_body(monkeypatch):
     fake(json.dumps(doc).encode())                     # a server ignoring the request
     assert na._get("https://api.weather.gov/x", "ua") == doc
     fake(b" " * 2048)
-    with pytest.raises(ValueError, match="larger than"):
+    with pytest.raises(ValueError, match="over the limit"):
         na._get("https://api.weather.gov/x", "ua", max_bytes=1024)
     fake(gzip.compress(b" " * 4096), "gzip")           # a (tiny) gzip bomb
-    with pytest.raises(ValueError, match="inflates beyond"):
+    with pytest.raises(ValueError, match="inflates to more than"):
         na._get("https://api.weather.gov/x", "ua", max_bytes=1024)
     assert na.MAX_BODY_BYTES >= 8 * 1024 * 1024        # never cuts a real zone / area answer
 

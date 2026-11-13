@@ -126,7 +126,8 @@ you use the shell launchers.
 make_status_page.py     status-page generator (run every 90 s)
 run_status_page.sh       manual fallback loop for the status page (normally not needed)
 safety_monitor.py        Alpaca SafetyMonitor daemon entry point
-run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd)
+run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd, never both:
+                         a second copy exits at once)
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
   hazard_feeds.py        information-only hazard feeds (HMS, NIFC, SPC, LSR)
@@ -212,10 +213,12 @@ the downloadable CSV log that goes with it.
 ```bash
 python3 -m venv venv && venv/bin/pip install flask waitress pytest flake8
 venv/bin/python -m pytest safety/tests -q        # unit + smoke tests (hardware stubbed)
-venv/bin/flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety
+venv/bin/flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety make_status_page.py
 ```
 
-CI (GitHub Actions) runs the same on every push. `make_status_page.py` is smoke-tested with
+CI (GitHub Actions) runs the same on every push, on Python 3.9 (the development host), 3.11
+(Raspberry Pi OS Bookworm), 3.13 (Trixie) and 3.14 (the current release), and checks the
+syntax of the shell scripts with `bash -n`. `make_status_page.py` is smoke-tested with
 its Raspberry Pi hardware libraries (`board`, `adafruit_dht`, `gps`, `astropy`) mocked, so it
 lints and its page-rendering functions run without a Pi.
 

@@ -117,8 +117,10 @@ elif GEOCODE_FROM_ENV:
                            "the other comes from the built-in TTU default")
 else:
     GEOCODE_SOURCE = "built-in default (TTU)"
-GEOCODE_MISMATCH_KM = _env_float("TTU_SAFETY_GEO_MISMATCH_KM", 0.1)  # warn beyond ~100 m
-WU_MAX_STATION_KM = _env_float("TTU_SAFETY_WU_MAX_KM", 60.0)  # drop 'nearest' beyond this
+GEOCODE_MISMATCH_KM = _clamp("TTU_SAFETY_GEO_MISMATCH_KM",          # warn beyond ~100 m
+                             _env_float("TTU_SAFETY_GEO_MISMATCH_KM", 0.1), 0.01, 10000.0)
+WU_MAX_STATION_KM = _clamp("TTU_SAFETY_WU_MAX_KM",       # drop 'nearest' beyond this
+                           _env_float("TTU_SAFETY_WU_MAX_KM", 60.0), 1.0, 500.0)
 # Stations excluded from rain detection (comma-separated IDs, case-insensitive).
 # Reserve this list for stations that LIE — merely dead hardware is handled by the
 # automatic backoff (WU_BACKOFF_AFTER below), which probes it hourly and restores it
@@ -127,13 +129,17 @@ WU_MAX_STATION_KM = _env_float("TTU_SAFETY_WU_MAX_KM", 60.0)  # drop 'nearest' b
 WU_EXCLUDE_STATIONS = frozenset(
     x.strip().upper()
     for x in _env_str("TTU_SAFETY_WU_EXCLUDE", "KTXSHALL25").split(",") if x.strip())
-WU_POLL_INTERVAL = _env_int("TTU_SAFETY_POLL_INTERVAL", 600)  # s between WU polls
+# s between WU polls (60 s to 1 h: ten stations per poll against the PWS budget below)
+WU_POLL_INTERVAL = _clamp("TTU_SAFETY_POLL_INTERVAL",
+                          _env_int("TTU_SAFETY_POLL_INTERVAL", 600), 60, 3600)
 # Automatic dead-station backoff: after this many CONSECUTIVE no-response polls a
 # station is probed only every WU_BACKOFF_RETRY_SEC instead of every cycle (saves API
 # calls on dead hardware), and rejoins the full cadence by itself on the first answer —
 # unlike the manual WU_EXCLUDE_STATIONS list, this self-heals.
-WU_BACKOFF_AFTER = _env_int("TTU_SAFETY_WU_BACKOFF_AFTER", 6)       # ~1 h at night cadence
-WU_BACKOFF_RETRY_SEC = _env_int("TTU_SAFETY_WU_BACKOFF_RETRY", 3600)
+WU_BACKOFF_AFTER = _clamp("TTU_SAFETY_WU_BACKOFF_AFTER",            # ~1 h at night cadence
+                          _env_int("TTU_SAFETY_WU_BACKOFF_AFTER", 6), 1, 1000)
+WU_BACKOFF_RETRY_SEC = _clamp("TTU_SAFETY_WU_BACKOFF_RETRY",
+                              _env_int("TTU_SAFETY_WU_BACKOFF_RETRY", 3600), 60, 86400)
 WU_DAILY_BUDGET = 1500          # PWS-owner cap (calls/day); informational only
 MAX_OBS_AGE_MIN = 30            # ignore a station reading older than this
 HTTP_TIMEOUT = 15               # s per WU request
@@ -145,9 +151,13 @@ RAIN_POLL_SUN_BELOW_DEG = 5.0   # only poll WU when sun altitude < this (save ca
 HUMIDITY_UNSAFE_ABOVE = 95.0    # unsafe when humidity > 95 %
 HUMIDITY_CLEAR_BELOW = 93.0     # hysteresis: clear humidity-unsafe below this
 # Freeze time after the LAST rain reading at a WU station: hold unsafe this long, then
-# clear if nothing else is still triggering.
-RAIN_LATCH_HOURS = _env_float("TTU_SAFETY_RAIN_LATCH_HOURS", 1.0)
-INPUTS_STALE_SEC = _env_int("TTU_SAFETY_INPUTS_STALE_SEC", 600)  # older => fail safe
+# clear if nothing else is still triggering. At least 0.1 h: a zero or negative latch
+# would release the moment the rain is seen (it disabled the latch silently).
+RAIN_LATCH_HOURS = _clamp("TTU_SAFETY_RAIN_LATCH_HOURS",
+                          _env_float("TTU_SAFETY_RAIN_LATCH_HOURS", 1.0), 0.1, 48.0)
+# page inputs older than this => fail safe (1 min to 1 h: the page is written every 90 s)
+INPUTS_STALE_SEC = _clamp("TTU_SAFETY_INPUTS_STALE_SEC",
+                          _env_int("TTU_SAFETY_INPUTS_STALE_SEC", 600), 60, 3600)
 CLOCK_SKEW_TOLERANCE_SEC = 5    # future-dated inputs beyond this => also stale
 # WRONG-CLOCK GUARD (safety/servertime.py). The radar archives and the GLM bucket keep
 # years of data, and every request asks for "now" by THIS host's clock: a Pi booting with
@@ -177,7 +187,7 @@ elif SERVER_CLOCK_TOL_SEC == 0:
 # hour or NEXT hour breaches any threshold. Free, no key (NWS asks for a User-Agent). A
 # fetch error or stale forecast is treated as "unavailable" (does not by itself flip unsafe
 # — it's a forecast, not a local sensor); a breach in a fresh forecast DOES flip unsafe.
-NWS_ENABLED = _env_str("TTU_SAFETY_NWS", "1").strip().lower() not in ("0", "false", "no")
+NWS_ENABLED = _env_flag("TTU_SAFETY_NWS", True)
 # ONE User-Agent for every request the daemon makes to NWS, IEM, the hazard feeds and the
 # basemap tile servers. Put a REAL contact e-mail in it, e.g.
 #   ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)
@@ -215,32 +225,55 @@ if ua_has_placeholder(NWS_USER_AGENT):
         "OpenStreetMap blocks such requests, so no OSM basemap tiles are fetched; put your "
         "real e-mail address in it (NWS asks for a contact too)")
 NWS_GRID = _env_str("TTU_SAFETY_NWS_GRID", "")   # e.g. "LUB/46,41"; empty => resolve via GEOCODE
-NWS_POLL_INTERVAL = _env_int("TTU_SAFETY_NWS_POLL_INTERVAL", 900)     # 15 min
-NWS_STALE_AFTER_MIN = _env_int("TTU_SAFETY_NWS_STALE_MIN", 150)
-NWS_CLOUD_MAX = _env_float("TTU_SAFETY_NWS_CLOUD_MAX", 60.0)          # % ; unsafe when >
-NWS_PRECIP_PROB_MAX = _env_float("TTU_SAFETY_NWS_PRECIP_MAX", 20.0)   # % ; unsafe when >
-NWS_THUNDER_PROB_MAX = _env_float("TTU_SAFETY_NWS_THUNDER_MAX", 15.0)  # % ; unsafe when >
-NWS_RENDER_HOURS = _env_int("TTU_SAFETY_NWS_RENDER_HOURS", 12)        # 12-h table (display)
+# 15 min; 5 min to 1 h (0 made the forecast permanently "unavailable": it re-ages at two
+# poll intervals)
+NWS_POLL_INTERVAL = _clamp("TTU_SAFETY_NWS_POLL_INTERVAL",
+                           _env_int("TTU_SAFETY_NWS_POLL_INTERVAL", 900), 300, 3600)
+NWS_STALE_AFTER_MIN = _clamp("TTU_SAFETY_NWS_STALE_MIN",
+                             _env_int("TTU_SAFETY_NWS_STALE_MIN", 150), 30, 1440)
+# % ; unsafe when > (0-100: 100 never trips, so it switches that check off)
+NWS_CLOUD_MAX = _clamp("TTU_SAFETY_NWS_CLOUD_MAX",
+                       _env_float("TTU_SAFETY_NWS_CLOUD_MAX", 60.0), 0.0, 100.0)
+NWS_PRECIP_PROB_MAX = _clamp("TTU_SAFETY_NWS_PRECIP_MAX",
+                             _env_float("TTU_SAFETY_NWS_PRECIP_MAX", 20.0), 0.0, 100.0)
+NWS_THUNDER_PROB_MAX = _clamp("TTU_SAFETY_NWS_THUNDER_MAX",
+                              _env_float("TTU_SAFETY_NWS_THUNDER_MAX", 15.0), 0.0, 100.0)
+NWS_RENDER_HOURS = _clamp("TTU_SAFETY_NWS_RENDER_HOURS",              # 12-h table (display)
+                          _env_int("TTU_SAFETY_NWS_RENDER_HOURS", 12), 1, 48)
 LOCAL_TZ = _env_str("TTU_SAFETY_LOCAL_TZ", "America/Chicago")         # for the render table
 
 # --- GLM lightning component (GOES-19 total lightning via AWS S3) -----------
-# Every GLM_POLL_INTERVAL (night only, sun below the gate) fetches the last GLM_WINDOW_MIN
-# of GLM granules IN RAM (no SD writes) and LATCHES unsafe for GLM_COOLOFF_HOURS if any
+# Every GLM_POLL_INTERVAL (night only, sun below the gate) fetches the GLM granules since the
+# last poll (at least the last GLM_WINDOW_MIN; see glm_lightning.poll_flashes) IN RAM (no
+# SD writes) and LATCHES unsafe for GLM_COOLOFF_HOURS if any
 # flash is within GLM_TRIGGER_KM. The slow S3/netCDF work runs in its own thread; evaluate()
 # only reads the cached latch, so it never blocks page/monitor refresh. Needs numpy+netCDF4
 # (apt: python3-numpy python3-netcdf4); if absent, GLM is disabled (other layers unaffected).
-GLM_ENABLED = _env_str("TTU_SAFETY_GLM", "1").strip().lower() not in ("0", "false", "no")
+GLM_ENABLED = _env_flag("TTU_SAFETY_GLM", True)
 GLM_BUCKET = _env_str("TTU_SAFETY_GLM_BUCKET", "noaa-goes19")
-GLM_TRIGGER_KM = _env_float("TTU_SAFETY_GLM_TRIGGER_KM", 50.0)
+# A ring of 0 km (or less) would never trigger: the layer would read as "clear" forever.
+GLM_TRIGGER_KM = _clamp("TTU_SAFETY_GLM_TRIGGER_KM",
+                        _env_float("TTU_SAFETY_GLM_TRIGGER_KM", 50.0), 1.0, 20000.0)
 # Freeze time after the last in-range flash (30 min — lightning warrants a longer
-# hold than the 15 min radar rain freeze).
-GLM_COOLOFF_HOURS = _env_float("TTU_SAFETY_GLM_COOLOFF_HOURS", 0.5)
+# hold than the 15 min radar rain freeze). 0 would make a flash a no-op.
+GLM_COOLOFF_HOURS = _clamp("TTU_SAFETY_GLM_COOLOFF_HOURS",
+                           _env_float("TTU_SAFETY_GLM_COOLOFF_HOURS", 0.5), 0.1, 24.0)
 GLM_POLL_INTERVAL = _env_int("TTU_SAFETY_GLM_POLL_INTERVAL", 300)     # 5 min
-GLM_WINDOW_MIN = _env_int("TTU_SAFETY_GLM_WINDOW_MIN", 5)             # look-back per poll
+# Look-back of the first poll after a start (later polls read from where the previous one
+# stopped). At most 60: only the current and the previous hour of the bucket are listed.
+GLM_WINDOW_MIN = _clamp("TTU_SAFETY_GLM_WINDOW_MIN",
+                        _env_int("TTU_SAFETY_GLM_WINDOW_MIN", 5), 1, 60)
 GLM_POLL_SUN_BELOW_DEG = _env_float("TTU_SAFETY_GLM_SUN_BELOW", 5.0)  # night gate (like WU)
 GLM_LATCH_FILE = _env_str("TTU_SAFETY_GLM_LATCH_FILE",
                           os.path.expanduser("~/safety_glm_latch.json"))
 GLM_STALE_AFTER_SEC = _env_int("TTU_SAFETY_GLM_STALE_SEC", 900)  # older poll => no data
+if GLM_STALE_AFTER_SEC < GLM_POLL_INTERVAL + 120:
+    # shorter than one poll interval (plus the poll's own time): every poll would turn
+    # into "no data" before the next one
+    CONFIG_WARNINGS.append(
+        f"TTU_SAFETY_GLM_STALE_SEC={GLM_STALE_AFTER_SEC} is shorter than one GLM poll "
+        f"interval plus 2 min ({GLM_POLL_INTERVAL + 120} s) — using {GLM_POLL_INTERVAL + 120}")
+    GLM_STALE_AFTER_SEC = GLM_POLL_INTERVAL + 120
 
 # --- MRMS radar (rain within a radius) --------------------------------------
 # Every RADAR_POLL_INTERVAL (DAY AND NIGHT — free data) read the newest MRMS SeamlessHSR
@@ -252,10 +285,13 @@ GLM_STALE_AFTER_SEC = _env_int("TTU_SAFETY_GLM_STALE_SEC", 900)  # older poll =>
 # page. Needs Pillow (apt: python3-pil); absent => radar disabled (other layers
 # unaffected). A fetch error/stale frame => unavailable (does not by itself force
 # unsafe); the radar keeps its own post-rain freeze (RADAR_LATCH_SEC).
-RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "false", "no")
-RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 30.0)
-RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
-RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
+RADAR_ENABLED = _env_flag("TTU_SAFETY_RADAR", True)
+RADAR_TRIGGER_KM = _clamp("TTU_SAFETY_RADAR_KM",
+                          _env_float("TTU_SAFETY_RADAR_KM", 30.0), 1.0, 300.0)
+RADAR_DBZ = _clamp("TTU_SAFETY_RADAR_DBZ",                   # echo >= this = rain
+                   _env_float("TTU_SAFETY_RADAR_DBZ", 20.0), 5.0, 60.0)
+RADAR_POLL_INTERVAL = _clamp("TTU_SAFETY_RADAR_POLL_INTERVAL",          # 5 min
+                             _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300), 60, 1800)
 # CONFIRMATION: how many CONSECUTIVE frames (one per poll; each frame counts once, so a
 # stalled feed offering the same frame again confirms nothing) must show an in-ring echo
 # before the radar vetoes. MRMS composites occasionally carry a single-frame artefact
@@ -263,12 +299,15 @@ RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
 # frame should not close the dome. Costs one poll interval (~5 min) of extra latency on
 # real rain, which is affordable for a 30 km early-warning ring — the close-in layers (WU
 # stations, GLM) are unaffected. Set to 1 to trigger on a single frame again.
-RADAR_TRIGGER_AFTER = _env_int("TTU_SAFETY_RADAR_TRIGGER_AFTER", 2)
+RADAR_TRIGGER_AFTER = _clamp("TTU_SAFETY_RADAR_TRIGGER_AFTER",
+                             _env_int("TTU_SAFETY_RADAR_TRIGGER_AFTER", 2), 1, 10)
 # NOTE: radar polls day AND night (free data, daytime rain matters, live map) — unlike
 # the WU/GLM night gates.
 # A frame older than this BY ITS OWN TIME is "no data" (unavailable): measured from the
 # frame's time, not from when it was fetched, so a stalled feed cannot keep it current.
-RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older => unavailable
+# (10 min to 1 h: IEM's frames arrive ~5.5 min after their time, one poll interval later)
+RADAR_STALE_AFTER_SEC = _clamp("TTU_SAFETY_RADAR_STALE_SEC",            # older => unavailable
+                               _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200), 600, 3600)
 # FRAME SOURCES (safety/radar.py): the same MRMS frames from two free, key-less archives.
 #   aws — NOAA's Open Data bucket on AWS: MRMS's own GRIB2, ~1 min after the frame time;
 #   iem — the Iowa Environmental Mesonet's lcref PNG of the same grid, ~5.5 min after.
@@ -308,7 +347,8 @@ RADAR_RETRY_SEC = _clamp("TTU_SAFETY_RADAR_RETRY_SEC",
 # frames are clear, so the dome does not reopen the moment a cell's leading edge leaves
 # the ring (and so a ranged echo can't reopen it when the radar feed goes blind, since a
 # cell inside the ring may sit over no WU station at all).
-RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 900)   # 15 min post-rain freeze
+RADAR_LATCH_SEC = _clamp("TTU_SAFETY_RADAR_LATCH_SEC",          # 15 min post-rain freeze
+                         _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 900), 60, 21600)
 RADAR_LATCH_FILE = _env_str("TTU_SAFETY_RADAR_LATCH_FILE",
                             os.path.expanduser("~/safety_radar_latch.json"))
 # thumbnail: written where the status page can load it (beside status.html on the Pi)
@@ -443,7 +483,7 @@ RADAR_TILE_URL, _key_night = _carto_url(
     "TTU_SAFETY_RADAR_TILE_URL", _env_str("TTU_SAFETY_RADAR_TILE_URL", "").strip()
     or CARTO_TILE_URL)
 # Daytime (light) version of the map, shown when the status page is in day style.
-RADAR_DAY_ENABLED = _env_str("TTU_SAFETY_RADAR_DAY", "1").strip().lower() not in ("0", "false", "no")
+RADAR_DAY_ENABLED = _env_flag("TTU_SAFETY_RADAR_DAY", True)
 RADAR_TILE_URL_DAY, _key_day = _carto_url(
     "TTU_SAFETY_RADAR_TILE_URL_DAY", _env_str("TTU_SAFETY_RADAR_TILE_URL_DAY", "").strip()
     or CARTO_TILE_URL_DAY)
@@ -467,15 +507,13 @@ if RADAR_BASEMAP == "carto" and any(tile_host_kind(u) == "osm"
 # near-black, black labels white). Dark tiles are left alone, tile by tile. CARTO tiles
 # are never inverted: the night map is Dark Matter already, and the cached CARTO
 # composites were built uninverted.
-RADAR_TILE_DARK_INVERT = (_env_str("TTU_SAFETY_RADAR_TILE_DARK_INVERT", "1").strip().lower()
-                          not in ("0", "false", "no"))
+RADAR_TILE_DARK_INVERT = _env_flag("TTU_SAFETY_RADAR_TILE_DARK_INVERT", True)
 RADAR_CACHE_DIR = _env_str("TTU_SAFETY_RADAR_CACHE", os.path.expanduser("~/.cache/ttu-radar"))
 # Write the thumbnails into /dev/shm and leave a one-time symlink at RADAR_THUMB_PATH:
 # the two PNGs are rewritten every poll (~150-250 MB/day) — the single largest SD write
 # of the whole stack, on a Pi whose brownouts corrupt SD cards mid-write. Apache, nginx
 # and lighttpd all follow symlinks out of the box on Debian. Set 0 to write directly.
-RADAR_THUMB_VIA_SHM = (_env_str("TTU_SAFETY_RADAR_THUMB_SHM", "1").strip().lower()
-                       not in ("0", "false", "no")) and os.path.isdir("/dev/shm")
+RADAR_THUMB_VIA_SHM = _env_flag("TTU_SAFETY_RADAR_THUMB_SHM", True) and os.path.isdir("/dev/shm")
 # The radar-data credit. The map's full attribution line is COMPUTED from the basemap
 # actually drawn (radar.basemap_attribution): "© OpenStreetMap contributors, © CARTO"
 # when a CARTO map is shown, "© OpenStreetMap contributors" for OSM alone, then this,
@@ -498,7 +536,7 @@ RADAR_ATTRIBUTION = "Radar: NOAA/NSSL MRMS"
 #    map, never part of IsSafe.
 # With no veto held, an unreachable alert feed is "unavailable" and does not veto on its
 # own — like the forecast and radar layers; the connectivity watchdog covers total loss.
-HAZARDS_ENABLED = _env_str("TTU_SAFETY_HAZARDS", "1").strip().lower() not in ("0", "false", "no")
+HAZARDS_ENABLED = _env_flag("TTU_SAFETY_HAZARDS", True)
 
 # Every event name api.weather.gov/alerts/types listed on 2026-09-24, plus the legacy names
 # retired by the 2024-25 heat/cold renaming. Used ONLY to catch a typo in
@@ -653,8 +691,7 @@ HAZARD_ALERT_FILL_ALPHA = _clamp("TTU_SAFETY_HAZARD_FILL_ALPHA",
 
 # Hazard information feeds (INFORMATION ONLY — shown, never part of IsSafe). Each feed is
 # independent: one failing never blanks the others.
-HAZARD_FEEDS_ENABLED = (_env_str("TTU_SAFETY_HAZARD_FEEDS", "1").strip().lower()
-                        not in ("0", "false", "no"))
+HAZARD_FEEDS_ENABLED = _env_flag("TTU_SAFETY_HAZARD_FEEDS", True)
 # Every 10 min: slow-moving products (SPC outlooks and HMS smoke update a few times a
 # day); a feed whose own cadence is slower is polled at that cadence instead.
 HAZARD_FEEDS_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_FEEDS_POLL_SEC",
@@ -667,13 +704,14 @@ HAZARD_LSR_HOURS = _clamp("TTU_SAFETY_HAZARD_LSR_HOURS",
 # The daemon periodically runs make_status_page.py as a SUBPROCESS (one systemd service
 # for everything; the page's heavy deps and any crash stay isolated from the safety
 # logic). A run that hangs is killed with its whole process tree after PAGE_TIMEOUT.
-PAGE_ENABLED = _env_str("TTU_SAFETY_PAGE", "1").strip().lower() not in ("0", "false", "no")
+PAGE_ENABLED = _env_flag("TTU_SAFETY_PAGE", True)
 PAGE_SCRIPT = _env_str("TTU_SAFETY_PAGE_SCRIPT",
                        os.path.join(os.path.dirname(os.path.dirname(
                            os.path.abspath(__file__))), "make_status_page.py"))
 # same env var the page itself uses for its meta-refresh, so the two always agree
-PAGE_INTERVAL = _env_int("STATUS_PAGE_INTERVAL", 90)
-PAGE_TIMEOUT = _env_int("TTU_SAFETY_PAGE_TIMEOUT", 1800)   # kill a stuck run after 30 min
+PAGE_INTERVAL = _clamp("STATUS_PAGE_INTERVAL", _env_int("STATUS_PAGE_INTERVAL", 90), 30, 3600)
+PAGE_TIMEOUT = _clamp("TTU_SAFETY_PAGE_TIMEOUT",      # kill a stuck run after 30 min
+                      _env_int("TTU_SAFETY_PAGE_TIMEOUT", 1800), 60, 7200)
 
 # --- connectivity watchdog (loss of internet) -------------------------------
 # A lightweight probe (day and night) checks whether ANY online service host is reachable.
@@ -683,10 +721,16 @@ PAGE_TIMEOUT = _env_int("TTU_SAFETY_PAGE_TIMEOUT", 1800)   # kill a stuck run af
 # "unknown"): it exists precisely to catch the case where every online layer is silently
 # unavailable. A response of ANY kind (even an HTTP error) counts as "reachable" — only a
 # connection/DNS/timeout failure is "offline".
-CONN_ENABLED = _env_str("TTU_SAFETY_CONN", "1").strip().lower() not in ("0", "false", "no")
-CONN_OFFLINE_UNSAFE_SEC = _env_int("TTU_SAFETY_OFFLINE_UNSAFE_SEC", 3600)   # 1 hour
-CONN_PROBE_INTERVAL = _env_int("TTU_SAFETY_CONN_PROBE_INTERVAL", 300)       # 5 min
-CONN_PROBE_TIMEOUT = _env_int("TTU_SAFETY_CONN_PROBE_TIMEOUT", 10)
+CONN_ENABLED = _env_flag("TTU_SAFETY_CONN", True)
+CONN_PROBE_INTERVAL = _clamp("TTU_SAFETY_CONN_PROBE_INTERVAL",              # 5 min
+                             _env_int("TTU_SAFETY_CONN_PROBE_INTERVAL", 300), 30, 3600)
+CONN_PROBE_TIMEOUT = _clamp("TTU_SAFETY_CONN_PROBE_TIMEOUT",
+                            _env_int("TTU_SAFETY_CONN_PROBE_TIMEOUT", 10), 1, 60)
+# 1 hour; 10 min to 24 h, and never shorter than two probe intervals (a single slow probe
+# must not be able to veto)
+CONN_OFFLINE_UNSAFE_SEC = _clamp("TTU_SAFETY_OFFLINE_UNSAFE_SEC",
+                                 _env_int("TTU_SAFETY_OFFLINE_UNSAFE_SEC", 3600),
+                                 max(600, 2 * CONN_PROBE_INTERVAL), 86400)
 # One host per service family the daemon actually depends on (NWS, WU, radar/IEM, GLM/S3);
 # ANY response marks the internet up, so the list just needs breadth, not depth.
 CONN_PROBE_URLS = [
@@ -713,20 +757,27 @@ INPUTS_FILE = _env_str("TTU_SAFETY_INPUTS_FILE", _SHM + "/safety_inputs.json")
 STATE_FILE = _env_str("TTU_SAFETY_STATE_FILE", _SHM + "/safety_state.json")
 # Heartbeat for the throttled state-file write (see monitor._write_state): unchanged state
 # is rewritten at most this often so the page's staleness gate still sees a live daemon.
-STATE_WRITE_HEARTBEAT_SEC = _env_int("TTU_SAFETY_STATE_HEARTBEAT_SEC", 60)
+STATE_WRITE_HEARTBEAT_SEC = _clamp("TTU_SAFETY_STATE_HEARTBEAT_SEC",
+                                   _env_int("TTU_SAFETY_STATE_HEARTBEAT_SEC", 60), 10, 120)
 # Durable (survive reboot): the rain latch and the audit log.
 LATCH_FILE = _env_str("TTU_SAFETY_LATCH_FILE", os.path.expanduser("~/safety_latch.json"))
 EVENT_LOG = _env_str("TTU_SAFETY_EVENT_LOG", os.path.expanduser("~/safety_events.log"))
+# Single-instance guard (see housekeeping.run_lock): a second daemon exits at once. Beside
+# the latches, created once; each start rewrites only its pid line (no SD-card wear).
+LOCK_FILE = os.path.expanduser(_env_str("TTU_SAFETY_LOCK_FILE", "").strip()
+                               or "~/.ttu-safety.lock")
 
 # --- Alpaca server ----------------------------------------------------------
 HTTP_HOST = _env_str("TTU_SAFETY_HTTP_HOST", "0.0.0.0")   # LAN-reachable for NINA
-HTTP_PORT = _env_int("TTU_SAFETY_HTTP_PORT", 11111)
+HTTP_PORT = _clamp("TTU_SAFETY_HTTP_PORT", _env_int("TTU_SAFETY_HTTP_PORT", 11111), 1, 65535)
 DEVICE_NUMBER = 0
 SERVER_NAME = _env_str("TTU_SAFETY_NAME", "TTU Safety Monitor")
 LOCATION = _env_str("TTU_SAFETY_LOCATION", "TTU Observatory, Lubbock TX")
 UNIQUE_ID = "ttu-safetymonitor-0-9f2a7c31"   # stable per-device id for Alpaca
 DRIVER_VERSION = "0.1.0"
-EVAL_INTERVAL = _env_int("TTU_SAFETY_EVAL_INTERVAL", 30)  # evaluator cadence (s)
+# evaluator cadence (s); at least 1 (0 busy-looped the evaluator thread)
+EVAL_INTERVAL = _clamp("TTU_SAFETY_EVAL_INTERVAL",
+                       _env_int("TTU_SAFETY_EVAL_INTERVAL", 30), 1, 300)
 
 # --- dew monitor: a SECOND Alpaca SafetyMonitor (device 1) ------------------
 # Not an observing-safety verdict and NOT for NINA. Its IsSafe answers one question for
@@ -818,9 +869,9 @@ if DEW_GLM_MAX_AGE_MIN * 60.0 < GLM_POLL_INTERVAL + 120.0:
         "otherwise go stale between two good polls)")
     DEW_GLM_MAX_AGE_MIN = _needed
 # What a GLM poll must have read of its look-back window to count as lightning data. GLM
-# writes a granule every 20 s; the GLM layer skips a granule it cannot download and still
-# reports "no flash", and "no flash" out of a fraction of the window is not "no
-# lightning". Default: two thirds of the window (a healthy poll reads all of it but the
+# writes a granule every 20 s; a granule the GLM layer cannot download is read again by
+# the next poll, but this poll still reports "no flash", and "no flash" out of a fraction
+# of the window is not "no lightning". Default: two thirds of the window (a healthy poll reads all of it but the
 # newest two or three granules, which have not reached S3 yet).
 DEW_GLM_MIN_GRANULES = _clamp(
     "TTU_SAFETY_DEW_GLM_MIN_GRANULES",

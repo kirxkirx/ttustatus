@@ -27,6 +27,12 @@ from astropy.coordinates import AltAz
 from astropy.coordinates import get_sun
 from astropy.utils import iers
 
+# Two stdlib-only helpers of the daemon's package (the page runs from the repository's
+# directory, beside safety/): ISO times read alike on every Python, and the text scrub
+# that makes any feed text writable as UTF-8 and free of control / bidi characters.
+from safety.isotime import parse_iso
+from safety.textclean import clean_text
+
 
 IMAGE_FILE = "/var/www/html/snapshot.jpg"
 HTML_FILE = "/var/www/html/status.html"
@@ -92,6 +98,25 @@ CACHE_MAX_AGE_GPS = 604800
 REFRESH_SECONDS_DEFAULT = 90
 REFRESH_SECONDS_ENV_VAR = "STATUS_PAGE_INTERVAL"
 
+# The page's own age, judged in the viewer's browser (PAGE_JS): the meta refresh only
+# fetches the same file again, so a page that is no longer regenerated (the daemon
+# stopped, a run fails or hangs until PAGE_TIMEOUT kills it) would otherwise go on
+# showing its last verdict, a green SAFE included, as if current. Past the limit below the
+# page says so in a red banner and greys out the safety badges and tiles.
+# The limit must cover the longest NORMAL gap between two pages: a run without the camera
+# takes seconds, so max(15 min, 3 refresh intervals). With TTU_STATUS_CAMERA=1 a night run
+# is a 120 s timelapse capture (NIGHT_STACK_CAPTURE_MS), then dcraw on each of its ~80
+# frames (NIGHT_STACK_CAPTURE_MS / NIGHT_STACK_TIMELAPSE_MS) and a stack per batch of
+# NIGHT_STACK_BATCH: on the order of ten minutes on a Raspberry Pi 4, and the next run
+# starts only when it is done, so 30 min there. Both can be set
+# in minutes with TTU_STATUS_PAGE_STALE_MIN (a slower Pi, a longer interval).
+PAGE_STALE_MIN_SEC = 15 * 60
+PAGE_STALE_CAMERA_SEC = 30 * 60
+PAGE_STALE_ENV_VAR = "TTU_STATUS_PAGE_STALE_MIN"
+# A viewer's clock this far BEHIND the generation time cannot tell the page's age (the Pi
+# itself boots with fake-hwclock); the script then says so instead of judging.
+PAGE_CLOCK_BEHIND_SEC = 300
+
 # The footer links to the source code (a fork points this at its own copy; the /setup
 # page has its own SOURCE_URL in safety/alpaca.py).
 SOURCE_URL = "https://github.com/kirxkirx/ttustatus"
@@ -154,10 +179,18 @@ def save_cache(cache):
     tmp_file = CACHE_FILE + ".tmp"
 
     try:
-        with open(tmp_file, "w") as f:
+        with open(tmp_file, "w", encoding="utf-8", errors="replace") as f:
             json.dump(cache, f)
         os.replace(tmp_file, CACHE_FILE)
     except Exception:
+        _remove_quietly(tmp_file)
+
+
+def _remove_quietly(path):
+    """Remove a temporary file a failed write left behind; never raises."""
+    try:
+        os.remove(path)
+    except OSError:
         pass
 
 
@@ -1652,7 +1685,7 @@ def get_chrony_clients_count():
     count = parse_chrony_clients(out)
     if count is None:
         try:
-            with open(SUDO_CHRONYC_DENIED_MARKER, "w", encoding="utf-8"):
+            with open(SUDO_CHRONYC_DENIED_MARKER, "w", encoding="utf-8", errors="replace"):
                 pass
         except OSError:
             pass
@@ -1668,6 +1701,31 @@ def get_ntp_info():
     info["clients"] = get_chrony_clients_count()
 
     return info
+
+
+def page_stale_after_s(refresh_seconds=None):
+    """Seconds after its generation from which the page calls itself no longer updated:
+    TTU_STATUS_PAGE_STALE_MIN (minutes, > 0) when set, else max(15 min, 3 refresh
+    intervals), and at least 30 min with the camera on (see PAGE_STALE_MIN_SEC)."""
+    raw = os.environ.get(PAGE_STALE_ENV_VAR, "").strip()
+    if raw:
+        try:
+            minutes = float(raw)
+            if math.isfinite(minutes) and minutes > 0:
+                return max(60, int(round(minutes * 60)))
+        except ValueError:
+            pass
+    if refresh_seconds is None:
+        refresh_seconds = get_refresh_seconds()
+    limit = max(PAGE_STALE_MIN_SEC, 3 * int(refresh_seconds))
+    if CAMERA_ENABLED:
+        limit = max(limit, PAGE_STALE_CAMERA_SEC)
+    return limit
+
+
+def _fmt_minutes(seconds):
+    m = int(round(seconds / 60.0))
+    return "%d min" % m if m < 120 else "%g h" % round(m / 60.0, 1)
 
 
 def get_refresh_seconds():
@@ -1731,6 +1789,16 @@ PAGE_CSS = """  body { margin: 0; }
   .when { text-align: right; }
   .when .t { font-size: 27px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .when .d { font-size: 13px; color: var(--muted); }
+  .when .gl { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+              color: var(--faint); font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+              margin-right: 6px; vertical-align: 4px; }
+  /* the page's own age (PAGE_JS fills #pageage and adds .outdated to the page once it is no
+     longer being regenerated): a red banner, the verdicts greyed out */
+  .pageage { border: 2px solid #b42318; background: #b42318; color: #fff; font-weight: 700;
+             border-radius: 10px; padding: 10px 14px; margin: 0 0 16px; font-size: 14.5px; }
+  .pageage.note { background: var(--card); color: var(--ink); border-color: var(--warn); font-weight: 600; }
+  .page.outdated .sbadge { background: var(--faint) !important; text-decoration: line-through; }
+  .page.outdated .tiles, .page.outdated .hz-veto { opacity: .45; filter: grayscale(1); }
   .modebtn {
     font: 13px system-ui, sans-serif; color: var(--muted); background: var(--card);
     border: 1px solid var(--line); border-radius: 999px; padding: 7px 14px; cursor: pointer;
@@ -1859,8 +1927,44 @@ PAGE_CSS = """  body { margin: 0; }
   .hz details summary { padding: 4px 0 0; font-size: 12.5px; }
 """
 
-PAGE_JS = """  var btn = document.getElementById('modebtn');
-  var page = document.getElementById('page');
+PAGE_JS = """  var page = document.getElementById('page');
+  // The page's age by the viewer's clock. The meta refresh only fetches the same file
+  // again: a page that is no longer regenerated must say so itself. First in the script,
+  // so nothing below can keep it from running; the numbers come from data- attributes and
+  // the texts go in as textContent (no page data is ever part of this script).
+  var generated = parseInt(page.getAttribute('data-generated'), 10);
+  var staleAfter = parseInt(page.getAttribute('data-stale-after'), 10);
+  var agebox = document.getElementById('pageage');
+  function checkAge() {
+    if (!agebox || !(generated > 0) || !(staleAfter > 0)) { return; }
+    var age = Date.now() / 1000 - generated;
+    if (age > staleAfter) {
+      var min = Math.floor(age / 60);
+      agebox.textContent = 'This page was generated ' +
+        (min > 120 ? Math.floor(min / 60) + ' h' : min + ' min') +
+        ' ago and is no longer being updated: the safety verdict shown is not current.';
+      agebox.className = 'pageage';
+      agebox.hidden = false;
+      page.classList.add('outdated');
+    } else if (age < -300) {
+      // a clock more than 5 min behind the generation time: no age can be told from it
+      agebox.textContent = 'The clock of this device is behind the time this page was ' +
+        'generated: how old the page is cannot be judged here. Compare the generation ' +
+        'time with a clock you trust.';
+      agebox.className = 'pageage note';
+      agebox.hidden = false;
+      page.classList.remove('outdated');
+    } else {
+      agebox.hidden = true;
+      page.classList.remove('outdated');
+    }
+  }
+  checkAge();
+  setInterval(checkAge, 30000);
+  // a tab restored from the back/forward cache or woken from sleep: judge at once
+  window.addEventListener('pageshow', checkAge);
+
+  var btn = document.getElementById('modebtn');
   function setMode(night) {
     if (night) { page.classList.add('night'); } else { page.classList.remove('night'); }
     btn.textContent = night ? '\\u2600 Day mode' : '\\u263E Night mode';
@@ -1911,7 +2015,7 @@ def build_masthead_html(night_default):
     <div class="mastright">
       <button class="modebtn" id="modebtn" type="button" aria-pressed="%s">%s</button>
       <div class="when">
-        <div class="t mono">%s</div>
+        <div class="t mono"><span class="gl">generated</span>%s</div>
         <div class="d">%s · %s UTC</div>
       </div>
     </div>
@@ -2609,15 +2713,35 @@ def write_safety_inputs(sun_info, humidity, humidity_age_s=None, gps_data=None,
         data["lat"], data["lon"] = gps_data[0], gps_data[1]
         data["gps_source"] = gps_source
     tmp_file = SAFETY_INPUTS_FILE + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(tmp_file, SAFETY_INPUTS_FILE)
+    try:
+        with open(tmp_file, "w", encoding="utf-8", errors="replace") as f:
+            json.dump(data, f)
+        os.replace(tmp_file, SAFETY_INPUTS_FILE)
+    except BaseException:
+        _remove_quietly(tmp_file)
+        raise
+
+
+def _scrub_state(v):
+    """Every text in the daemon's state, keys included, through clean_text: the alert,
+    forecast and hazard texts in it come from upstream feeds, and JSON's "\\ud800" escape
+    reads back as a lone surrogate, which no UTF-8 page can hold (the page write failed on
+    every run until the alert expired). Control and bidirectional characters are dropped
+    there too, so a shown text reads as it is. Numbers, booleans and None pass unchanged."""
+    if isinstance(v, str):
+        return clean_text(v)
+    if isinstance(v, dict):
+        return {(clean_text(k) if isinstance(k, str) else k): _scrub_state(x)
+                for k, x in v.items()}
+    if isinstance(v, list):
+        return [_scrub_state(x) for x in v]
+    return v
 
 
 def read_safety_state():
     try:
         with open(SAFETY_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return _scrub_state(json.load(f))
     except Exception:
         return None
 
@@ -2729,6 +2853,13 @@ def build_safety_tiles_html(comp, state_stale=False):
     elif not glm.get("available"):
         glm_v = '<div class="v mono">no&nbsp;data</div>'
         glm_s = safety_dot_html(True, unknown=True) + "no successful poll yet"
+    elif glm.get("partial"):
+        # the last poll did not read its whole window: "no strike" there is not proof of
+        # none (not a veto; the component's warning says why)
+        nk = glm.get("nearest_km")
+        glm_v = ('<div class="v mono">%s</div>'
+                 % ("&mdash;" if nk is None else '%.0f<span class="u">km</span>' % nk))
+        glm_s = safety_dot_html(True, unknown=True) + "partial window"
     else:
         nk = glm.get("nearest_km")
         glm_v = ('<div class="v mono">%s</div>'
@@ -2855,8 +2986,8 @@ def build_safety_html(state):
     card_close = '  </section>\n'
 
     def head(label_text, bg):
-        badge = ('<span style="padding:.35rem .9rem;border-radius:8px;font-weight:700;'
-                 'letter-spacing:.03em;color:#fff;background:%s">%s</span>'
+        badge = ('<span class="sbadge" style="padding:.35rem .9rem;border-radius:8px;'
+                 'font-weight:700;letter-spacing:.03em;color:#fff;background:%s">%s</span>'
                  % (bg, html.escape(label_text)))
         return ('    <div style="display:flex;justify-content:space-between;'
                 'align-items:center;gap:12px;flex-wrap:wrap">\n'
@@ -2900,9 +3031,14 @@ def build_safety_html(state):
         reasons_html = ('    <ul style="margin:0 0 14px;padding-left:20px;'
                         'color:var(--warn)">\n' + items + "    </ul>\n")
     # Non-vetoing warnings (e.g. GPS vs configured-coordinates mismatch) — always shown.
-    if state.get("warnings"):
-        items = "".join("        <li>&#9888; %s</li>\n" % html.escape(w)
-                        for w in state.get("warnings"))
+    # Rendered whatever the verdict and however old the state is (a config warning or a
+    # blind rain check is news on a SAFE page too); any non-text entry is shown as text.
+    warns = state.get("warnings")
+    warns = [w for w in (warns if isinstance(warns, list) else [warns])
+             if w is not None and str(w).strip()]
+    if warns:
+        items = "".join("        <li>&#9888; %s</li>\n" % html.escape(clean_text(str(w)))
+                        for w in warns)
         reasons_html += ('    <ul style="margin:0 0 14px;padding-left:20px;'
                          'color:var(--warn);font-weight:600">\n' + items + "    </ul>\n")
 
@@ -3177,10 +3313,11 @@ def _hz_num(v):
 
 
 def _hz_str(v, limit=None):
-    """Display text for a feed value (None -> ''), cut to ``limit`` characters."""
+    """Display text for a feed value (None -> ''), cut to ``limit`` characters. Scrubbed
+    (clean_text): a lone surrogate becomes U+FFFD, control and bidi characters go."""
     if v is None:
         return ""
-    s = str(v).strip()
+    s = clean_text(str(v)).strip()
     if limit and len(s) > limit:
         s = s[:limit - 1].rstrip() + "…"
     return s
@@ -3230,20 +3367,27 @@ def _hz_alert_color(a):
     return _HZ_KIND_COLOR[kind]
 
 
+# An offset at the end of an ISO time (after the date: the date's own "-dd" is none).
+_HZ_ISO_OFFSET_RE = re.compile(r"(?:[Zz]|[+-]\d{2}(?::?\d{2})?)\Z")
+
+
 def _hz_iso_ts(s):
-    """ISO-8601 with an offset (as api.weather.gov sends it) -> epoch s, else None."""
+    """ISO-8601 with an offset (as api.weather.gov sends it) -> epoch s, else None.
+    safety.isotime reads the text alike on every Python (fromisoformat reads more on
+    3.11+ than on 3.9); a time without an offset stays None here, as it always was: a
+    naive time is ambiguous, and this caller does not guess."""
     if not isinstance(s, str) or not s.strip():
         return None
     t = s.strip()
-    if t[-1:] in ("Z", "z"):
-        t = t[:-1] + "+00:00"            # fromisoformat() on Python 3.9 rejects 'Z'
-    try:
-        dt = datetime.fromisoformat(t)
-    except ValueError:
+    if not _HZ_ISO_OFFSET_RE.search(t[10:]):
         return None
-    if dt.tzinfo is None:
-        return None                      # a naive time is ambiguous: unknown
-    return dt.timestamp()
+    dt = parse_iso(t, warn=False)
+    if dt is None:
+        return None
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _hz_local(ts):
@@ -4064,8 +4208,9 @@ def build_dew_html(state):
     else:
         bg, label = _DEW_TRUSTED_BG, "RAIN SENSOR TRUSTED"
         detail = "normal: the dome acts on its own rain sensor"
-    badge = ('<span style="padding:.35rem .9rem;border-radius:8px;font-weight:700;'
-             'letter-spacing:.03em;color:#fff;background:%s">%s</span>' % (bg, label))
+    badge = ('<span class="sbadge" style="padding:.35rem .9rem;border-radius:8px;'
+             'font-weight:700;letter-spacing:.03em;color:#fff;background:%s">%s</span>'
+             % (bg, label))
     head = ('    <div style="display:flex;justify-content:space-between;'
             'align-items:center;gap:12px;flex-wrap:wrap">\n'
             '      <h2 style="margin:0">Dew monitor (rain-sensor override)</h2>\n'
@@ -4182,8 +4327,8 @@ def build_weather_log_html(state):
             if ln is not None:
                 cells.append("%s <span style=\"color:var(--faint)\">(%s)</span>"
                              % (ln, _wlog_size(a.get("bytes"))))
-        return "        <li><b>%s</b> &nbsp; %s</li>\n" % (html.escape(month),
-                                                          " &middot; ".join(cells))
+        return "        <li><b>%s</b> &nbsp; %s</li>\n" % (
+            html.escape(month), " &middot; ".join(cells))
 
     order = sorted(months, reverse=True)
     recent, older = order[:6], order[6:]
@@ -4315,7 +4460,9 @@ def write_html(
     parts.append('<style>\n')
     parts.append(PAGE_CSS)
     parts.append('</style>\n</head>\n<body>\n')
-    parts.append('<section class="%s" id="page">\n<div class="wrap">\n' % page_class)
+    stale_after = page_stale_after_s(refresh_seconds)
+    parts.append(page_root_open_html(page_class, now_unix, stale_after))
+    parts.append(page_age_html(now_str, stale_after))
 
     parts.append(build_masthead_html(night_default))
 
@@ -4395,10 +4542,34 @@ def write_html(
     # Atomic replace: a crash/power cut mid-write must never leave a half page behind
     # (matches every other writer in this file).
     out = _html_output_target()
+    # errors="replace": a text no page can hold (a lone surrogate the scrub missed) costs
+    # one "?" instead of every page from now on; a failed write leaves no .tmp behind.
     tmp_file = out + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        f.write(page)
-    os.replace(tmp_file, out)
+    try:
+        with open(tmp_file, "w", encoding="utf-8", errors="replace") as f:
+            f.write(page)
+        os.replace(tmp_file, out)
+    except BaseException:
+        _remove_quietly(tmp_file)
+        raise
+
+
+def page_root_open_html(page_class, generated_ts, stale_after):
+    """The page element with what PAGE_JS needs to judge the page's age in the viewer's
+    browser: data-generated (epoch seconds) and data-stale-after (seconds)."""
+    return ('<section class="%s" id="page" data-generated="%d" data-stale-after="%d">\n'
+            '<div class="wrap">\n'
+            % (html.escape(page_class), int(generated_ts), int(stale_after)))
+
+
+def page_age_html(now_str, stale_after):
+    """The (hidden) banner PAGE_JS fills when the page is no longer being updated, and,
+    without JavaScript, a line saying when to take the page as stopped."""
+    return ('<div class="pageage" id="pageage" role="alert" hidden></div>\n'
+            '<noscript><p class="pageage note">Generated %s. This page cannot check its '
+            'own age without JavaScript: when that time is more than %s ago, the page is '
+            'no longer being updated and the safety verdict shown is not current.</p>'
+            '</noscript>\n' % (html.escape(str(now_str or "")), _fmt_minutes(stale_after)))
 
 
 def _html_output_target():

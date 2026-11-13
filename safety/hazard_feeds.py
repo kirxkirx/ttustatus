@@ -47,8 +47,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-import zlib
 from datetime import datetime, timedelta, timezone
+from xml.parsers import expat
+
+from .isotime import iso_ts
+from .netio import gunzip_capped, read_capped
+from .textclean import clean_text
 
 try:
     from zoneinfo import ZoneInfo
@@ -77,6 +81,12 @@ INFO_NOTE = ("Information only: these feeds never affect the safety monitor — 
 
 # ---- tuning (behaviour knobs; the operator-facing ones live in config.py) ---------
 HTTP_TIMEOUT = 20                  # s per request (own thread: never blocks evaluate())
+# Wall-clock limit for a whole reply body: HTTP_TIMEOUT bounds each wait on the socket
+# only, and a server that trickles a byte every few seconds would otherwise hold the
+# poll thread (and every feed behind it) for as long as it likes. The JSON answers are
+# KBs; the HMS KML can be MBs on a slow uplink, so it has a longer one.
+HTTP_DEADLINE = 60
+HMS_HTTP_DEADLINE = 180
 MAX_BODY_BYTES = 4 * 1024 * 1024   # every JSON answer here is KBs; cap garbage/runaway
 # A finished HMS day in a heavy smoke season (2023's Canadian fires) runs to MBs.
 HMS_MAX_BODY_BYTES = 24 * 1024 * 1024
@@ -189,15 +199,17 @@ def _num(x):
     return v if math.isfinite(v) else None
 
 
-_CTRL = re.compile(r"[\x00-\x1f\x7f]")
-
-
 def _clip(s, n):
     """Remote text -> one clean, bounded line (the page escapes it; this keeps the
-    state file small and a hostile feed from injecting control characters)."""
+    state file small and a hostile feed from injecting control characters).
+
+    clean_text first: a lone surrogate becomes U+FFFD (else the state file and the page
+    cannot be written as UTF-8), the C0/C1 controls and the bidirectional controls are
+    dropped (a bidi override can make a shown text read other than it is); then every
+    run of whitespace, line breaks included, becomes one blank."""
     if s is None:
         return ""
-    s = " ".join(_CTRL.sub(" ", str(s)).split())
+    s = " ".join(clean_text(str(s)).split())
     return s if len(s) <= n else s[:max(0, n - 1)].rstrip() + "…"
 
 
@@ -212,24 +224,10 @@ def _ms(x):
 
 
 def _parse_iso(s):
-    """ISO-8601 -> epoch seconds; a naive stamp is UTC (IEM writes UTC without Z)."""
-    if not isinstance(s, str) or not s.strip():
-        return None
-    t = s.strip().replace(" ", "T")
-    if t.endswith("Z"):
-        t = t[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(t)
-    except ValueError:
-        # fromisoformat on 3.9 rejects some fractional forms ("...00.000+00:00" is fine,
-        # "...00.0000000" is not): retry without the fraction
-        try:
-            dt = datetime.fromisoformat(re.sub(r"\.\d+", "", t))
-        except ValueError:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
+    """ISO-8601 -> epoch seconds; a naive stamp is UTC (IEM writes UTC without Z); None
+    for anything unreadable. safety.isotime reads the same text alike on every Python
+    (datetime.fromisoformat accepts much more on 3.11+ than on 3.9)."""
+    return iso_ts(s)
 
 
 def _json(body):
@@ -456,23 +454,24 @@ def _geo_hash(g):
 # ---- HTTP ---------------------------------------------------------------------------
 def _gunzip(raw, max_bytes):
     """gzip -> bytes, refusing anything that inflates beyond max_bytes (a gzip bomb must
-    not exhaust the Pi's RAM)."""
-    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    out = d.decompress(raw, max_bytes + 1)
-    if len(out) > max_bytes or d.unconsumed_tail:
-        raise ValueError(f"response inflates beyond {max_bytes} bytes")
-    return out
+    not exhaust the Pi's RAM). Inflated a step at a time (safety.netio.gunzip_capped):
+    what is held stays within max_bytes plus one step on every Python; a cut-short
+    stream or trailing garbage is refused as well (ValueError)."""
+    return gunzip_capped(raw, max_bytes)
 
 
 def _get(url, ua, etag=None, last_modified=None, timeout=HTTP_TIMEOUT,
-         max_bytes=MAX_BODY_BYTES, accept="application/geo+json, application/json;q=0.9"):
+         max_bytes=MAX_BODY_BYTES, accept="application/geo+json, application/json;q=0.9",
+         deadline=HTTP_DEADLINE):
     """One GET -> (status, body, etag, last_modified).
 
     Conditional when validators are given: a 304 returns (304, None, ...) — the caller's
     copy is still current and no body crossed the network. gzip is requested and
-    inflated here (urllib does not). Every body is capped at max_bytes. Any other
-    failure raises (urllib.error.HTTPError for a status, URLError/OSError for transport,
-    ValueError for an oversized or oddly encoded body)."""
+    inflated here (urllib does not). Every body is capped at max_bytes and must arrive
+    whole within deadline seconds (safety.netio.read_capped). Any other failure raises
+    (urllib.error.HTTPError for a status, URLError/OSError for transport, a TimeoutError
+    for a body past the deadline, ValueError for an oversized, cut-short or oddly
+    encoded body)."""
     headers = {"User-Agent": ua, "Accept": accept, "Accept-Encoding": "gzip"}
     if etag:
         headers["If-None-Match"] = etag
@@ -481,9 +480,7 @@ def _get(url, ua, etag=None, last_modified=None, timeout=HTTP_TIMEOUT,
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(max_bytes + 1)
-            if len(raw) > max_bytes:
-                raise ValueError(f"response larger than {max_bytes} bytes")
+            raw = read_capped(r, max_bytes, deadline)
             enc = (r.headers.get("Content-Encoding") or "").strip().lower()
             if enc in ("gzip", "x-gzip"):
                 raw = _gunzip(raw, max_bytes)
@@ -501,6 +498,25 @@ def _get(url, ua, etag=None, last_modified=None, timeout=HTTP_TIMEOUT,
 # ---- parsers (pure: bytes + site/box -> compact records; site-dependent parts done
 # here, once per fetch; time-dependent filtering is done at view time) ---------------
 _KML_REFUSE = re.compile(rb"<!\s*(DOCTYPE|ENTITY)", re.I)
+
+
+def _refuse_dtd(data):
+    """ValueError if the document declares a DOCTYPE or an entity in whatever encoding
+    the parser reads it in. The byte search (_KML_REFUSE) sees ASCII-compatible text
+    only: in a UTF-16 document "<!DOCTYPE" has other bytes, and ElementTree would expand
+    its entities. expat stops at the declaration, before any entity is defined; nothing
+    is built (a pass over the bytes, no tree). Port of vlbaweather's roads._refuse_dtd."""
+    def refuse(*_args):
+        raise ValueError("HMS KML declares a DOCTYPE/ENTITY (refused)")
+    p = expat.ParserCreate()
+    p.StartDoctypeDeclHandler = refuse
+    p.EntityDeclHandler = refuse
+    try:
+        p.Parse(data or b"", True)
+    except expat.ExpatError as e:
+        raise ValueError(f"HMS KML is not XML: {e}")
+
+
 _HMS_TIME = re.compile(r"(Start|End)\s*Time:\s*(\d{7})\s*(\d{4})\s*UTC", re.I)
 _HMS_DENSITY = re.compile(r"Density:\s*(Light|Medium|Heavy)", re.I)
 _HMS_STYLE_DENSITY = re.compile(r"Smoke_(Light|Medium|Heavy)", re.I)
@@ -557,8 +573,8 @@ def _hms_ts(yday, hhmm):
 def parse_hms_kml(body, site, box, file_date=None):
     """HMS smoke KML -> {"file_date", "total", "latest_window", "polys": [...]} keeping
     only polygons that touch the map (the site test needs no others). Parsed with
-    xml.etree after refusing any DOCTYPE/ENTITY (defusedxml is not available: no entity
-    games), streamed with iterparse and cleared as it goes, so a multi-MB file does not
+    xml.etree after refusing any DOCTYPE/ENTITY, in any encoding (defusedxml is not
+    available: no entity games), streamed with iterparse and cleared as it goes, so a multi-MB file does not
     balloon in RAM.
 
     latest_window = (start, end) of the file's LATEST analysis over ALL its placemarks,
@@ -567,6 +583,7 @@ def parse_hms_kml(body, site, box, file_date=None):
     with no smoke here, the morning's smoke would be shown as current."""
     if _KML_REFUSE.search(body or b""):
         raise ValueError("HMS KML declares a DOCTYPE/ENTITY (refused)")
+    _refuse_dtd(body)
     lat0, lon0 = site
     polys, total = [], 0
     lend = lstart = None
@@ -1013,7 +1030,8 @@ class HazardFeedsPoller:
         return _cfgv(self.cfg, "NWS_USER_AGENT", "ttu-safety-monitor")
 
     def _cond_fetch(self, f, url, parse, key, max_bytes=MAX_BODY_BYTES,
-                    accept="application/geo+json, application/json;q=0.9"):
+                    accept="application/geo+json, application/json;q=0.9",
+                    deadline=HTTP_DEADLINE):
         """Conditional GET + parse. A 304 re-uses the doc parsed from the body those
         validators came with; the key (site/map box) guards against re-using a doc
         derived for another site."""
@@ -1022,7 +1040,8 @@ class HazardFeedsPoller:
         status, body, etag, lm = _get(url, self._ua(),
                                       etag=prev["etag"] if usable else None,
                                       last_modified=prev["lm"] if usable else None,
-                                      max_bytes=max_bytes, accept=accept)
+                                      max_bytes=max_bytes, accept=accept,
+                                      deadline=deadline)
         if status == 304:
             if not usable:
                 raise ValueError("unexpected 304 Not Modified (no cached copy)")
@@ -1047,7 +1066,8 @@ class HazardFeedsPoller:
             try:
                 return self._cond_fetch(
                     f, url, lambda b, d=d: parse_hms_kml(b, site, box, d.isoformat()),
-                    (site, box), max_bytes=HMS_MAX_BODY_BYTES, accept=accept)
+                    (site, box), max_bytes=HMS_MAX_BODY_BYTES, accept=accept,
+                    deadline=HMS_HTTP_DEADLINE)
             except urllib.error.HTTPError as e:
                 if e.code != 404:
                     raise

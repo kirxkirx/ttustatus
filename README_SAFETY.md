@@ -36,6 +36,28 @@ Durable files (survive reboot): `~/safety_latch.json` (the rain latch), the GLM 
 NWS-warning latches beside it, and `~/safety_events.log` (the audit trail, also mirrored
 to stdout).
 
+**One daemon at a time.** Before it creates any layer, starts any thread or writes any
+file, the daemon takes an exclusive, non-blocking `flock` on `~/.ttu-safety.lock`
+(`TTU_SAFETY_LOCK_FILE`; the run user's home, beside the latches). A second copy — e.g.
+the `run_safety_monitor.sh` loop left running beside the systemd unit — logs
+`another instance is running (pid N)` and exits with status 1, having started nothing: no
+WU poll, no latch or state write, no weather-log flush to the SD card. Only "the lock is
+held" stops it. A lock file that cannot be used (a symbolic link, which is refused, not
+followed; not a regular file; another user's; a mount without `flock`) is a warning, and
+the daemon then runs **without** the guard: a safety monitor should rather run unguarded
+than not at all. The file is opened with `O_NOFOLLOW` and `O_CLOEXEC` (the page
+subprocess never inherits the lock), created once with mode 0600 (a wider mode is
+narrowed); each start rewrites only its one line, `<pid> <UTC start time>`. The lock goes
+with the process, however it ends: nothing to clean up after a crash.
+
+**Leftovers of a killed run.** Right after taking the lock, the daemon removes the temp
+files a SIGKILL, an OOM kill or a power cut left behind: regular files only (`lstat`; a
+link is never followed nor removed), owned by the run user, last modified more than an
+hour ago, and named like this program's own temp files and nothing else —
+`/dev/shm/ttu-glm-*.nc` (the GLM netCDF fallback), `.safety_state.*.tmp` beside the
+state file, and the page's `safety_inputs.json.tmp`, `status_page_cache.json.tmp` and
+`status.html.tmp` in `/dev/shm`. Each removal is logged.
+
 ## Safety logic
 
 `IsSafe = SAFE` only if **all** hold (anything else → `UNSAFE`, fail-safe):
@@ -44,9 +66,9 @@ to stdout).
 |------|-------------|--------|
 | Sun altitude | `> 0°` (no refraction / angular-size correction) | make_status_page.py |
 | Humidity | `> 95 %` (clears again below 93 %, small hysteresis) | make_status_page.py (DHT) |
-| Rain | **any** WU station reports `precipRate > 0` | this daemon |
+| Rain | **any** WU station reports `precipRate > 0` (0 of N stations reporting counts as no rain: shown as a *rain check blind* warning, never a veto — see below) | this daemon |
 | Inputs freshness | `safety_inputs.json` missing or older than 10 min | fail-safe |
-| NWS warning | a **Tornado / Dust Storm / High Wind Warning** (`TTU_SAFETY_HAZARD_VETO_EVENTS`) in effect **over the site** — NWS's point query, the warning's polygon, or one of the site's zones (TXZ035 / TXC303) — for the warning's whole duration, persisted | this daemon |
+| NWS warning | a **Tornado / Dust Storm / High Wind Warning** (`TTU_SAFETY_HAZARD_VETO_EVENTS`) in effect **over the site** — NWS's point query, the warning's polygon, or one of the site's zones (TXZ035 / TXC303) — for the warning's whole duration, persisted; released early when fresh queries no longer list it, and at most 24 h after NWS last listed it | this daemon |
 
 The NWS forecast, GLM lightning, MRMS radar and connectivity layers are described in their
 own sections below. **Every other NWS alert and all the non-NWS hazard information** (NOAA
@@ -58,6 +80,60 @@ calls). The **first** station reporting any rain trips UNSAFE immediately — no
 confirmation, no second reading — and it stays unsafe for **1 hour after the last** rain
 seen at any station (the freeze time). The latch is persisted, so a daemon restart or
 reboot keeps it.
+
+**What a WU poll makes of each station.** One station can never stop the poll: whatever
+its reply or the network does, the station gets a state and the next station is asked.
+`live` (a fresh observation: it votes) and `stale` (an observation older than 30 min) as
+before; `offline` (HTTP 204, 404 or 410, an empty body, no observation) and `bad-reply`
+(an HTTP 200 reply that cannot be used: not JSON, over 256 kB, no rain rate or no
+timestamp; a NaN rain rate is no reading) count toward the dead-station backoff
+(`TTU_SAFETY_WU_BACKOFF_AFTER`) — a `bad-reply` only when another station of the same
+poll got a proper answer (`live`, `stale` or `offline`): when none did, the garbage is
+WU's own (an HTML error page sent as HTTP 200) and counts like an `error`. `error` — an
+API or network problem: HTTP 429, any 5xx
+or other HTTP error, a timeout, a refused, broken or cut-short connection — says nothing
+about the station and **never** counts toward the backoff, so a WU or network outage does
+not leave every station backed off (and the rain layer blind) for an hour after the
+recovery. HTTP 429 or 503 ends the poll at once (the stations after it are `not-asked`),
+and the next poll waits for the reply's `Retry-After` (at most 1 h; without one, the
+normal interval). Every reply is read whole within 30 s and 256 kB. A station-discovery
+reply is checked entry by entry (a station id must be a non-empty string, a distance a
+finite number; a bad entry is skipped with a log line), and a discovery that fails keeps
+the previous station list.
+
+**No data is not "no rain" on the page.** While polling should be running (night, key
+set) and the last completed poll is older than 3 poll intervals, the rain component
+reports 0 live stations and the note "stale, last poll N min ago", so the page and the
+Alpaca `/setup` text say *no station data* instead of *no rain* (no veto change). When
+polling was off after that poll (daytime, or the sun altitude unknown), the 3 intervals
+count from when it was last seen off instead, and the note reads "stale, no WU poll
+completed for N min": the morning's poll is not "stale" at dusk, before the first poll of
+the night has had its 30 s to run.
+
+**Rain check blind (a warning, not a veto — the owner's choice).** With no WU station
+reporting for 3 polls in a row (or the last poll stale), while polling is active and a WU
+key is set, the state carries the non-vetoing warning *"rain check blind: 0/10 WU
+stations reporting for 20 min (radar still watches for rain)"* — or *"(the radar is
+unavailable too — nothing watches for rain)"* when the radar layer has no current frame.
+`IsSafe` is unchanged: the radar ring, GLM and the connectivity watchdog still apply. A
+gap of more than 2 h between polls (the next night) starts a new count, and a
+blind run from before polling was last off (the morning's) is not shown at dusk.
+
+**A layer that breaks.** Every gating layer (rain, NWS forecast, GLM, radar,
+connectivity, and the NWS alerts as before) is called inside a guard: one that raises, or
+returns something that is not a component, cannot take the evaluation down (no HTTP 500
+on `IsSafe`, the state file keeps updating, device 1 keeps answering). The broken layer is
+reported *unavailable* with its error, a warning names it on the page and `/setup`, and
+the traceback goes to the daemon log (once per change of error, else every 10 min). An
+unavailable layer does not veto on its own — except that **a veto it last reported is
+held to that veto's own end**: the rain latch, the GLM cool-off and the radar freeze keep
+the dome closed for the time they had left (marked *held*), so a bug in the code that
+reports rain never reopens the dome. A layer that breaks from its first call after a
+restart has reported nothing yet: the latch it restored from its own latch file is held
+the same way. A broken forecast is simply unavailable. A broken
+connectivity watchdog keeps its last verdict (an "offline too long" stays UNSAFE) and
+vetoes once it has gone `TTU_SAFETY_OFFLINE_UNSAFE_SEC` without reporting "online": a
+broken watchdog proves the internet up no better than a failed probe.
 
 More inputs (cloud sensor, ceilometer, radar, plate-solve failures) can be added later as
 extra components in `safety/monitor.py`.
@@ -145,10 +221,12 @@ hour. WU reports °F and mph, NWS °C and km/h; every conversion is in `safety/d
   two hours;
 - no lightning data: the last good GLM poll is older than 15 min (two poll intervals plus
   five minutes, so one failed poll is tolerated). A good poll is one that read at least
-  10 of the granules of its 5-minute look-back (`TTU_SAFETY_DEW_GLM_MIN_GRANULES`; there
-  are up to 15): the GLM layer skips a granule it cannot download, and "no flash" in a
-  fraction of the data is not "no lightning". A flash, on the other hand, counts from
-  whatever poll shows it, and missing data never ends its 30 minutes;
+  10 of the granules of the last 5 minutes (`TTU_SAFETY_DEW_GLM_MIN_GRANULES`; there
+  are up to 15, the granules a poll reads further back, where the previous poll stopped,
+  not counted) and is not partial (a hole or a lag in what it read): a granule the GLM
+  layer cannot download is read by a later poll, but "no flash" in a fraction of the
+  data is not "no lightning". A flash, on the other hand, counts from whatever poll
+  shows it, partial or not, and missing data never ends its 30 minutes;
 - lightning not watched for 30 minutes yet (a daemon start, a clock correction, good
   polls more than 15 min apart: see "Lightning" above);
 - no GLM layer: `TTU_SAFETY_GLM=0`, numpy / netCDF4 not installed, or a site outside
@@ -270,6 +348,10 @@ If a later version changes the columns in the middle of a month, that month cont
    failure is logged and never affects the safety logic). Logs (rotating, via
    journald): `journalctl -u ttu-safety -f`. Disable the built-in page runner with
    `TTU_SAFETY_PAGE=0` if you prefer to schedule the page yourself.
+   Run the daemon from this unit **or** from `run_safety_monitor.sh`, not both: the
+   single-instance lock (see Architecture) makes the second one exit at once with
+   `another instance is running` in its log — under `run_safety_monitor.sh` every 5 s,
+   under the unit every 15 s — until the other is stopped.
 
 ### `ttustatus.env`: the WU API key, the User-Agent contact, the CARTO key (kept out of git)
 
@@ -341,8 +423,9 @@ active (227329 min left)"*). The daemon defends itself:
   steps can neither fake a huge offline window nor neutralize it.
 - **NWS warning vetoes** hold the warning's *absolute* NWS end time: a backward step keeps
   each veto for exactly the time it had left, a forward step never holds one past the NWS
-  end, a veto that has started stays in effect across a step, and an early release needs
-  point and area queries made *after* the step. A persisted veto first seen "in the
+  end, a veto that has started stays in effect across a step, the 24 h release bound (a
+  veto not listed for 24 h is released) keeps the time it had left, and an early release
+  needs point and area queries made *after* the step. A persisted veto first seen "in the
   future" is clamped at load like the other latches. The hazard information feeds drop
   everything fetched under the old clock and re-poll.
 - The NWS forecast **re-ages**: if the poller goes silent the forecast flips to
@@ -377,12 +460,13 @@ The Pi runs 24/7 from an SD card on imperfect power, so every recurring write ma
 | `/dev/shm/safety_inputs.json`, `/dev/shm/safety_state.json`, page cache | every 60–90 s | RAM |
 | `/dev/shm/ttu_radar*.png` + `/dev/shm/status.html` (symlinked from `/var/www/html`) | every 90 s / 5 min | RAM |
 | `~/safety_latch.json`, `~/safety_glm_latch.json`, `~/safety_radar_latch.json` | only on rain/lightning events | SD (must survive reboot) |
-| `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning; written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
+| `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning, and at most hourly while a long warning keeps being listed (its 24 h release bound is renewed); written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
 | `~/safety_events.log` (audit trail) | only on events | SD (its purpose) |
+| `~/.ttu-safety.lock` (single-instance lock) | created once; one short line at each daemon start | SD (a few bytes per start) |
 | `/dev/shm/ttu_weather_log/` (weather-log rows not archived yet) | every 5 min, plus every WU poll | RAM |
 | `/var/www/html/weather_log/*.csv` (weather-log archive) | one append per monthly file every 24 h, in daytime, and when the daemon is stopped | SD (its purpose; about 0.2 MB a day) |
 | `~/.cache/ttu-radar/` basemaps | once ever (per site, theme and source — CARTO or OpenStreetMap; never a partial one, never one with a refused tile) | SD (avoids re-fetching map tiles per boot) |
-| `~/.cache/ttu-hazards/zones/<type>_<ID>.json` (NWS zone outlines), `points_<lat>_<lon>.json` (the site's zones) | once per zone (never re-fetched while the site stays put); the site's zones only if NWS changes them | SD (~200 KB for a three-state event: simplified outlines near the map, bounding boxes far away) |
+| `~/.cache/ttu-hazards/zones/<type>_<ID>.json` (NWS zone outlines), `points_<lat>_<lon>.json` (the site's zones) | once per zone (never re-fetched while the site stays put; a zone without a usable outline once a day); the site's zones only if NWS changes them | SD (~200 KB for a three-state event: simplified outlines near the map, bounding boxes far away) |
 
 The hazard information feeds (`safety/hazard_feeds.py`) write nothing at all: their state
 lives in RAM. A change in the hazard overlays re-renders the two radar PNGs (into
@@ -439,35 +523,39 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 |-----|---------|---------|
 | `TTU_SAFETY_HTTP_PORT` | `11111` | Alpaca port |
 | `TTU_SAFETY_HTTP_HOST` | `0.0.0.0` | bind address (LAN) |
-| `TTU_SAFETY_POLL_INTERVAL` | `600` | seconds between WU polls (night only) |
-| `TTU_SAFETY_RAIN_LATCH_HOURS` | `1.0` | freeze time: how long UNSAFE persists after the last rain |
-| `TTU_SAFETY_INPUTS_STALE_SEC` | `600` | older inputs → fail-safe UNSAFE |
+| `TTU_SAFETY_POLL_INTERVAL` | `600` | seconds between WU polls (night only; 60-3600) |
+| `TTU_SAFETY_RAIN_LATCH_HOURS` | `1.0` | freeze time: how long UNSAFE persists after the last rain (0.1-48) |
+| `TTU_SAFETY_INPUTS_STALE_SEC` | `600` | older inputs → fail-safe UNSAFE (60-3600) |
+| `TTU_SAFETY_EVAL_INTERVAL` | `30` | seconds between background evaluations (1-300; every Alpaca request evaluates too) |
 | `TTU_SAFETY_WU_KEY` | **(required)** | Weather Underground PWS API key — set via env, never commit (see above) |
 | `TTU_SAFETY_LAT` / `_LON` | (adopted from GPS) | site coordinates; unset ⇒ the daemon adopts the status page's GPS fix once at startup (rounded to ~100 m). All derived values (NWS grid, WU stations, radar/GLM rings, cached tiles) follow them |
 | `TTU_SAFETY_GEO_MISMATCH_KM` | `0.1` | warn (page + /setup) when GPS and configured coords differ by more |
-| `TTU_SAFETY_WU_MAX_KM` | `60` | drop "nearest" WU stations farther than this (sparse regions) |
-| `TTU_SAFETY_WU_BACKOFF_AFTER` / `_BACKOFF_RETRY` | `6` / `3600` | after N consecutive silent polls a station is probed only every RETRY seconds (saves API calls on dead hardware); it rejoins full cadence automatically on the first answer |
+| `TTU_SAFETY_WU_MAX_KM` | `60` | drop "nearest" WU stations farther than this (sparse regions; 1-500) |
+| `TTU_SAFETY_WU_BACKOFF_AFTER` / `_BACKOFF_RETRY` | `6` / `3600` | after N consecutive silent polls (`offline` or `bad-reply`; an API or network `error` never counts) a station is probed only every RETRY seconds (saves API calls on dead hardware); it rejoins full cadence automatically on the first answer (1-1000 / 60-86400) |
 | `TTU_SAFETY_WU_EXCLUDE` | `KTXSHALL25` | comma-separated station IDs excluded from rain detection — reserve for stations reporting *bogus* data; merely dead ones are handled by the automatic backoff. Does not self-heal; set to empty to clear |
 | `TTU_SAFETY_LOCAL_TZ` | `America/Chicago` | timezone of the forecast table (invalid ⇒ loud UTC fallback) |
-| `TTU_SAFETY_STATE_HEARTBEAT_SEC` | `60` | max interval between unchanged state-file writes (SD-wear throttle) |
+| `TTU_SAFETY_STATE_HEARTBEAT_SEC` | `60` | max interval between unchanged state-file writes (SD-wear throttle; 10-120) |
 | `TTU_SAFETY_INPUTS_FILE` / `_STATE_FILE` / `_LATCH_FILE` / `_EVENT_LOG` | see `config.py` | file paths |
+| `TTU_SAFETY_LOCK_FILE` | `~/.ttu-safety.lock` | the single-instance lock: a second daemon exits with status 1 (see Architecture); empty = the default |
 | `TTU_SAFETY_NWS` | `1` | enable the NWS forecast component (`0` disables) |
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent of the NWS, IEM radar, hazard-feed and map-tile requests (WU, GLM and the connectivity probe send their own). **Absolutely crucial: put a REAL e-mail address in it**: `ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)` with `you@example.org` replaced by your own address (double-quoted in `ttustatus.env`). OpenStreetMap blocks a placeholder like `you@example.org` — the daemon then requests no OSM tiles, and a map with no CARTO basemap (cached or keyed) has no basemap — and NWS asks for a contact. The default names the app but has no contact (warned at startup, and on the page when OSM is used) |
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
-| `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min) |
-| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `60` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour) |
-| `TTU_SAFETY_GLM` | `1` | enable the GLM lightning component (`0` disables) |
-| `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE |
-| `TTU_SAFETY_GLM_COOLOFF_HOURS` | `0.5` | freeze time (h) after the last nearby flash |
+| `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min; 300-3600) |
+| `TTU_SAFETY_NWS_STALE_MIN` | `150` | a forecast NWS has not updated for this many minutes is unavailable (30-1440) |
+| `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `60` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour; 0-100, and 100 never trips) |
+| `TTU_SAFETY_GLM` | `1` | enable the GLM lightning component (`0`/`off`/`false`/`no`/`disabled` disables; another word is reported at startup and leaves it on) |
+| `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE (1-20000) |
+| `TTU_SAFETY_GLM_COOLOFF_HOURS` | `0.5` | freeze time (h) after the last nearby flash (0.1-24) |
 | `TTU_SAFETY_GLM_POLL_INTERVAL` | `300` | seconds between GLM polls (night only) |
-| `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes fetched per poll. With the default the granules still on their way to S3 at poll time (about one in seven) are read by no poll; `7` closes that gap for about 45 % more download (see "GLM lightning component") |
+| `TTU_SAFETY_GLM_WINDOW_MIN` | `5` | look-back minutes of the first poll after a start (1–60: only the current and the previous hour are listed); later polls read from a minute before where the previous one stopped, but never less than this (see "GLM lightning component") |
+| `TTU_SAFETY_GLM_STALE_SEC` | `900` | a GLM poll older than this is no data (at least the poll interval plus 120 s; raised with a startup warning) |
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
-| `TTU_SAFETY_RADAR_KM` | `30` | any echo within this radius → UNSAFE |
-| `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
-| `TTU_SAFETY_RADAR_TRIGGER_AFTER` | `2` | consecutive frames (each counted once) that must show an in-ring echo before it triggers (`1` = trigger on a single frame) |
-| `TTU_SAFETY_RADAR_LATCH_SEC` | `900` | freeze time (s) after the last in-ring echo; clear frames do not cancel it |
-| `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (day and night) |
-| `TTU_SAFETY_RADAR_STALE_SEC` | `1200` | a frame older than this **by its own time** is "no data" (unavailable) |
+| `TTU_SAFETY_RADAR_KM` | `30` | any echo within this radius → UNSAFE (1-300) |
+| `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain (5-60) |
+| `TTU_SAFETY_RADAR_TRIGGER_AFTER` | `2` | consecutive frames (each counted once) that must show an in-ring echo before it triggers (`1` = trigger on a single frame; 1-10) |
+| `TTU_SAFETY_RADAR_LATCH_SEC` | `900` | freeze time (s) after the last in-ring echo; clear frames do not cancel it (60-21600) |
+| `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (day and night; 60-1800) |
+| `TTU_SAFETY_RADAR_STALE_SEC` | `1200` | a frame older than this **by its own time** is "no data" (unavailable; 600-3600) |
 | `TTU_SAFETY_RADAR_SOURCES` | `aws,iem` | the frame sources asked every poll, the newest frame read: `aws` = NOAA's MRMS bucket on AWS (~1 min behind), `iem` = IEM's lcref archive (~5.5 min behind). One name alone leaves no fallback; unknown names are ignored (warned) |
 | `TTU_SAFETY_RADAR_AWS_URL` | `https://noaa-mrms-pds.s3.amazonaws.com` | base URL of the MRMS bucket |
 | `TTU_SAFETY_RADAR_RETRY_SEC` | `60` | a poll that got no new frame is retried after this many seconds (30 … the poll interval) |
@@ -480,8 +568,8 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR_TILE_DARK_INVERT` | `1` | night map from light tiles (OpenStreetMap, a light non-CARTO custom set): invert the lightness of each light tile (hue kept); dark tiles are left alone, and CARTO tiles are never inverted |
 | `TTU_SAFETY_RADAR_CACHE` | `~/.cache/ttu-radar` | cached basemap composites (`basemap_<hash>.png`, one per site, theme and source; tiles fetched once each). The hash also covers `TTU_SAFETY_RADAR_THUMB_PX`, `TTU_SAFETY_RADAR_THUMB_HALF` and `TTU_SAFETY_RADAR_TILE_ZOOM`: changing one of them (or the site) leaves the cached CARTO maps unused. A watermarked CARTO map: remove just that file (README.md shows how to find it in the log) |
 | `TTU_SAFETY_CONN` | `1` | enable the connectivity watchdog (`0` disables) |
-| `TTU_SAFETY_OFFLINE_UNSAFE_SEC` | `3600` | UNSAFE after this long with no internet |
-| `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes |
+| `TTU_SAFETY_OFFLINE_UNSAFE_SEC` | `3600` | UNSAFE after this long with no internet (600-86400, and at least two probe intervals) |
+| `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes (30-3600) |
 | `TTU_SAFETY_HAZARDS` | `1` | enable the NWS active-alerts layer (`0` disables it: no warning veto, no alert lists or map areas) |
 | `TTU_SAFETY_HAZARD_VETO_EVENTS` | `Tornado Warning,Dust Storm Warning,High Wind Warning` | NWS events that make the monitor UNSAFE while in effect over the site, for the warning's duration (comma list, case-insensitive; empty = every alert display-only, announced at startup; a name NWS does not know is kept but warned about) |
 | `TTU_SAFETY_HAZARD_VETO_ONSET_LEAD_SEC` | `900` | a veto warning issued ahead of its onset vetoes from this long before the onset (shown as *scheduled* until then) |
@@ -504,7 +592,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN` | `40` | the last good NWS download counts this long (two poll intervals + 10 min; at most 240) |
 | `TTU_SAFETY_DEW_GLM_KM` | `60` | lightning ring of device 1, **kilometres**: a GLM flash at or within this distance makes it false for `TTU_SAFETY_GLM_COOLOFF_HOURS` (30 min). A ring no wider than `TTU_SAFETY_GLM_TRIGGER_KM` adds no distance (device 0 is UNSAFE there anyway; warned at startup), but device 1 still needs current GLM data: the lightning condition cannot be switched off |
 | `TTU_SAFETY_DEW_GLM_MAX_AGE_MIN` | `15` | the last good GLM poll counts this long, and good polls further apart than this are a gap in the 30-minute watch (default: two poll intervals + 5 min; at least one poll interval + 2 min, at most 120) |
-| `TTU_SAFETY_DEW_GLM_MIN_GRANULES` | `10` | granules a GLM poll must have read to count as lightning data for device 1 (default: two per minute of `TTU_SAFETY_GLM_WINDOW_MIN`, two thirds of the look-back) |
+| `TTU_SAFETY_DEW_GLM_MIN_GRANULES` | `10` | granules of the last `TTU_SAFETY_GLM_WINDOW_MIN` minutes a GLM poll must have read to count as lightning data for device 1 (default: two per minute of `TTU_SAFETY_GLM_WINDOW_MIN`, two thirds of the look-back); a partial poll never counts |
 | `TTU_SAFETY_DEW_NAME` | `TTU Dew Monitor` | Alpaca name of device 1 |
 | `TTU_SAFETY_WEATHER_LOG` | `1` | enable the weather log (`0` disables it) |
 | `TTU_SAFETY_WEATHER_LOG_DIR` | `/var/www/html/weather_log` | the archive, on the SD card; inside the web root so the page can link to it |
@@ -516,8 +604,11 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_WEATHER_LOG_MAX_MB` | `6144` | archive size limit; above it the oldest months are deleted |
 | `TTU_SAFETY_WEATHER_LOG_RAM_FLUSH_MB` / `_RAM_MAX_MB` | `8` / `32` | RAM size that forces a copy at once / beyond which the oldest unarchived rows are dropped |
 
-Out-of-range hazard settings are corrected to the nearest allowed value, with a warning
-at startup (log + `CONFIG` event).
+Out-of-range settings (the ranges are in the table and in `safety/config.py`) are
+corrected to the nearest allowed value, and an on/off switch reads `1`/`true`/`yes`/`on`
+and `0`/`false`/`no`/`off`/`disabled` (any case; anything else keeps the default) — each
+with a warning at startup (log + `CONFIG` event). The same warnings stay on the status
+page and `/setup` (prefixed *configuration:*) for as long as the daemon runs with them.
 
 Thresholds (sun `>0°`, humidity `>95%`, WU sun-gate `<5°`) are in `safety/config.py`.
 
@@ -545,7 +636,9 @@ the instant a probe succeeds. Unlike the per-service components (which fail to *
 veto), this is a **hard veto** — it exists to catch the case where every online layer is
 silently unavailable (no internet). A response of any kind (even an HTTP error) counts as
 "reachable"; only a connection/DNS/timeout failure is "offline". A fresh daemon gets a full
-1 h grace from startup.
+1 h grace from startup. A watchdog that itself fails (its component raises) keeps its last
+verdict and vetoes once it has gone the offline threshold without reporting "online" (see
+"A layer that breaks" under Safety logic).
 
 ### MRMS radar component
 
@@ -602,6 +695,22 @@ three IEM outages left the radar blind for 34–49 min each.
   instead of five. A host that does not answer is asked nothing more that poll, each
   source's lookup gets at most 30 s (a slow, overloaded source cannot starve the other),
   and no request starts after 120 s: a dead source costs one timeout.
+- **Every reply is bounded as a whole**, not only each wait on the socket: a frame must
+  arrive within 30 s, a HEAD or listing within 10 s (never more than is left of the
+  lookup's 30 s or the poll's 120 s), a reply larger than 32 MB (a listing: 1 MB) is
+  refused before or while it is read, and a server trickling a byte every few seconds is
+  cut off at the deadline, the host then asked nothing more that poll. Before, such a
+  server held the radar thread for as long as it liked, and the radar went *unavailable*
+  meanwhile. The bucket's gzip'ed file (~1 MB inflated) is inflated in steps and refused
+  beyond 32 MB inflated, so a few kB of gzip cannot inflate to gigabytes in the daemon.
+- **Only PNG reaches the image decoder**: IEM's frame and the PNG inside the bucket's
+  GRIB2 are checked for PNG's signature and opened by Pillow's PNG reader alone (a
+  Pillow too old to restrict the format is refused), so a reply in another format, an EPS
+  file for one, is never handed to another decoder (Ghostscript, for EPS). The image's
+  size and mode are checked on its header before a pixel is decoded: anything but the
+  7000 × 3500 lcref grid in palette or grey indices (the GRIB2 payload: 8 or 16-bit grey)
+  is refused, and Pillow's decompression-bomb warning is an error. A PNG of 136 kB that
+  declares 12000 × 12000 pixels used to cost 144 MB before it was refused.
 - The pages say where the frame came from ("frame 02:10Z from NOAA Open Data (AWS)") and
   list each source's newest frame or its problem, so a dead backup shows up before it is
   needed; a source switch is a `RADAR-SOURCE` event. A reply whose `Date` disagrees with
@@ -644,6 +753,13 @@ source that works (`TTU_SAFETY_RADAR_BASEMAP=auto`, the default):
    requested at all (a composite cached earlier is still used), and a tile the server
    marks not cacheable is never drawn.
 4. **Nothing** — a plain background, retried every 30 min.
+
+**Tiles are PNG or JPEG of 256 × 256 px** (or 512 × 512, a "@2x" tile, drawn at 256),
+read with the same checks as the frames: the signature first, Pillow's PNG and JPEG
+readers only, the size on the header before decoding, at most 2 MB and 15 s per tile. A
+custom tile server must therefore serve PNG or JPEG (not WebP); any other reply counts as
+a failed tile. The CARTO probe tile and the cached composites (PNG, at most twice the
+map's size on a side) are read the same way.
 
 `TTU_SAFETY_RADAR_BASEMAP=carto` runs steps 1, 2, 4 (never OpenStreetMap);
 `=osm` runs 3, 4 (never CARTO, not even the cached maps). A custom
@@ -698,8 +814,9 @@ SD card.
 
 ### GLM lightning component
 
-Every 5 min **while the sun is below 5°** (night, like WU rain) the daemon fetches the last
-5 min of **GOES-19 GLM total-lightning** granules from AWS Open Data (anonymous S3, no key)
+Every 5 min **while the sun is below 5°** (night, like WU rain) the daemon fetches the
+**GOES-19 GLM total-lightning** granules published since its last poll (at least the last
+5 min) from AWS Open Data (anonymous S3, no key)
 and **latches UNSAFE for 30 min** (the freeze time) if any flash is within **50 km**. Parsing is **entirely in
 RAM** (in-memory netCDF, `/dev/shm` fallback) — **no SD-card writes** — and the slow
 S3/netCDF poll runs in its own thread, so it never blocks `evaluate()` or the status page.
@@ -709,16 +826,36 @@ the distance to the nearest strike. Fail-safe: a fetch error never clears an act
 never forces unsafe on its own; "no flashes" is never proof of safety.
 
 **What one poll covers.** GLM writes a granule every 20 s, and a granule reaches S3 some
-25–60 s after it starts. A poll reads the granules that started in the last
-`TTU_SAFETY_GLM_WINDOW_MIN` (5) minutes and are on S3 at that moment; a granule it
-cannot download is skipped. Polls are a little more than 5 minutes apart (the interval
-plus the time a poll takes), so with the default look-back the two or three newest
-granules at each poll, about one in seven overall, are read by no poll at all: a storm,
-with its many flashes, is seen all the same, but an isolated flash can be missed.
-`TTU_SAFETY_GLM_WINDOW_MIN=7` makes consecutive polls overlap and closes that gap, for
-about 45 % more download per poll (a flash read twice only renews the 30 minutes). This
-applies to device 0's latch and to the lightning check of the
-[dew monitor](#dew-monitor-alpaca-device-1) alike.
+25–95 s after it starts. No time is left unread between polls: each poll keeps a
+**cursor**, the start of the newest granule up to which every granule was read, and the
+next poll reads from **one minute before the cursor** up to its own time (a granule
+published late, after a newer one, is read then; a flash read twice only renews the 30
+minutes). A granule that cannot be downloaded or read stops the cursor before it, so the
+next poll reads it again. The first poll after a daemon start or a clock step has no
+cursor and reads the last `TTU_SAFETY_GLM_WINDOW_MIN` (5) minutes; after a long pause
+(daytime, an outage) a poll reaches back at most 15 minutes (or the window, if longer).
+Either way a poll reads at least the last `TTU_SAFETY_GLM_WINDOW_MIN` minutes — typically
+about 22 granules at the 5-minute interval.
+
+**A partial poll.** A poll is *partial* when what it read leaves more than 2 min of its
+window unread in a row (a hole: a GLM outage, a run of failed downloads) or when the
+newest granule it read ends more than 3 min before the poll (a lagging feed). A flash in
+any granule that was read **still arms the latch**; but "no flash" then vouches for
+nothing, so the poll is reported with a visible warning ("the last poll did not read its
+whole window …"), as `partial` / `coverage` in the component, as *partial window* with
+a grey dot (not the green "no strike") on the status page and `/setup`, and the
+[dew monitor](#dew-monitor-alpaca-device-1) does not take it as lightning data. A
+window in which no granule at all could be read is no data, never "no lightning".
+
+**Limits.** A listing reply may be at most 2 MB and a granule 8 MB (real ones are
+0.2–0.6 MB), each within 15 s; a granule that declares more than 100,000 flashes, or
+whose `flash_lat` / `flash_lon` are not two 1-D arrays of one length, is unread (checked
+before its values are read). A key without a readable start time is ignored. One poll
+reads at most one granule per 20 s of its window plus 10 (the newest first) and stops
+after 75 s; what it did not read counts as unread and is read by the next poll. A flash
+whose latitude or longitude is not a finite number in range is dropped (counted, and
+logged) instead of hiding the real nearest flash. The `/dev/shm` fallback names its
+temporary file `ttu-glm-*.nc`, so one left by a killed poll is recognisable.
 
 ### NWS forecast component
 
@@ -726,7 +863,13 @@ A pre-emptive layer: every 15 min the daemon pulls the free **NWS gridpoint fore
 (api.weather.gov, no key) and flags **UNSAFE if THIS hour or NEXT hour** exceeds any of:
 cloud cover > 60%, precip probability > 20%, thunder probability > 15%. A fetch error or a
 stale forecast is treated as *unavailable* (does not by itself flip unsafe — it's a
-forecast, not a local sensor); a breach in a fresh forecast does. Both the daemon's
+forecast, not a local sensor); a breach in a fresh forecast does. Every grid value is read
+as a finite number (a number sent as text counts; anything else — text, `true`, NaN — is
+"no value"), and the grid's times by `safety/isotime.py`, which reads the same text alike on
+every Python (a time it cannot read makes that download unavailable, never misread). The
+gridpoint URL that `/points` names is followed only when it starts with
+`https://api.weather.gov/gridpoints/`, and every reply is read whole within 60 s and 4 MB.
+Both the daemon's
 `/setup` page and the observatory status page show the inputs, the conclusion, and (on the
 observatory page) a 12-hour forecast table with a source note.
 
@@ -755,7 +898,32 @@ about 120 requests an hour (60 point, 30 area, 30 civil) and, on a quiet day, ~0
 hour — the point answer is a few hundred bytes, the TX/NM/OK area answer ~8 KB gzipped
 (49 KB plain; roughly 50-150 KB gzipped on a busy severe day), the civil answer ~200
 bytes. Zone outlines add a one-time fetch per zone. Every body is capped at 16 MiB, compressed and
-inflated, so a runaway answer fails the query instead of the daemon's memory.
+inflated, so a runaway answer fails the query instead of the daemon's memory; the whole
+reply must also arrive within 40 s (twice the 20 s socket timeout), so a server trickling a
+byte at a time cannot hold the alerts thread, and a gzip body must end where its stream
+does (trailing data or a cut stream fails the query). Times (`sent`, `onset`, `ends`,
+`expires`) are read by the project's own ISO-8601 reader (`safety/isotime.py`), alike on
+every Python: a form that Python 3.11+ would read but 3.9 would not (basic format, week
+dates) is no time at all. Every text taken from an alert (event, headline, description,
+instruction, area, sender, NWS headline) is scrubbed (`safety/textclean.py`): a lone
+surrogate from a JSON `\ud83d` escape becomes U+FFFD, control and bidi characters are
+dropped, so no alert text can stop the page write or the `/setup` page.
+
+**Alerts that cannot be read.** A polygon that cannot be read (a coordinate that is not a
+number, a ring of fewer than 4 positions, wrong nesting) is treated as no polygon: the
+alert is placed by its zones, so a storm-based warning then covers every county it
+touches — the cautious side. A feature that cannot be read at all is never dropped: what
+can be read of it (event, CAP id, VTEC key, `ends`/`expires`) is kept, it is logged once,
+and the component's error says how many alerts of each query could not be read. In the
+point query such a feature is over the site (NWS listed it there): one of a veto event
+vetoes as usual (until its end time if readable, else the 60-min hold), and one whose event
+name cannot be read creates no veto but makes that point answer unable to confirm any
+release. In the area and civil queries it cannot be placed, so that answer is blind to its
+event (to every veto event when the name cannot be read, to every civil event for the
+civil query): its silence never releases such a veto. One alert whose shape breaks the
+site or map test is placed without its shape (point query: still at the site; area query:
+by the site's zones only) and never fails the whole poll; a crash in one query never costs
+the other its round.
 
 **Over the site** means either of these (fail-safe: one is enough):
 - the point query lists the warning;
@@ -794,11 +962,26 @@ cannot delay a veto.
 **Release.** At the warning's end time, or **early** only when a fresh point query AND a
 fresh area query, both made after the warning was last seen, no longer list it over the
 site (cancelled, expired, or its updated polygon has moved off the site). The area query
-counts only once the site's zones are known. If the feeds fail or go stale the veto is
-held until the warning's end time, and never beyond it. A warning without an end time is
-held for 60 min after it was last seen — the last sighting is saved in the latch file, so
-a restart does not start a fresh hour — and a hold on stale information is capped at
-72 h. Each start, update, release and restore is recorded as a `HAZARD-VETO` event (like
+counts only once the site's zones are known. A warning without an end time is held for
+60 min after it was last seen — the last sighting is saved in the latch file, so a restart
+does not start a fresh hour.
+
+**A veto that cannot be confirmed gone does not hang on.** A held veto that no fresh query
+has listed over the site for **24 h** is released, whatever its end time, with a log line
+and the event *"released: not sighted for 24 h, could not be confirmed gone"*: a feed
+outage, a wrong clock or an end time days away can hold the dome shut for a day at most
+after the warning was last seen. A warning that NWS keeps listing keeps vetoing to its end
+(a long-fuse High Wind Warning runs about two days): every sighting renews the 24 h. The
+bound is saved in the latch file in one-hour steps — it falls between 24 h and 25 h after
+the last sighting, never sooner, and the file is rewritten at most hourly while a long
+warning is listed — and it survives restarts and clock steps (a restart never starts a
+fresh 24 h; a clock step keeps the time it had left). So with the feeds down a veto is
+held until the warning's end time or 24 h after its last sighting, whichever comes first.
+While that bound comes before the warning's end, the reason says so (*"... until Sat 22:00
+CDT (NWS Lubbock TX); held to Fri 23:10 CDT unless NWS lists it again (released 24 h after
+its last sighting)"*).
+
+Each start, update, release and restore is recorded as a `HAZARD-VETO` event (like
 `RADAR-RAIN`). The IsSafe reason reads, for example, *"NWS Tornado Warning in effect for
 the site until 18:45 CDT (NWS Lubbock TX)"*.
 
@@ -810,8 +993,9 @@ area queries release, and which ends 60 min after it was armed whatever the rest
 between. An enabled layer that fails to start is shown as failed ("no warning veto"),
 not as switched off. A broken or missing `nws_alerts.py` is reported as a `CONFIG`
 event and the daemon keeps running. If the component itself raises, the monitor keeps the
-vetoes it last reported until their end time: a bug in the code that reports a tornado
-warning must never be what reopens the dome. A site outside NWS coverage disables the
+vetoes it last reported until their end time, and at most 24 h after the layer's last
+report: a bug in the code that reports a tornado warning must never be what reopens the
+dome, nor what keeps it shut for good. A site outside NWS coverage disables the
 layer loudly.
 
 **Zone outlines.** Zone-based alerts carry no polygon. Their outline is assembled from
@@ -820,7 +1004,11 @@ and kept in `~/.cache/ttu-hazards/zones/`: simplified to about 100 m (below one 
 for zones near the map, a bounding box only for far ones. A statewide event's 51 zones
 take about 200 KB instead of 14 MB. At most 40 zones or 15 s are fetched per area poll,
 so a first-run backlog never delays the point query for long; an alert is drawn once all
-its zones are in (its site test does not need them).
+its zones are in (its site test does not need them). A zone reply is used only when it
+names the zone asked for (`properties.id`, or its own address), and an outline with a
+polygon wider than 40° or taller than 25° (larger than any zone) is not used. A zone that
+has no usable outline is asked for again after a day (the fetch time is kept in its cache
+file), a failed fetch after 10 min, and an unreadable cache file is fetched again.
 
 **Colours.** The official NWS map colours (the weather.gov "Watch, Warning, Advisory
 Display" chart), except that **hazards are never drawn green**, because green reads as
@@ -869,6 +1057,21 @@ under the old clock and re-polls. HMS smoke is analysed from daytime satellite i
 only and is smoke anywhere in the column (aloft), not surface air quality. SPC paints
 general thunder and Marginal green; here they are grey (text only) and sand.
 
+Hostile or broken input. Every reply is read in pieces against a size cap (4 MB, 24 MB
+for the HMS file) and a deadline for the whole body (60 s, 180 s for the HMS file): the
+20-s socket timeout bounds one wait only, and a server trickling a byte at a time would
+otherwise hold the feeds' thread indefinitely. A gzip'ed reply is inflated in 1-MB steps
+against the same cap, and one that is cut short or has anything after its stream is
+refused. The HMS KML is refused when it declares a DOCTYPE or an entity, in whatever
+encoding it is written (an expat pass before the real parse: a UTF-16 document hides
+`<!DOCTYPE` from a byte search). Every text taken from a feed is scrubbed before it is
+kept (`safety/textclean.py`): a lone surrogate becomes U+FFFD, the control characters
+(C0, C1) and the bidirectional controls (which can make a text read other than it is)
+are dropped, and runs of blanks and line breaks become one blank. Times are read with
+`safety/isotime.py`, alike on every Python: `datetime.fromisoformat` reads forms on 3.11+
+that 3.9 refuses (and "10:53.5" as 10:53:00.5); a time without an offset is UTC (IEM
+writes them so). Each failure is that feed's error; the other feeds go on.
+
 ### Status page: the Hazards section
 
 `make_status_page.py` adds a **Hazards** section below the radar map, and the safety card
@@ -896,7 +1099,48 @@ own verdict (it knows `TTU_SAFETY_HAZARD_STALE_SEC`). All feed text is HTML-esca
 `TTU_SAFETY_LOCAL_TZ`, which the page inherits from the daemon's environment. The daemon's
 `/setup` page carries the same lists in compact form, with an "NWS warnings" row in its
 inputs table, the same fail-safe wording ("unknown", "no current data", "NWS alert layer
-off — no veto") and a Sources line.
+off — no veto") and a Sources line. `/setup` passes every text it shows, and then the
+whole page, through `textclean.clean_text`: a lone surrogate (a JSON `\ud83d` escape in an
+alert) becomes U+FFFD and control and bidirectional-control characters are dropped, so
+such a text can no longer make the page answer HTTP 500.
+
+### Status page: its own age, its texts and its writes
+
+**The page dates itself.** The page is a static file, regenerated only by the daemon's
+page runner; its meta refresh fetches the same file again. A stopped daemon, or page runs
+that fail or hang until `TTU_SAFETY_PAGE_TIMEOUT` kills them, would leave the last page,
+a green SAFE included, looking current. So the page element carries `data-generated`
+(epoch seconds) and `data-stale-after` (seconds), and the page's script compares them
+with the viewer's clock on load, every 30 s and when the tab is shown again. Past the
+limit a red banner says "This page was generated N min ago and is no longer being
+updated: the safety verdict shown is not current", and the SAFE / UNSAFE and dew-monitor
+badges, the input tiles and the veto banners are greyed out. When the viewer's clock is
+more than 5 min *behind* the generation time (the Pi boots with fake-hwclock; a phone can
+be wrong too), the page says that its age cannot be judged on this device instead. Without
+JavaScript a line gives the generation time and the limit. The masthead time is labelled
+*generated*: it is the time of the run, not a live clock.
+
+The limit covers the longest normal gap between two pages: max(15 min, 3 ×
+`STATUS_PAGE_INTERVAL`), and at least 30 min with `TTU_STATUS_CAMERA=1` (a night run
+captures for 120 s, puts some 80 frames through dcraw and stacks them in batches, on the
+order of ten minutes on a Pi 4, and the next run starts only after it).
+`TTU_STATUS_PAGE_STALE_MIN` sets it in minutes instead (a slower Pi, a longer run).
+This is a statement on the page only: the Alpaca devices judge their own inputs' ages
+(the STALE badge above is the daemon state's age at generation time).
+
+**Texts.** Every text the page reads back from the daemon's state (alert texts, forecast,
+hazard information, reasons, warnings, events) passes through `safety/textclean.py` once,
+as the state is read: JSON's `\ud800` escape reads back as a lone surrogate, which no UTF-8
+file can hold, and the page write failed on every run until the alert expired. Control and
+bidirectional characters are dropped there too. The state's **warnings** (configuration
+warnings, a blind rain check, a GPS/coordinates mismatch) are listed under the verdict
+whether it is SAFE, UNSAFE or STALE.
+
+**Writes.** Every file the page writes (`status.html`, `safety_inputs.json`, its cache) is
+written to a `.tmp` beside it and moved into place, with `errors="replace"` (a character
+nothing could encode costs one "?", not the page); a write that fails removes its `.tmp`.
+A `.tmp` left by a run that was killed mid-write (`TTU_SAFETY_PAGE_TIMEOUT`, a power cut)
+is removed at the daemon's next start (*Leftovers of a killed run*, under Architecture).
 
 ## Test / develop off the Pi
 
@@ -906,7 +1150,9 @@ The daemon needs no Pi hardware (it only reads JSON and polls WU over the networ
 pip install flask waitress pytest flake8
 python -m pytest safety/tests -q                       # unit + smoke tests (hardware and network stubbed)
 # smoke test: feed inputs and hit the API
-TTU_SAFETY_INPUTS_FILE=/tmp/in.json TTU_SAFETY_HTTP_PORT=11234 python safety_monitor.py &
+# (a lock file of its own: the default one, ~/.ttu-safety.lock, is a running daemon's)
+TTU_SAFETY_INPUTS_FILE=/tmp/in.json TTU_SAFETY_HTTP_PORT=11234 \
+    TTU_SAFETY_LOCK_FILE=/tmp/ttu-test.lock python safety_monitor.py &
 echo '{"ts":'$(date +%s)',"sun_altitude_deg":-10,"humidity_pct":40}' > /tmp/in.json
 curl -X PUT localhost:11234/api/v1/safetymonitor/0/connected -d Connected=true
 curl localhost:11234/api/v1/safetymonitor/0/issafe          # -> Value: true

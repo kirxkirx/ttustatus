@@ -1,6 +1,7 @@
 #!/bin/bash
 # Persistent launcher for the TTU Alpaca SafetyMonitor daemon.
-# Use this OR the systemd service (README_SAFETY.md), not both. Keeps the daemon running
+# Use this OR the systemd service (README_SAFETY.md), not both: the daemon's single-instance
+# lock (~/.ttu-safety.lock) makes a second copy exit at once. Keeps the daemon running
 # and restarts it if it exits. Location-independent (runs from this script's own dir), so
 # it works wherever the repo is cloned (e.g. ~/ttustatus).
 # Requires: sudo apt install python3-flask python3-waitress

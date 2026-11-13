@@ -13,6 +13,10 @@ Threads:
                    rows collected in RAM to the SD card. The only thread that does.
   * discovery    — UDP responder so NINA can auto-find us.
   * main thread  — waitress serving the Alpaca HTTP API.
+
+Before any of them starts, main() takes the single-instance lock (a second copy exits
+with status 1, having started nothing) and sweeps temp files a killed run left behind
+(see housekeeping.py).
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ import sys
 import threading
 import time
 
-from . import config, discovery, glm_lightning, radar as radar_mod
+from . import config, discovery, glm_lightning, housekeeping, radar as radar_mod
 from .alpaca import create_app
 from .connectivity import ConnectivityWatch
 from .dew import DewMonitor
@@ -185,12 +189,46 @@ def overlay_sources(*layers):
             if layer is not None and callable(getattr(layer, "overlays", None))]
 
 
+def take_run_lock(cfg):
+    """The single-instance guard: return the lock descriptor (keep it open), or None when
+    the lock cannot be used — then the daemon runs unguarded, with a warning: a safety
+    daemon should rather run without the guard than not at all. When ANOTHER instance holds
+    the lock (e.g. the run_safety_monitor.sh loop left running beside the systemd unit),
+    log it and exit with status 1, having started nothing: no poll, no latch or state
+    write, no weather-log flush."""
+    try:
+        return housekeeping.run_lock(cfg.LOCK_FILE)
+    except housekeeping.AlreadyRunning as e:
+        log.critical("another instance is running%s (it holds %s) — this one exits without "
+                     "starting anything. Run the daemon from the systemd unit OR "
+                     "run_safety_monitor.sh, not both.",
+                     " (pid %d)" % e.pid if e.pid else "", cfg.LOCK_FILE)
+        raise SystemExit(1)
+    except Exception as e:  # noqa: BLE001
+        log.warning("single-instance lock %s unusable (%s) — running WITHOUT the guard "
+                    "against a second copy of the daemon", cfg.LOCK_FILE, e)
+        return None
+
+
 def main(argv=None):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = config
+    # First of all, before any layer, thread or file: a second copy must start nothing.
+    lock_fd = take_run_lock(cfg)
+    try:
+        try:
+            housekeeping.sweep_leftovers(cfg)    # temp files a killed run left behind
+        except Exception:  # noqa: BLE001
+            log.exception("temp-file sweep failed")
+        _run(cfg)
+    finally:
+        housekeeping.release_lock(lock_fd)
 
+
+def _run(cfg):
+    """The daemon proper (main() holds the single-instance lock around it)."""
     eventlog = EventLog(cfg.EVENT_LOG)
     poller = RainPoller(cfg, eventlog)
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None

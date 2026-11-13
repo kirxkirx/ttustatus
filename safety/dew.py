@@ -39,8 +39,9 @@ every five minutes, and one quiet poll must not hand the roof back to "it is onl
 "Missing data is false" here means three things, all read off the GLM layer's component:
     * the latest GOOD poll is at most DEW_GLM_MAX_AGE_MIN old (one failed poll is
       tolerated), a good poll being one that read at least DEW_GLM_MIN_GRANULES of its
-      look-back window — the GLM layer skips a granule it cannot download, and "no
-      flash" out of a fraction of the data is not "no lightning";
+      look-back window and is not flagged partial (a hole or a lag in what it read) — a
+      granule the GLM layer cannot download is read by a later poll, but "no flash" out
+      of a fraction of the data is not "no lightning";
     * good polls have been arriving, never further apart than that, for a whole hold:
       after a daemon start, a clock correction or an outage nobody knows what happened
       in the minutes not watched, so the answer stays false until a hold has been
@@ -241,7 +242,8 @@ class DewMonitor:
 
         A GOOD poll is one that can vouch for "no lightning": the layer is on, the poll
         succeeded and is current, it read enough of its look-back window
-        (DEW_GLM_MIN_GRANULES), its nearest flash has a readable distance and its time
+        (DEW_GLM_MIN_GRANULES, counted in granules_in_window), it is not partial (no hole
+        or lag in what it read), its nearest flash has a readable distance and its time
         stamp can be used. Anything less is not lightning data: the last good poll then
         simply ages out (DEW_GLM_MAX_AGE_MIN), which is what makes one failed poll
         harmless.
@@ -272,7 +274,11 @@ class DewMonitor:
             ts = _finite(glm.get("last_poll_ts"))
             raw = glm.get("nearest_km")
             nearest = _finite(raw)
-            granules = _finite(glm.get("granules_scanned")) or 0.0
+            # the granules read of the look-back window (a poll also reads back to where
+            # the previous one stopped; older components have only granules_scanned)
+            in_window = glm.get("granules_in_window")
+            granules = _finite(glm.get("granules_scanned") if in_window is None
+                               else in_window) or 0.0
             if raw is not None and (nearest is None or nearest < 0):
                 # there WAS a flash, at a distance that cannot be read: nobody can say
                 # it was outside the ring
@@ -285,6 +291,9 @@ class DewMonitor:
                 elif granules < cfg.DEW_GLM_MIN_GRANULES:
                     why = ("the last GLM poll read only %d of the %d granules needed"
                            % (granules, cfg.DEW_GLM_MIN_GRANULES))
+                elif glm.get("partial"):
+                    why = ("the last GLM poll left part of its window unread (%s)"
+                           % (glm.get("coverage") or "incomplete"))
                 else:
                     why, good = None, True
         with self._lock:

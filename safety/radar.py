@@ -52,7 +52,6 @@ overlay on the map the PNG is pixel-identical to the pre-hazards thumbnail.
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import http.client
 import io
@@ -68,6 +67,7 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 import zlib
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -78,7 +78,7 @@ except Exception:                       # pragma: no cover - optional dep
     Image = ImageChops = ImageDraw = ImageFont = ImageStat = None
 
 from . import config as _config
-from . import servertime
+from . import netio, servertime
 
 log = logging.getLogger("ttu.safety.radar")
 
@@ -107,6 +107,10 @@ class TileRefused(ValueError):
     (a keyed tile identical to its unkeyed twin)."""
 
 
+# A tile is ~10-60 kB; a reply beyond this is no tile, and is not read further.
+TILE_MAX_BYTES = 2 << 20
+
+
 def _get(url, timeout=25, refuse_uncacheable=False, fresh=False):
     """GET -> bytes. refuse_uncacheable (OSM and custom basemap tiles): a reply the
     server marks Cache-Control no-cache / no-store is refused (TileRefused) —
@@ -115,7 +119,12 @@ def _get(url, timeout=25, refuse_uncacheable=False, fresh=False):
     key check): asks every cache on the way for a fresh copy (Cache-Control/Pragma
     no-cache), so a proxy holding a pre-watermark copy of an unkeyed tile cannot make a
     rejected key look accepted. (CARTO's own CDN ignores it — checked 2026-09-24 — which
-    is harmless: its unkeyed copies are all watermarked.)"""
+    is harmless: its unkeyed copies are all watermarked.)
+
+    ``timeout`` bounds each wait on the socket AND the reading of the whole body (a server
+    trickling a byte every few seconds cannot hold the radar thread), and the body is
+    refused beyond TILE_MAX_BYTES (netio.read_capped: ReplyTooSlow, an OSError, or
+    ReplyTooLarge, a ValueError)."""
     headers = dict(UA)
     if fresh:
         headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
@@ -126,7 +135,91 @@ def _get(url, timeout=25, refuse_uncacheable=False, fresh=False):
             if "no-cache" in cc or "no-store" in cc:
                 raise TileRefused("tile server marked the tile not cacheable (%s): an "
                                   "'access blocked' tile?" % cc)
-        return r.read()
+        return netio.read_capped(r, TILE_MAX_BYTES, timeout, "tile")
+
+
+# ---- bytes from a server (or from the basemap cache) -> image --------------------
+# After vlbaweather's weather/radar.py _open_image. The first bytes of the only formats
+# this module decodes, compared before Pillow sees the data: which codec runs never
+# depends on what a server chose to send (left to itself, Pillow hands an EPS reply to
+# Ghostscript, and every other plugin is within reach of a tile server).
+_MAGIC = {"PNG": b"\x89PNG\r\n\x1a\n", "JPEG": b"\xff\xd8\xff"}
+FRAME_FORMATS = ("PNG",)            # IEM's lcref frame and the bucket's GRIB2 payload
+TILE_FORMATS = ("PNG", "JPEG")      # map tiles, and the basemap composite cached here
+TILE_SIDE = 256                     # the tiles _build_tiles requests and pastes
+TILE_SIDES = (TILE_SIDE, 2 * TILE_SIDE)     # 512: a "@2x" tile, scaled to 256
+
+
+class ImageRefused(ValueError):
+    """Image bytes this module does not decode: not in the formats asked for, or (said by
+    the caller) not of the size or mode expected."""
+
+
+def _open_image(data, formats):
+    """Open (NOT decode) image bytes that must be in one of ``formats``; ImageRefused
+    otherwise, and for anything Pillow cannot open. The caller compares ``size`` and
+    ``mode`` with what it expects BEFORE ``load()``: a PNG of 136 kB may declare 12000 x
+    12000 pixels, and decoding it takes 144 MB (an RGB one about 1 GB with its
+    conversion). Pillow's warning for a header beyond 89 M pixels (the frame has 24.5 M)
+    is an error here, not a line in the journal (Pillow warns while opening, not while
+    decoding; the radar thread is the daemon's only Pillow user, so the filter changed
+    for the moment of the open touches no other thread's warnings). A Pillow too old to
+    take ``formats=`` is refused, never left to pick the codec (the apt Pillow of
+    Bookworm, 9.4, and of Trixie, 11.x, both take it)."""
+    head = bytes(data[:8]) if isinstance(data, (bytes, bytearray)) else b""
+    want = " or ".join(formats)
+    if not any(head.startswith(_MAGIC[f]) for f in formats):
+        raise ImageRefused("not a %s image" % want)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            img = Image.open(io.BytesIO(data), formats=list(formats))
+        except TypeError:
+            raise ImageRefused("this Pillow cannot restrict the image format: upgrade "
+                               "Pillow") from None
+        except Exception as e:          # noqa: BLE001 - Pillow raises many kinds for bad bytes
+            raise ImageRefused("unreadable %s image (%s)" % (want, _errtext(e))) from e
+    if img.format not in formats:       # e.g. "MPO": a JPEG start with more pictures behind
+        raise ImageRefused("a %s image, not %s" % (img.format, want))
+    return img
+
+
+def _load(img, what):
+    """Decode an image ``_open_image`` opened and the caller checked; ImageRefused for
+    bytes that do not decode (a truncated or corrupt file)."""
+    try:
+        img.load()
+    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
+        raise ImageRefused("%s does not decode (%s)" % (what, _errtext(e))) from e
+    return img
+
+
+def _open_tile(data):
+    """A map tile opened (not decoded): PNG or JPEG of TILE_SIDE or 2 * TILE_SIDE px
+    square, checked on the header; ImageRefused otherwise."""
+    tile = _open_image(data, TILE_FORMATS)
+    if tile.size[0] != tile.size[1] or tile.size[0] not in TILE_SIDES:
+        raise ImageRefused("tile of %dx%d px (a tile is %d or %d px square)"
+                           % (tile.size + TILE_SIDES))
+    return tile
+
+
+def _decode_tile(data):
+    """A map tile as a TILE_SIDE px RGB image (a "@2x" tile scaled down to it: it covers
+    the same ground); ImageRefused for bytes that are no tile (_open_tile)."""
+    tile = _load(_open_tile(data), "tile").convert("RGB")
+    if tile.size != (TILE_SIDE, TILE_SIDE):
+        tile = tile.resize((TILE_SIDE, TILE_SIDE), Image.LANCZOS)
+    return tile
+
+
+def _pixels(im):
+    """The values of a single-band image, row by row: ``get_flattened_data`` where Pillow
+    has it (12.1 on: ``getdata`` is deprecated there and goes in Pillow 14, 2027-10-15),
+    ``getdata`` in the apt Pillow of Bookworm (9.4) and Trixie (11.x). Both give the same
+    values."""
+    flat = getattr(im, "get_flattened_data", None)
+    return flat() if flat is not None else im.getdata()
 
 
 # ---- geometry -------------------------------------------------------------
@@ -184,6 +277,8 @@ POLL_DEADLINE = 120             # s: no radar request of a poll starts later tha
 MIN_TIMEOUT = 3                 # s: floor of a timeout shortened by the poll's deadline
 LISTING_MAX_BYTES = 1 << 20     # an hour's listing is ~11 KB
 FRAME_MAX_BYTES = 32 << 20      # a frame is ~0.6 (IEM) or ~1 MB (AWS); more is no frame
+FRAME_INFLATED_MAX = 32 << 20   # the bucket's file inflated: ~1.0 MB (2026-11-10's file:
+#                                 1 003 393 bytes); a few kB of gzip can inflate to GBs
 GRIB_TIME_TOL = 1               # s: a GRIB2 file's own time against its name's
 FRAME_BOX_MARGIN_DEG = 0.05     # around the cells the ring check and the maps read
 _mono = time.monotonic          # the poll's deadline clock (tests replace it)
@@ -246,14 +341,23 @@ def _http(url, method="GET", timeout=META_TIMEOUT, max_bytes=None):
     slow body must not read as a wrong clock). An HTTP error status comes back like a
     success (its headers carry the server's Date as well); no answer at all raises
     (URLError, OSError, HTTPException). The seam the tests replace (they may return the
-    first three only)."""
+    first three only).
+
+    ``timeout`` bounds each wait on the socket and, once the headers are in, the reading
+    of the whole body: urlopen's timeout alone would let a server trickling a byte every
+    few seconds hold the radar thread for as long as it likes. The body is read through
+    netio.read_capped against ``max_bytes`` (FRAME_MAX_BYTES when None): ReplyTooLarge
+    (a ValueError) for a larger one, ReplyTooSlow (an OSError) for one not complete in
+    time, ReplyCutShort for a connection closed before the declared length."""
     req = urllib.request.Request(url, headers=dict(UA), method=method)
+    cap = FRAME_MAX_BYTES if max_bytes is None else max_bytes
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             received = time.time()
             body = b""
             if method != "HEAD":
-                body = r.read(-1 if max_bytes is None else max_bytes + 1)
+                body = netio.read_capped(r, cap, timeout,
+                                         urllib.parse.urlsplit(url).hostname or "reply")
             return (getattr(r, "status", None) or 200), r.headers, body, received
     except urllib.error.HTTPError as e:
         received = time.time()
@@ -285,9 +389,11 @@ class _PollNet:
 
     def request(self, source, url, method="GET", timeout=META_TIMEOUT, max_bytes=None):
         """``(status, body)`` of a reply whose Date agrees with this host's clock.
-        SourceError for no answer, a host that failed earlier this poll or a spent
-        budget; ClockMismatch for a Date beyond the tolerance; FrameError for a body
-        larger than ``max_bytes``."""
+        SourceError for no answer (a body not complete within the request's timeout
+        included), a host that failed earlier this poll or a spent budget; ClockMismatch
+        for a Date beyond the tolerance; FrameError for a body larger than ``max_bytes``.
+        The timeout handed to _http, which bounds the whole reply, is never more than
+        what is left of the poll's deadline and of the current lookup's budget."""
         host = (urllib.parse.urlsplit(url).hostname or "").lower()
         if host in self.down:
             raise SourceError(self.down[host])
@@ -301,6 +407,10 @@ class _PollNet:
             left = min(left, self.phase_end - now)
         try:
             reply = _http(url, method, max(MIN_TIMEOUT, min(timeout, left)), max_bytes)
+        except netio.ReplyTooLarge as e:
+            # an answer, just not a frame (or listing): the host is asked on
+            raise FrameError("reply larger than %d MB" % max(1, (max_bytes or FRAME_MAX_BYTES)
+                                                             >> 20)) from e
         except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
             why = "%s: no answer (%s)" % (host or "server", _errtext(e))
             self.down[host] = why
@@ -483,9 +593,13 @@ def aws_image(data, ts, box):
     the ring check and the maps read) and 0, "no echo", elsewhere — so the 98 MB the
     decoded grid takes is held only for the moment of the crop. The file must be MRMS's
     SeamlessHSR (AWS_PRODUCT_ID), of the time its name gives (GRIB_TIME_TOL) and on
-    lcref's grid; anything else is a FrameError."""
+    lcref's grid; anything else is a FrameError. The gzip'ed file is inflated in steps
+    and refused beyond FRAME_INFLATED_MAX (netio.gunzip_capped), and the PNG payload is
+    opened by Pillow's PNG reader only, its size and mode checked on its header before a
+    pixel is decoded (_open_image)."""
     try:
-        raw = gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data
+        raw = (netio.gunzip_capped(data, FRAME_INFLATED_MAX) if data[:2] == b"\x1f\x8b"
+               else data)
         meta = parse_grib2(raw)
     except (OSError, EOFError, ValueError, zlib.error, struct.error, IndexError) as e:
         raise FrameError("unreadable GRIB2 (%s)" % _errtext(e)) from e
@@ -509,21 +623,23 @@ def aws_image(data, ts, box):
         raise FrameError("grid of %dx%d cells of %gx%g deg from %.3f, %.3f, scan 0x%02x "
                          "(not lcref's)" % (g["ni"], g["nj"], g["di"], g["dj"], g["la1"],
                                             lo1, g["scan"]))
+    del raw, data                       # the payload is all that is needed from here on
     try:
-        im = Image.open(io.BytesIO(meta["payload"]))
-        if im.format != "PNG":
-            raise ValueError("payload is %s, not PNG" % im.format)
-        im.load()
-    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
-        raise FrameError("unreadable PNG payload (%s)" % _errtext(e)) from e
+        im = _open_image(meta["payload"], FRAME_FORMATS)
+    except ImageRefused as e:
+        raise FrameError("unreadable PNG payload (%s)" % e) from e
     if im.size != (GRID_W, GRID_H) or im.mode not in ("I", "I;16", "I;16B", "I;16L", "L"):
         raise FrameError("PNG payload of %dx%d in mode %s" % (im.size + (im.mode,)))
+    try:
+        _load(im, "the PNG payload")
+    except ImageRefused as e:
+        raise FrameError("unreadable PNG payload (%s)" % e) from e
     c0, r0, c1, r1 = box
     crop = im.crop((c0, r0, c1, r1))
     del im                              # the 98 MB grid goes here, before the 24.5 MB one
     try:
         index = lcref_index(drs)
-        cells = bytes(map(index, crop.getdata())) if crop.size[0] and crop.size[1] else b""
+        cells = bytes(map(index, _pixels(crop))) if crop.size[0] and crop.size[1] else b""
     except (ArithmeticError, ValueError, TypeError) as e:
         raise FrameError("values not convertible (%s)" % _errtext(e)) from e
     out = Image.new("L", (GRID_W, GRID_H), 0)
@@ -533,16 +649,20 @@ def aws_image(data, ts, box):
 
 
 def lcref_image(data):
-    """IEM's lcref PNG, checked: palette indices on the full lcref grid."""
+    """IEM's lcref PNG, checked: palette indices on the full lcref grid. Only Pillow's PNG
+    reader sees the bytes, and their size and mode are checked on the header before a
+    pixel is decoded (_open_image)."""
     try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
-    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
-        raise FrameError("unreadable PNG (%s)" % _errtext(e)) from e
+        img = _open_image(data, FRAME_FORMATS)
+    except ImageRefused as e:
+        raise FrameError("unreadable PNG (%s)" % e) from e
     if img.mode not in ("P", "L") or img.size != (GRID_W, GRID_H):
         raise FrameError("PNG of %dx%d in mode %s (lcref is %dx%d palette indices)"
                          % (img.size + (img.mode, GRID_W, GRID_H)))
-    return img
+    try:
+        return _load(img, "the PNG")
+    except ImageRefused as e:
+        raise FrameError("unreadable PNG (%s)" % e) from e
 
 
 def fetch_frame(cfg, net, source, url, ts, box):
@@ -1635,7 +1755,9 @@ class Thumbnailer:
             return ("unreachable", None, "the keyed tile %s could not be fetched (%s)"
                     % (keyed_url, e), "no answer")
         try:
-            Image.open(io.BytesIO(keyed)).verify()
+            # a PNG or JPEG tile of a tile's size only (_open_tile): anything else is
+            # refused here, unread, rather than handed to _build_tiles as the probe tile
+            _open_tile(keyed).verify()
         except Exception as e:                  # noqa: BLE001 - an error page, a portal
             return ("unreachable", None, "the keyed tile %s is not an image (%s)"
                     % (keyed_url, e), "not an image")
@@ -1696,7 +1818,7 @@ class Thumbnailer:
                 data = prefetched.get((tx, ty))
                 if data is None:
                     data = fetch(tx, ty)
-                t = Image.open(io.BytesIO(data)).convert("RGB")
+                t = _decode_tile(data)          # PNG or JPEG of a tile's size only
                 if invert and _mean_luminance(t) > LIGHT_TILE_LUMINANCE:
                     t = invert_lightness(t)
                 canvas.paste(t, (tx * 256 - gx0, ty * 256 - gy0))
@@ -1711,10 +1833,19 @@ class Thumbnailer:
         return canvas.resize((self._ox, self._oy), Image.LANCZOS), n, len(self._tiles), refused
 
     def _load_cache(self, path):
+        """The cached composite at ``path`` as RGB, or None (none there, or unusable: a
+        torn file, not PNG or JPEG, or more than twice the map's size on a side — checked
+        on the header, before a pixel is decoded, like every image this module reads)."""
         if not os.path.exists(path):
             return None
         try:
-            img = Image.open(path).convert("RGB")
+            with open(path, "rb") as f:
+                data = f.read()
+            img = _open_image(data, TILE_FORMATS)
+            w, h = img.size
+            if not (0 < w <= 2 * self._ox and 0 < h <= 2 * self._oy):
+                raise ImageRefused("%dx%d px for a map of %dx%d" % (w, h, self._ox, self._oy))
+            img = _load(img, "the composite").convert("RGB")
         except Exception as e:                  # noqa: BLE001 - a torn file: rebuild
             log.warning("radar basemap cache %s unreadable (%s) — ignored", path, e)
             return None

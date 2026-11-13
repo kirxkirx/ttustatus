@@ -22,6 +22,7 @@ from flask import Flask, jsonify, request
 
 from . import __version__
 from .radar import basemap_summary
+from .textclean import clean_text
 
 # The /setup page links to the source code (make_status_page.py has its own SOURCE_URL).
 SOURCE_URL = "https://github.com/kirxkirx/ttustatus"
@@ -158,23 +159,34 @@ def create_app(monitor, cfg) -> Flask:
         return fail(ERR_NOT_IMPLEMENTED, f"cannot set: {action}")
 
     # --- human-readable setup / debug ---------------------------------------
+    # The HTML pages pass through clean_text as a whole: upstream text (an NWS headline, a
+    # feed's error) can carry a lone surrogate, which Werkzeug cannot encode to UTF-8 (the
+    # page answered HTTP 500 for as long as the alert was out). _txt scrubs each piece; this
+    # is the net for every text rendered without it. The JSON routes are safe as they are:
+    # jsonify writes non-ASCII as \u escapes.
     @app.get("/setup")
     def server_setup():
-        return _setup_html(monitor, cfg)
+        return setup_page(monitor, cfg)
 
     @app.get("/setup/v1/safetymonitor/<int:d>/setup")
     def device_setup(d):
-        return _setup_html(monitor, cfg)
+        return setup_page(monitor, cfg)
 
     @app.get("/")
     def index():
-        return _setup_html(monitor, cfg)
+        return setup_page(monitor, cfg)
 
     @app.get("/status")
     def status_json():
         return jsonify(monitor.evaluate())
 
     return app
+
+
+def setup_page(monitor, cfg) -> str:
+    """The /setup page, made safe to encode: lone surrogates become U+FFFD, control and
+    bidirectional-control characters are dropped (textclean.clean_text)."""
+    return clean_text(_setup_html(monitor, cfg))
 
 
 def _setup_html(monitor, cfg) -> str:
@@ -258,6 +270,14 @@ def _setup_html(monitor, cfg) -> str:
             gv, glm_unknown = "polling paused (daytime) — no current data", True
         elif not glm.get("available"):
             gv, glm_unknown = "no fresh data (no recent successful poll)", True
+        elif glm.get("partial"):
+            # the last poll did not read its whole window: not a veto, not "clear" either
+            nk = glm.get("nearest_km")
+            gv = "partial window — %s (%s)" % (
+                "no strike in what was read" if nk is None else
+                "nearest %s km %s" % (nk, glm.get("nearest_bearing") or ""),
+                glm.get("coverage") or "incomplete")
+            glm_unknown = True
         else:
             nk = glm.get("nearest_km")
             gv = "no strikes seen" if nk is None else "no strike in ring; nearest %s km %s" % (
@@ -522,8 +542,9 @@ _MAX_ALERTS = 25
 
 
 def _txt(x, limit=300) -> str:
-    """One line of plain text, bounded (callers html.escape it)."""
-    return "" if x is None else " ".join(str(x).split())[:limit]
+    """One line of plain text, bounded (callers html.escape it), scrubbed of what cannot
+    or must not be shown: a lone surrogate, control and bidirectional-control characters."""
+    return "" if x is None else " ".join(clean_text(str(x)).split())[:limit]
 
 
 def _item_text(x, limit=160) -> str:

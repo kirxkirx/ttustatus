@@ -51,9 +51,21 @@ hazard_feeds, HAZARD_FEEDS_IMPORT_ERROR = _import_layer("hazard_feeds")
 # (see SafetyMonitor._held_vetoes); one that gave no end time is held this long after its
 # last report — the same bound the NWS-alerts poller applies to such a warning.
 HAZARD_NO_END_HOLD_SEC = 3600
+# ... and none is carried forward beyond this after the layer's last report, whatever its
+# end time: a veto that cannot be confirmed gone must not hang on for ever (the same 24 h
+# as the poller's own bound, nws_alerts.UNSEEN_RELEASE_SEC).
+HAZARD_UNSEEN_RELEASE_SEC = 24 * 3600
 # A broken layer's traceback is logged when the error changes, else at most this often:
 # evaluate() runs on every Alpaca poll, and the journal lives on the SD card.
 COMPONENT_ERROR_LOG_SEC = 600
+# The rain layer's results are "stale" (no data, not "no rain") once the last completed WU
+# poll is older than this many poll intervals while polling should be running.
+RAIN_STALE_POLLS = 3
+# "Rain check blind" warning (never a veto): this many consecutive WU polls in a row with
+# no station reporting, while polling is active and a key is set.
+RAIN_BLIND_POLLS = 3
+# A gap this long between two WU polls starts a new blind count (the next night).
+RAIN_BLIND_RESET_SEC = 7200
 
 
 def _finite(x):
@@ -61,6 +73,34 @@ def _finite(x):
     if isinstance(x, (int, float)) and math.isfinite(x):
         return x
     return None
+
+
+def _persisted_end(persisted, now, hold_sec):
+    """A broken layer's own latch end (epoch) for SafetyMonitor._guarded, or None:
+    persisted() reads it from the layer's state as its latch file restored it, without
+    the layer's component(). An end in the past is none; an endless one counts hold_sec
+    from now. Never raises: it is the fallback of a fallback."""
+    try:
+        end = persisted()
+        if end is None or isinstance(end, bool):
+            return None
+        end = float(end)
+    except Exception:  # noqa: BLE001
+        return None
+    if math.isnan(end):
+        return None
+    if math.isinf(end):
+        return now + float(hold_sec) if end > 0 else None
+    return end if end > now else None
+
+
+def _radar_latch_end(radar, cfg, now):
+    """The radar layer's latch end: its last rain on the ring (a stamp from the future, as
+    after a clock step, read as now, the way the layer itself heals it) plus RADAR_LATCH_SEC."""
+    last = getattr(radar, "_last_rain_ts", None)
+    if last is None:
+        return None
+    return min(float(last), now) + float(cfg.RADAR_LATCH_SEC)
 
 
 def _json_clean(obj):
@@ -97,6 +137,27 @@ def _hazards_unavailable(cfg, error=None, enabled=False):
     if error:
         comp["error"] = error
     return comp
+
+
+def _rain_unavailable(cfg, error=None):
+    """The 'rain' component when the rain poller itself fails: no data, and no veto of its
+    own (SafetyMonitor carries a latch it last reported forward separately)."""
+    return {"safe": True, "enabled": bool(getattr(cfg, "WU_API_KEY", "")),
+            "available": False, "latched": False, "latched_until": None,
+            "seconds_remaining": 0, "last_rain_ts": None, "polling_active": False,
+            "last_poll_ts": None, "last_poll_age_s": None, "stale": True, "note": None,
+            "stations_live": 0, "stations_total": 0, "stations_error": 0,
+            "throttle": None, "hold_until": None, "blind_polls": 0, "blind_since": None,
+            "raining": [], "results": [], "error": error}
+
+
+def _local_hhmm(ts, cfg):
+    """'21:45 CDT' for an epoch (local time), or '?' for one that cannot be shown."""
+    try:
+        return nws_forecast._local(datetime.fromtimestamp(ts, timezone.utc),
+                                   cfg.LOCAL_TZ).strftime("%H:%M %Z")
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "?"
 
 
 def _hazard_info_unavailable(cfg, error=None, enabled=False):
@@ -221,6 +282,14 @@ class RainPoller:
         self._last_poll_ts = None
         self._last_result: dict | None = None
         self._latch_dirty = False       # a latch we failed to persist; retry later
+        # WU asked us to wait (HTTP 429/503 with Retry-After): no poll before this epoch
+        self._hold_until = None
+        # consecutive polls with no station reporting, and when that run began
+        self._blind_polls = 0
+        self._blind_since = None
+        # the last time component() found polling off (daytime, sun unknown, no key): a
+        # poll older than that is no sign of a stuck poll loop (see component's STALE)
+        self._inactive_ts = None
         self._load_latch()
 
     # -- persistence ---------------------------------------------------------
@@ -286,9 +355,13 @@ class RainPoller:
         if fresh:
             return
         try:
-            found = wu_poll.discover_stations(*self.cfg.GEOCODE)
-        except Exception:
-            log.exception("station discovery failed")
+            # each entry validated (a non-empty id, a finite distance) INSIDE the guard:
+            # a malformed discovery reply keeps the previous station list
+            found = wu_poll.clean_station_list(wu_poll.discover_stations(*self.cfg.GEOCODE))
+        except Exception as e:  # noqa: BLE001 - discovery failed: keep the old list
+            log.warning("WU station discovery failed (%s: %s) — keeping the previous "
+                        "station list (%d stations)", type(e).__name__, str(e)[:200],
+                        len(self._stations))
             return
         # The WU API returns the ~10 NEAREST stations with no distance cap: in a sparse
         # region that can mean gauges 100s of km away that say nothing about rain here.
@@ -342,7 +415,24 @@ class RainPoller:
         for sid, _d in skipped:             # keep live/total honest on the page
             result["results"].append({"station": sid, "state": "backed-off"})
         result["total"] += len(skipped)
+        throttle = result.get("throttle")
         with self._lock:
+            # HTTP 429/503: honour Retry-After (wu_poll bounds it to an hour) before the
+            # next poll; without one the next poll comes at the normal interval
+            wait = _finite((throttle or {}).get("retry_after_s"))
+            self._hold_until = now + wait if wait and wait > 0 else None
+            # blind count: consecutive polls in which no station reported
+            prev = self._last_poll_ts
+            if result.get("live", 0) > 0:
+                self._blind_polls, self._blind_since = 0, None
+            else:
+                gap = None if prev is None else now - prev
+                if (self._blind_since is None or gap is None or gap < 0
+                        or gap > max(RAIN_STALE_POLLS * self.cfg.WU_POLL_INTERVAL,
+                                     RAIN_BLIND_RESET_SEC)):
+                    self._blind_polls, self._blind_since = 1, now
+                else:
+                    self._blind_polls += 1
             self._last_poll_ts = now
             self._last_result = result
             if result["raining"]:
@@ -360,10 +450,25 @@ class RainPoller:
     def _update_backoff(self, result, mono):
         after = max(1, int(self.cfg.WU_BACKOFF_AFTER))
         retry = float(self.cfg.WU_BACKOFF_RETRY_SEC)
+        results = result.get("results", [])
+        # A reply that cannot be used ("bad-reply") counts against the station only when
+        # another station of the same poll got a proper answer (a reading, or WU's own "no
+        # data" for a dead station): when none did, the garbage is WU's (an HTML error page
+        # sent as HTTP 200), like a 5xx, and backing every station off for it would leave
+        # the rain layer blind after WU recovers.
+        answered = any(r.get("state") in ("live", "stale", "offline") for r in results)
         with self._lock:
-            for r in result.get("results", []):
+            for r in results:
                 sid = r.get("station")
-                if r.get("state") == "offline":
+                if r.get("state") == "bad-reply" and not answered:
+                    continue
+                if r.get("state") in ("error", "not-asked", "backed-off"):
+                    # an API or network problem (HTTP 429/5xx, a timeout) or a station
+                    # this poll did not ask: says nothing about the station — after a
+                    # WU or network outage the stations must not all be backed off,
+                    # leaving the rain layer blind for an hour after the recovery
+                    continue
+                if r.get("state") in wu_poll.BACKOFF_STATES:
                     streak = self._offline_streak.get(sid, 0) + 1
                     self._offline_streak[sid] = streak
                     if streak == after:
@@ -398,6 +503,12 @@ class RainPoller:
             # due, or polling would stall for the entire size of the step
             elapsed = None if self._last_poll_ts is None else now - self._last_poll_ts
             due = elapsed is None or elapsed < 0 or elapsed >= self.cfg.WU_POLL_INTERVAL
+            hold = self._hold_until
+            if hold is not None and (now >= hold
+                                     or hold - now > wu_poll.RETRY_AFTER_MAX_S + 60):
+                self._hold_until = hold = None      # over, or a clock step: forget it
+            if hold is not None:
+                due = False                         # WU's Retry-After is still running
         if not due:
             return None
         return self.poll_now(now)
@@ -416,6 +527,8 @@ class RainPoller:
                 log.warning("rain latch re-armed across a clock step (it would have "
                             "silently evaporated)")
             self._last_poll_ts = None
+            self._hold_until = None
+            self._inactive_ts = None
 
     def component(self, sun_alt, now=None) -> dict:
         if now is None:
@@ -440,6 +553,24 @@ class RainPoller:
             enabled = bool(self.cfg.WU_API_KEY)
             polling_active = (enabled and sun_alt is not None
                               and sun_alt < self.cfg.RAIN_POLL_SUN_BELOW_DEG)
+            # STALE: polling should be running but the last completed poll is old (a hung
+            # or crashing poll loop, a long Retry-After). Its "N/M live, no rain" is no
+            # longer a reading: report no live station, so the page and the Alpaca text
+            # say "no data" instead of "no rain". No veto change. Timed from the last poll,
+            # or from when polling was last seen off if that is later: at dusk the last
+            # poll is the morning's, and a day of sun-up silence is no stuck poll loop
+            # (the first poll of the night follows within the rain loop's 30 s tick).
+            if not polling_active:
+                self._inactive_ts = now
+            poll_age = (None if self._last_poll_ts is None
+                        else now - self._last_poll_ts)
+            since_off = (self._inactive_ts is not None and self._last_poll_ts is not None
+                         and self._inactive_ts > self._last_poll_ts)
+            quiet = now - self._inactive_ts if since_off else poll_age
+            stale = bool(polling_active and quiet is not None
+                         and quiet > RAIN_STALE_POLLS * self.cfg.WU_POLL_INTERVAL)
+            # (a blind run of polls made before polling was last off is not tonight's)
+            blind_polls = self._blind_polls if polling_active and not since_off else 0
             return {
                 "safe": not latched,
                 "enabled": enabled,
@@ -449,8 +580,22 @@ class RainPoller:
                 "last_rain_ts": self._last_rain_ts,
                 "polling_active": polling_active,
                 "last_poll_ts": self._last_poll_ts,
-                "stations_live": res.get("live", 0),
+                "last_poll_age_s": None if poll_age is None else round(poll_age),
+                "stale": stale,
+                # how long no poll has completed while polling was on (the blind warning)
+                "stale_for_s": round(quiet) if stale else None,
+                "note": (None if not stale else
+                         "stale, no WU poll completed for %d min" % round(quiet / 60)
+                         if since_off else "stale, last poll %d min ago" % round(quiet / 60)),
+                "stations_live": 0 if stale else res.get("live", 0),
                 "stations_total": res.get("total", len(self._stations)),
+                "stations_error": res.get("errors", 0),
+                "throttle": res.get("throttle"),
+                "hold_until": self._hold_until,
+                # consecutive polls with no station reporting (see SafetyMonitor's
+                # "rain check blind" warning), and when the run began
+                "blind_polls": blind_polls,
+                "blind_since": self._blind_since if blind_polls else None,
                 "raining": res.get("raining", []),
                 "results": res.get("results", []),
             }
@@ -479,6 +624,13 @@ class SafetyMonitor:
         # the vetoes the hazard layer last reported, and when (see _held_vetoes)
         self._last_veto: list = []
         self._last_veto_ts = None
+        # rain / GLM / radar: when each layer's last reported veto runs out (epoch), carried
+        # forward while the layer itself is broken (see _guarded)
+        self._held_latch: dict = {}
+        # connectivity: the verdict last reported, and when (monotonic) the watchdog last
+        # reported "safe" — a watchdog broken that long vetoes, like an hour offline
+        self._conn_last_safe = None
+        self._conn_ok_mono = time.monotonic()
         self._comp_err_logged: dict = {}   # component name -> (message, monotonic ts)
         # The dew monitor (Alpaca device 1, safety/dew.py) and the weather log. Neither
         # is an input of IsSafe: device 1 only READS the verdict made here, and the log
@@ -588,44 +740,79 @@ class SafetyMonitor:
             sun_safe = self._eval_sun(sun_alt, reasons)
             hum_safe = self._eval_humidity(humidity, reasons)
 
+        # Every gating layer is called through _guarded: a layer that raises (or returns
+        # something that is not a component) must not take evaluate() down — that would
+        # turn /issafe into an HTTP 500, freeze the state file and take device 1 with it.
+        # A broken layer is "unavailable" (no veto of its own, like an unreachable feed)
+        # — except that a veto it last reported is held to that veto's own end. The
+        # warnings list names the broken layer.
+        sun_for_layers = None if stale else sun_alt
+
         # Rain latch is independent of the page inputs; it applies even when stale.
-        rain = self.poller.component(None if stale else sun_alt, now)
+        rain = self._guarded(
+            "rain", lambda: self.poller.component(sun_for_layers, now),
+            lambda err: _rain_unavailable(self.cfg, err), now, warnings,
+            hold_sec=self.cfg.RAIN_LATCH_HOURS * 3600,
+            persisted=lambda: getattr(self.poller, "_latch_until", None))
         rain_safe = rain["safe"]
         if not rain_safe:
-            reasons.append(f"rain latch active ({rain['seconds_remaining'] // 60} min left)")
+            reasons.append("rain latch active (%d min left%s)"
+                           % (self._mins_left(rain),
+                              "; held, the rain layer failed" if rain.get("held") else ""))
 
         # NWS forecast (pre-emptive): unsafe only when it has fresh data that breaches a
-        # threshold; an unavailable/stale forecast does not flip safe->unsafe on its own.
+        # threshold; an unavailable/stale forecast does not flip safe->unsafe on its own,
+        # and neither does a forecast layer that fails (no hold: it is a forecast).
         if self.nws is not None:
-            nws = self.nws.component(now)
+            nws = self._guarded(
+                "forecast", lambda: self.nws.component(now),
+                lambda err: dict(nws_forecast.unavailable_component(self.cfg),
+                                 enabled=True, error=err),
+                now, warnings, hold_sec=None,
+                check=lambda c: isinstance(c.get("reasons", []), list))
         else:
             nws = nws_forecast.unavailable_component(self.cfg)
         nws_safe = nws["safe"]
         if not nws_safe:
-            reasons.extend(nws["reasons"])
+            reasons.extend(str(r) for r in (nws.get("reasons") or ["NWS forecast unsafe"]))
 
         # GLM lightning latch (independent of page inputs; applies even when stale).
         if self.glm is not None:
-            glm = self.glm.component(None if stale else sun_alt, now)
+            glm = self._guarded(
+                "lightning", lambda: self.glm.component(sun_for_layers, now),
+                lambda err: dict(glm_lightning.unavailable_component(self.cfg),
+                                 enabled=True, error=err),
+                now, warnings, hold_sec=self.cfg.GLM_COOLOFF_HOURS * 3600,
+                persisted=lambda: getattr(self.glm, "_latch_until", None))
         else:
             glm = glm_lightning.unavailable_component(self.cfg)
         glm_safe = glm["safe"]
         if not glm_safe:
-            reasons.append("lightning within %g km (GLM latch %d min left)"
-                           % (glm["trigger_km"], glm["seconds_remaining"] // 60))
+            reasons.append("lightning within %g km (GLM latch %d min left%s)"
+                           % (self._km(glm, self.cfg.GLM_TRIGGER_KM), self._mins_left(glm),
+                              "; held, the GLM layer failed" if glm.get("held") else ""))
 
         # MRMS radar (simple any-rain ring, RADAR_TRIGGER_KM). Live check; unavailable
         # => no veto.
         if self.radar is not None:
-            radar = self.radar.component(None if stale else sun_alt, now)
+            radar = self._guarded(
+                "radar", lambda: self.radar.component(sun_for_layers, now),
+                lambda err: dict(radar_mod.unavailable_component(self.cfg),
+                                 enabled=True, error=err),
+                now, warnings, hold_sec=self.cfg.RADAR_LATCH_SEC,
+                persisted=lambda: _radar_latch_end(self.radar, self.cfg, now))
         else:
             radar = radar_mod.unavailable_component(self.cfg)
         radar_safe = radar["safe"]
         if not radar_safe:
-            near = radar.get("nearest_km")
-            reasons.append("rain on radar within %g km%s"
-                           % (radar["trigger_km"],
-                              "" if near is None else " (nearest %g km)" % near))
+            near = _finite(radar.get("nearest_km"))
+            reasons.append("rain on radar within %g km%s%s"
+                           % (self._km(radar, self.cfg.RADAR_TRIGGER_KM),
+                              "" if near is None else " (nearest %g km)" % near,
+                              " (held %d min, the radar layer failed)" % self._mins_left(radar)
+                              if radar.get("held") else ""))
+        self._rain_blind_warning(rain, radar, now, warnings)
+
         # Basemap configuration problems (a CARTO key CARTO did not accept, a User-Agent
         # OpenStreetMap blocks or that lacks a contact): shown as warnings, NEVER a veto —
         # the basemap is decoration, the rain check never reads it.
@@ -639,18 +826,20 @@ class SafetyMonitor:
                         warnings.append(w)
 
         # Connectivity watchdog (loss of internet). HARD veto after the offline threshold.
-        if self.conn is not None:
-            conn = self.conn.component()      # its clock is monotonic-internal
-        else:
-            conn = conn_mod.unavailable_component(self.cfg)
+        conn = self._conn_component(warnings)
         conn_safe = conn["safe"]
         if not conn_safe:
-            reasons.append("no internet — online services unreachable for %d min "
-                           "(failing safe)" % conn.get("offline_min", 0))
+            if conn.get("error"):
+                reasons.append("connectivity watchdog failed — no proof the internet is "
+                               "up (failing safe)")
+            else:
+                reasons.append("no internet — online services unreachable for %d min "
+                               "(failing safe)" % (_finite(conn.get("offline_min")) or 0))
 
         # NWS warnings OVER THE SITE. Only the configured veto events (Tornado / Dust
         # Storm / High Wind Warning by default) can veto, each for the life of the warning
-        # (the poller persists it); every other alert is display-only. With no veto held
+        # (the poller persists it; one no fresh query has listed for 24 h is released);
+        # every other alert is display-only. With no veto held
         # an unavailable feed does not veto on its own, like the forecast and radar layers
         # (the connectivity watchdog covers a total outage). Independent of page inputs.
         hazards = self._hazards_component(now)
@@ -664,6 +853,13 @@ class SafetyMonitor:
             err = hazards.get("error")
             reasons.append("NWS hazard layer reports unsafe%s"
                            % (" (%s)" % str(err)[:120] if err else ""))
+
+        # Settings the daemon corrected or ignored at startup: shown (never a veto) for as
+        # long as they apply, not only once in the log.
+        for w in getattr(self.cfg, "CONFIG_WARNINGS", None) or ():
+            text = "configuration: %s" % w
+            if text not in warnings:
+                warnings.append(text)
 
         # Hazard INFORMATION (smoke, fires, SPC, storm reports) is shown on the page and
         # the map and is NEVER part of the decision: it is fetched for the state file
@@ -736,6 +932,129 @@ class SafetyMonitor:
             except Exception as e:
                 self._log_component_error("weather_log", e)
         return state
+
+    # -- the gating layers, guarded ------------------------------------------------
+    def _guarded(self, name, call, fallback, now, warnings, hold_sec, check=None,
+                 persisted=None):
+        """One gating layer's component, never an exception.
+
+        call() must return a dict whose 'safe' is a bool (and whose seconds_remaining, if
+        any, is a finite number; `check` may add a test). Anything else, or an exception,
+        is logged (_log_component_error) and replaced by fallback(error_text): an
+        UNAVAILABLE layer, which does not veto by itself — unless the layer's last good
+        report was a veto that is still running. That veto is held, marked 'held', to its
+        own end: now + seconds_remaining at the last report (hold_sec when it gave none;
+        hold_sec None = never held). With no good report since the start (a layer that
+        breaks from its first call after a restart), persisted() gives the latch end the
+        layer restored from its own latch file, held the same way. A bug in the code that
+        REPORTS rain must never be what reopens the dome. Either way a warning names the
+        broken layer."""
+        try:
+            comp = call()
+            if not isinstance(comp, dict) or not isinstance(comp.get("safe"), bool):
+                raise TypeError("malformed %s component (%s)" % (name, type(comp).__name__))
+            rem = comp.get("seconds_remaining")
+            if rem is not None and _finite(rem) is None:
+                raise TypeError("%s component: seconds_remaining is %r" % (name, rem))
+            if check is not None and not check(comp):
+                raise TypeError("malformed %s component" % name)
+        except Exception as e:  # noqa: BLE001 - a broken layer must not break IsSafe
+            self._log_component_error(name, e)
+            err = "%s layer error: %s: %s" % (name, type(e).__name__, str(e)[:200])
+            comp = fallback(err)
+            comp.update(safe=True, available=False, error=err)
+            with self._lock:
+                until = self._held_latch.get(name) if hold_sec is not None else None
+            if until is None and hold_sec is not None and persisted is not None:
+                until = _persisted_end(persisted, now, hold_sec)
+            if until is not None and now < until:
+                comp.update(safe=False, latched=True, held=True,
+                            seconds_remaining=int(math.ceil(until - now)))
+                warnings.append("%s layer failed (%s) — its last veto is held until %s"
+                                % (name, type(e).__name__, _local_hhmm(until, self.cfg)))
+            else:
+                warnings.append("%s layer failed (%s) — treated as unavailable (no veto "
+                                "from it); see the daemon log" % (name, type(e).__name__))
+            return comp
+        if hold_sec is not None:
+            with self._lock:
+                if comp["safe"]:
+                    self._held_latch.pop(name, None)
+                else:
+                    rem = _finite(comp.get("seconds_remaining"))
+                    self._held_latch[name] = now + (rem if rem and rem > 0
+                                                    else float(hold_sec))
+        return comp
+
+    def _conn_component(self, warnings) -> dict:
+        """The connectivity component, never an exception. The watchdog is a HARD veto
+        after CONN_OFFLINE_UNSAFE_SEC offline; when it breaks, the verdict it last gave is
+        kept (an "offline too long" stays unsafe), and a watchdog that has not reported
+        "safe" for CONN_OFFLINE_UNSAFE_SEC vetoes too: a broken watchdog proves the
+        internet up no better than a failed probe."""
+        if self.conn is None:
+            return conn_mod.unavailable_component(self.cfg)
+        mono = time.monotonic()
+        try:
+            comp = self.conn.component()      # its clock is monotonic-internal
+            if not isinstance(comp, dict) or not isinstance(comp.get("safe"), bool):
+                raise TypeError("malformed connectivity component (%s)"
+                                % type(comp).__name__)
+        except Exception as e:  # noqa: BLE001 - a broken layer must not break IsSafe
+            self._log_component_error("connectivity", e)
+            with self._lock:
+                last_safe, ok_mono = self._conn_last_safe, self._conn_ok_mono
+            broken = max(0.0, mono - ok_mono)
+            unsafe = last_safe is False or broken > self.cfg.CONN_OFFLINE_UNSAFE_SEC
+            comp = dict(conn_mod.unavailable_component(self.cfg))
+            comp.update(safe=not unsafe, enabled=True, available=False,
+                        error="connectivity layer error: %s: %s"
+                              % (type(e).__name__, str(e)[:200]),
+                        offline_sec=round(broken), offline_min=round(broken / 60))
+            warnings.append("connectivity layer failed (%s) — %s" % (
+                type(e).__name__, "failing safe" if unsafe else
+                "its last verdict (online) is kept; UNSAFE once it has been broken for "
+                "%d min" % round(self.cfg.CONN_OFFLINE_UNSAFE_SEC / 60)))
+            return comp
+        with self._lock:
+            self._conn_last_safe = comp["safe"]
+            if comp["safe"]:
+                self._conn_ok_mono = mono
+        return comp
+
+    @staticmethod
+    def _mins_left(comp) -> int:
+        return int((_finite(comp.get("seconds_remaining")) or 0) // 60)
+
+    @staticmethod
+    def _km(comp, default):
+        km = _finite(comp.get("trigger_km"))
+        return default if km is None else km
+
+    @staticmethod
+    def _rain_blind_warning(rain, radar, now, warnings) -> None:
+        """A NON-VETOING warning while the rain check is blind: polling active, a WU key
+        set, and either no station has reported for RAIN_BLIND_POLLS polls in a row or
+        the last completed poll is stale. 0 of N stations reporting counts as "no rain"
+        for IsSafe by design (the owner's choice: a warning only); this makes it visible
+        on the page and /setup."""
+        if not (rain.get("enabled") and rain.get("polling_active")):
+            return
+        radar = ("radar still watches for rain"
+                 if radar.get("available") and not radar.get("error")
+                 else "the radar is unavailable too — nothing watches for rain")
+        if rain.get("stale"):
+            age = (_finite(rain.get("stale_for_s")) or _finite(rain.get("last_poll_age_s"))
+                   or 0)
+            warnings.append("rain check blind: no WU poll completed for %d min (%s)"
+                            % (round(age / 60), radar))
+            return
+        polls = _finite(rain.get("blind_polls")) or 0
+        since = _finite(rain.get("blind_since"))
+        if polls >= RAIN_BLIND_POLLS and since is not None:
+            warnings.append("rain check blind: 0/%d WU stations reporting for %d min (%s)"
+                            % (_finite(rain.get("stations_total")) or 0,
+                               max(0, round((now - since) / 60)), radar))
 
     # -- dew monitor (Alpaca device 1) and weather log ---------------------------
     def _forecast_outlook(self, now):
@@ -860,14 +1179,19 @@ class SafetyMonitor:
         """The vetoes last reported by the hazard layer that are still running by their
         own end time, marked 'latched'. A bug in the code that REPORTS a tornado warning
         must never be what reopens the dome. Bounded like the poller's own hold: to the
-        warning's end_ts, or HAZARD_NO_END_HOLD_SEC after the last report without one."""
+        warning's end_ts, or HAZARD_NO_END_HOLD_SEC after the last report without one, and
+        never beyond HAZARD_UNSEEN_RELEASE_SEC after the last report (a layer broken for a
+        day can no longer confirm anything: the held veto is released, not kept for ever)."""
         with self._lock:
             last, seen = list(self._last_veto), self._last_veto_ts
         held = []
+        base = _finite(seen)
+        base = now if base is None else base
         for v in last:
             end = _finite(v.get("end_ts"))
             if end is None:
-                end = (seen if seen is not None else now) + HAZARD_NO_END_HOLD_SEC
+                end = base + HAZARD_NO_END_HOLD_SEC
+            end = min(end, base + HAZARD_UNSEEN_RELEASE_SEC)
             if now < end:
                 held.append(dict(v, source="latched"))
         return held

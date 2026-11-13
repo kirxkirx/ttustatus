@@ -233,8 +233,10 @@ def test_settings_from_the_environment():
     # itself): a two-hour poll interval gives the two hours allowed, raised to "one
     # interval plus two minutes", and only that is reported
     rare = _config_with(TTU_SAFETY_GLM_POLL_INTERVAL="7200")
-    assert rare["glm_age"] == 122 and len(rare["warnings"]) == 1
-    assert "shorter than one GLM poll interval" in rare["warnings"][0]
+    assert rare["glm_age"] == 122 and len(rare["warnings"]) == 2
+    assert "DEW_GLM_MAX_AGE_MIN=120 is shorter than one GLM poll interval" in rare["warnings"][1]
+    # (the other: the GLM layer's own staleness limit, raised the same way)
+    assert "TTU_SAFETY_GLM_STALE_SEC=900 is shorter than one GLM poll" in rare["warnings"][0]
     negative = _config_with(TTU_SAFETY_GLM_POLL_INTERVAL="-600")
     assert negative["glm_age"] == 1 and negative["warnings"] == []
     assert _config_with(TTU_SAFETY_GLM_POLL_INTERVAL="-600",
@@ -993,7 +995,9 @@ def test_an_odd_rain_rate_still_counts_as_rain(monkeypatch):
     monkeypatch.setattr(wu_poll, "_get_json",
                         lambda url, timeout=None: _wu_reply(precipRate="abc"))
     res = wu_poll.poll_stations(["X", "Y"])          # unreadable: that station only
-    assert res["live"] == 0 and [r["state"] for r in res["results"]] == ["offline"] * 2
+    # (a 200 reply without a readable rate is a "bad-reply" since the WU error
+    # classification; like "offline" it counts toward the dead-station backoff)
+    assert res["live"] == 0 and [r["state"] for r in res["results"]] == ["bad-reply"] * 2
 
 
 def test_an_absurd_number_from_one_station_does_not_abort_the_whole_rain_poll(monkeypatch):

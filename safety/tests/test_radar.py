@@ -641,7 +641,7 @@ def _xy(t, lat, lon):
 
 
 def _count(img, rgb):
-    return sum(1 for p in img.getdata() if p == tuple(rgb))
+    return sum(1 for p in rd._pixels(img) if p == tuple(rgb))
 
 
 def _near(img, xy, rgb, r=1):
