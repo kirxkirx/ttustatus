@@ -1,8 +1,9 @@
 """MRMS radar component for the SafetyMonitor — a simple 30 km "any rain" ring.
 
-Every poll (DAY AND NIGHT — free data, and daytime rain matters for the roof) it fetches
-the latest MRMS composite-reflectivity frame
-from the Iowa Environmental Mesonet (free, no key), and:
+Every poll (DAY AND NIGHT — free data, and daytime rain matters for the roof) it reads
+the newest MRMS SeamlessHSR frame (every US weather radar's lowest unblocked beam, fused
+on a 0.01 deg CONUS grid every 2 min) from whichever of its two free, key-less sources
+has the newer one, and:
   * CHECK: declares unsafe if any echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of the dome.
     Deliberately simple — no upwind/downwind logic, just a plain radius.
   * THUMBNAIL: renders a TTU-centered map with the radar overlaid, the trigger ring, and
@@ -13,18 +14,31 @@ from the Iowa Environmental Mesonet (free, no key), and:
     background — see the basemap block in config.py. The component reports which source
     each map uses, and the attribution line follows it.
 
+FRAME SOURCES (the "frame sources" block below): NOAA's Open Data bucket on AWS has
+MRMS's own GRIB2 file about 1 min after the frame time; the Iowa Environmental Mesonet has
+the same grid as an indexed PNG ("lcref") about 5.5 min after. Each poll asks both what
+they have, reads the NEWEST frame, and falls back to the other when that one cannot be
+had; the two failed at different times over the 120 days measured. A frame counts once,
+whichever source delivered it, and is fresh by its OWN time (RADAR_STALE_AFTER_SEC): a
+stalled feed that keeps offering the same frame neither confirms an echo with it nor
+keeps it current. A poll that gets no new frame is retried after RADAR_RETRY_SEC. A reply
+whose Date header disagrees with this host's clock by more than SERVER_CLOCK_TOL_SEC is
+refused: both archives keep years of frames, so a wrong boot clock would otherwise fetch
+that date's weather and read it as current.
+
 A single frame never vetoes: an in-ring echo must repeat on RADAR_TRIGGER_AFTER (2)
-CONSECUTIVE polls before it counts, because MRMS composites occasionally carry a
+CONSECUTIVE frames before it counts, because MRMS composites occasionally carry a
 one-frame artefact (aircraft, anomalous propagation, clutter). The first, unconfirmed
-frame is reported honestly — neither "rain" nor "no rain" — and starts no freeze.
+frame is reported honestly — neither "rain" nor "no rain" — and starts no freeze. Frames
+either side of a gap longer than RADAR_STALE_AFTER_SEC are not consecutive.
 
 Live check: unsafe while rain is within the ring, and for RADAR_LATCH_SEC (15 min) after
 the LAST in-ring detection — a post-rain freeze that clear frames do NOT cancel, so the
 roof does not reopen the instant a cell's edge leaves the ring, and a blind feed cannot
 drop the veto either. The radar does NOT rely on the WU latch, which only arms when rain
-reaches a nearby station, not for a ranged echo. Fail-safe: a fetch error or stale frame
-with no recent detection => unavailable (no veto on its own). Needs Pillow; absent =>
-radar disabled.
+reaches a nearby station, not for a ranged echo. Fail-safe: no frame younger than
+RADAR_STALE_AFTER_SEC and no recent detection => unavailable (no veto on its own). Needs
+Pillow; absent => radar disabled.
 
 HAZARD OVERLAYS (display only): the thumbnails also show whatever the NWS-alerts and
 hazard-feeds pollers hand over through RadarPoller(overlay_sources=[...overlays]) — drawn
@@ -38,20 +52,25 @@ overlay on the map the PNG is pixel-identical to the pre-hazards thumbnail.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
+import http.client
 import io
 import json
 import logging
 import math
 import os
 import re
+import struct
 import threading
 import time
 import types
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+import zlib
+from datetime import datetime, timezone
+from fractions import Fraction
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageStat
@@ -59,6 +78,7 @@ except Exception:                       # pragma: no cover - optional dep
     Image = ImageChops = ImageDraw = ImageFont = ImageStat = None
 
 from . import config as _config
+from . import servertime
 
 log = logging.getLogger("ttu.safety.radar")
 
@@ -137,23 +157,427 @@ def _dbz(idx):
     return None if idx == 255 else -32.0 + idx * 0.5
 
 
-# ---- radar fetch + in-ring check --------------------------------------------
-def latest_frame(max_back=8):
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    if now.minute % 2:
-        now -= timedelta(minutes=1)
-    for i in range(max_back):
-        ts = now - timedelta(minutes=2 * i)
+# ---- frame sources: one MRMS product, two archives ----------------------------
+# IEM's lcref PNG IS MRMS's SeamlessHSR_00.00 on the same grid (GRID_W x GRID_H cells of
+# PX deg from UL_LAT / UL_LON), written as palette indices floor((dBZ + 32) * 2), with 0
+# for "no echo" and "no radar coverage" alike: the bucket's GRIB2 file of 2026-11-11
+# 01:22Z converted by aws_image() equals IEM's PNG of that time in all 24.5 M cells. So
+# check_rain and the maps read either source's frame the same way.
+# Measured over 2026-07-13..11-10: the bucket has a file ~1 min after its time, IEM ~5.5
+# min after. They failed at different times: IEM stalled for 40-70 min on 07-25, 08-05
+# and 10-09 while the bucket had every file within ~1.5 min; the bucket fell 25-60 min
+# behind (or lost files) on 09-11, 10-07 and 11-10 while IEM was on time. IEM's own GRIB2
+# mirror stalled together with its lcref frames on 10-09, so it is not a third source.
+AWS_PRODUCT = "SeamlessHSR_00.00"
+AWS_PRODUCT_ID = (209, 8, 8)    # its GRIB2 discipline (MRMS's local 209), category, number
+SOURCES = ("aws", "iem")
+SOURCE_NAMES = {"aws": "NOAA Open Data (AWS)", "iem": "IEM"}
+SOURCE_SHORT = {"aws": "AWS", "iem": "IEM"}
+FRAME_STEP = 120                # s between MRMS frames
+SAME_FRAME_S = 60               # frame times closer than this are one frame, whoever sent it
+IEM_FIRST_PROBE_BACK = 240      # s: IEM writes a frame ~5.5 min after its time
+META_TIMEOUT = 10               # s per HEAD or listing request
+FRAME_TIMEOUT = 30              # s per frame download
+LOOKUP_BUDGET = 30              # s for one source's lookup: a slow one cannot starve the
+#                                 other's lookup or the downloads
+POLL_DEADLINE = 120             # s: no radar request of a poll starts later than this
+MIN_TIMEOUT = 3                 # s: floor of a timeout shortened by the poll's deadline
+LISTING_MAX_BYTES = 1 << 20     # an hour's listing is ~11 KB
+FRAME_MAX_BYTES = 32 << 20      # a frame is ~0.6 (IEM) or ~1 MB (AWS); more is no frame
+GRIB_TIME_TOL = 1               # s: a GRIB2 file's own time against its name's
+FRAME_BOX_MARGIN_DEG = 0.05     # around the cells the ring check and the maps read
+_mono = time.monotonic          # the poll's deadline clock (tests replace it)
+
+
+class SourceError(Exception):
+    """A source gave no usable frame this poll; the text says why (shown on the page)."""
+
+
+class FrameError(SourceError):
+    """A downloaded frame that is not what it should be: never read, never guessed at."""
+
+
+class ClockMismatch(SourceError):
+    """A reply whose Date disagrees with this host's clock beyond SERVER_CLOCK_TOL_SEC."""
+
+    def __init__(self, skew):
+        self.skew = skew
+        super().__init__(servertime.clock_phrase(skew))
+
+
+def clock_tolerance(cfg) -> float:
+    """SERVER_CLOCK_TOL_SEC as a number of seconds; 0 switches the wrong-clock guard off."""
+    try:
+        v = float(getattr(cfg, "SERVER_CLOCK_TOL_SEC", 60))
+    except (TypeError, ValueError):
+        v = 60.0
+    return v if v > 0 and math.isfinite(v) else 0.0
+
+
+def _future_tolerance(cfg) -> float:
+    """How far a frame's time may lie ahead of this host's clock and still be read as now
+    (the clock may be off by up to the guard's tolerance without being refused)."""
+    return max(60.0, clock_tolerance(cfg))
+
+
+def _utc(ts):
+    return datetime.fromtimestamp(ts, timezone.utc)
+
+
+def _hhmm(ts):
+    return _utc(ts).strftime("%H:%MZ")
+
+
+def _even_floor(t):
+    """The latest even UTC minute at or before ``t`` (epoch s): MRMS's frame times."""
+    m = int(t) - int(t) % 60
+    return m - 60 if (m // 60) % 2 else m
+
+
+def _errtext(e) -> str:
+    """A short reason: a URLError's own reason, else the text or the class name."""
+    r = getattr(e, "reason", None)
+    return str(r if r is not None else e) or type(e).__name__
+
+
+def _http(url, method="GET", timeout=META_TIMEOUT, max_bytes=None):
+    """One request: ``(status, headers, body, received)``, ``received`` being this host's
+    clock when the reply's headers arrived — what the reply's Date is compared with (a
+    slow body must not read as a wrong clock). An HTTP error status comes back like a
+    success (its headers carry the server's Date as well); no answer at all raises
+    (URLError, OSError, HTTPException). The seam the tests replace (they may return the
+    first three only)."""
+    req = urllib.request.Request(url, headers=dict(UA), method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            received = time.time()
+            body = b""
+            if method != "HEAD":
+                body = r.read(-1 if max_bytes is None else max_bytes + 1)
+            return (getattr(r, "status", None) or 200), r.headers, body, received
+    except urllib.error.HTTPError as e:
+        received = time.time()
+        headers = e.headers
         try:
-            req = urllib.request.Request(ts.strftime(ARCHIVE), method="HEAD", headers=UA)
-            with urllib.request.urlopen(req, timeout=15) as r:
-                if r.status == 200:
-                    return ts, ts.strftime(ARCHIVE)
-        except Exception:
-            continue
-    return None, None
+            e.close()
+        except Exception:               # noqa: BLE001 - closing a failed reply
+            pass
+        return e.code, headers, b"", received
 
 
+class _PollNet:
+    """The requests of one poll: a deadline (and a budget per source lookup, so a slow
+    source cannot starve the other or the downloads), the hosts that did not answer (asked
+    nothing more this poll, so a dead host costs one timeout, not one per frame probed)
+    and the server clocks the replies carried (the wrong-clock guard)."""
+
+    def __init__(self, cfg):
+        self.deadline = _mono() + POLL_DEADLINE
+        self.phase_end = None   # the current lookup's budget (phase), None: the deadline
+        self.tol = clock_tolerance(cfg)
+        self.down = {}          # host -> why it is asked nothing more this poll
+        self.skews = []         # (source, server minus this host's clock in s) per reply
+
+    def phase(self, seconds):
+        """The requests that follow get at most ``seconds`` in all (None: the poll's
+        deadline only)."""
+        self.phase_end = None if seconds is None else _mono() + seconds
+
+    def request(self, source, url, method="GET", timeout=META_TIMEOUT, max_bytes=None):
+        """``(status, body)`` of a reply whose Date agrees with this host's clock.
+        SourceError for no answer, a host that failed earlier this poll or a spent
+        budget; ClockMismatch for a Date beyond the tolerance; FrameError for a body
+        larger than ``max_bytes``."""
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if host in self.down:
+            raise SourceError(self.down[host])
+        now = _mono()
+        if self.deadline - now <= 0:
+            raise SourceError("no time left in this poll (%d s)" % POLL_DEADLINE)
+        left = self.deadline - now
+        if self.phase_end is not None:
+            if self.phase_end - now <= 0:
+                raise SourceError("the lookup took longer than %d s" % LOOKUP_BUDGET)
+            left = min(left, self.phase_end - now)
+        try:
+            reply = _http(url, method, max(MIN_TIMEOUT, min(timeout, left)), max_bytes)
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+            why = "%s: no answer (%s)" % (host or "server", _errtext(e))
+            self.down[host] = why
+            raise SourceError(why) from e
+        status, headers, body = reply[0], reply[1], reply[2]
+        skew = servertime.skew_s(headers, reply[3] if len(reply) > 3 else None)
+        if skew is not None:
+            self.skews.append((source, skew))
+            if self.tol and abs(skew) > self.tol:
+                raise ClockMismatch(skew)
+        if max_bytes is not None and len(body) > max_bytes:
+            raise FrameError("reply larger than %d MB" % max(1, max_bytes >> 20))
+        return status, body
+
+
+def iem_url(ts):
+    return _utc(ts).strftime(ARCHIVE)
+
+
+def iem_newest(cfg, net, now):
+    """IEM's newest lcref frame of the last RADAR_STALE_AFTER_SEC: ``(epoch, url)`` or
+    None. HEADs newest first from IEM_FIRST_PROBE_BACK before now (IEM's ~5.5 min lag:
+    the newer ones are never there yet); a 404 walks on, any other answer ends the walk
+    with SourceError, and a host that does not answer is asked nothing more (_PollNet)."""
+    ts = _even_floor(now - IEM_FIRST_PROBE_BACK)
+    oldest = now - cfg.RADAR_STALE_AFTER_SEC
+    while ts >= oldest:
+        url = iem_url(ts)
+        status, _ = net.request("iem", url, method="HEAD")
+        if 200 <= status < 300:
+            return ts, url
+        if status != 404:
+            raise SourceError("HTTP %d for the frame of %s" % (status, _hhmm(ts)))
+        ts -= FRAME_STEP
+    return None
+
+
+_AWS_KEY_RE = re.compile(r"<Key>([^<]+)</Key>")
+_AWS_TIME_RE = re.compile(r"_(\d{8})-(\d{6})\.grib2\.gz$")
+
+
+def _aws_listing_url(base, hour):
+    d = _utc(hour)
+    prefix = "CONUS/%s/%s/MRMS_%s_%s" % (AWS_PRODUCT, d.strftime("%Y%m%d"), AWS_PRODUCT,
+                                         d.strftime("%Y%m%d-%H"))
+    return "%s/?list-type=2&prefix=%s" % (base, urllib.parse.quote(prefix, safe="/"))
+
+
+def aws_newest(cfg, net, now):
+    """The bucket's newest SeamlessHSR file of the last RADAR_STALE_AFTER_SEC: ``(epoch,
+    url)`` or None. Lists the current UTC hour (~11 KB), and the hour before it while the
+    window reaches into that one and the current hour has nothing yet."""
+    base = str(cfg.RADAR_AWS_URL).rstrip("/")
+    oldest = now - cfg.RADAR_STALE_AFTER_SEC
+    latest = now + _future_tolerance(cfg)
+    hour = int(now) - int(now) % 3600
+    for h in (hour, hour - 3600):
+        if h + 3600 <= oldest:
+            break
+        status, body = net.request("aws", _aws_listing_url(base, h),
+                                   max_bytes=LISTING_MAX_BYTES)
+        if status != 200:
+            raise SourceError("HTTP %d for the listing of %s" % (status, _utc(h).strftime("%HZ")))
+        best = None
+        for key in _AWS_KEY_RE.findall(body.decode("utf-8", "replace")):
+            m = _AWS_TIME_RE.search(key)
+            if not m:
+                continue
+            try:
+                kt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(
+                    tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+            if oldest <= kt <= latest and (best is None or kt > best[0]):
+                best = (kt, "%s/%s" % (base, urllib.parse.quote(key, safe="/")))
+        if best is not None:
+            return best
+    return None
+
+
+def newest_frame(source, cfg, net, now):
+    """``(epoch, url)`` of the newest frame ``source`` has, None, or SourceError."""
+    return (aws_newest if source == "aws" else iem_newest)(cfg, net, now)
+
+
+# ---- MRMS GRIB2 (the bucket's files) -------------------------------------------
+# After vlbaweather's vlba/mrms.py: only what MRMS writes is read (a regular lat/lon grid,
+# template 3.0, of PNG-packed values, template 5.41, without a bitmap); anything else is
+# an error, never a guess. Decoding needs Pillow only.
+def _sint(b) -> int:
+    """A GRIB2 signed integer (sign and magnitude, not two's complement)."""
+    v = int.from_bytes(b, "big")
+    top = 1 << (8 * len(b) - 1)
+    return -(v & (top - 1)) if v & top else v
+
+
+def parse_grib2(raw):
+    """The reference time, the product, the grid, the packing and the PNG payload of the
+    first field of a GRIB2 message: ``{"ts", "discipline", "parameter": (category,
+    number) | None, "grid": {"ni", "nj", "la1", "lo1", "di", "dj", "scan"}, "drs": {"R",
+    "E", "D", "nbits"}, "payload"}``. ValueError for anything else."""
+    if len(raw) < 16 or raw[:4] != b"GRIB" or raw[7] != 2:
+        raise ValueError("not a GRIB2 message")
+    total = int.from_bytes(raw[8:16], "big")
+    if total > len(raw):
+        raise ValueError("GRIB2 message truncated (%d of %d bytes)" % (len(raw), total))
+    out = {"discipline": raw[6], "parameter": None}
+    pos = 16
+    while pos + 5 <= total and raw[pos:pos + 4] != b"7777":
+        ln = int.from_bytes(raw[pos:pos + 4], "big")
+        num = raw[pos + 4]
+        if ln < 5 or pos + ln > total:
+            raise ValueError("GRIB2 section %d has a bad length (%d)" % (num, ln))
+        sec = raw[pos:pos + ln]
+        if num == 1 and ln >= 19:
+            try:
+                out["ts"] = datetime(int.from_bytes(sec[12:14], "big"), sec[14], sec[15],
+                                     sec[16], sec[17], sec[18], tzinfo=timezone.utc)
+            except ValueError:
+                out["ts"] = None
+        elif num == 4 and ln >= 11:
+            out["parameter"] = (sec[9], sec[10])
+        elif num == 3:
+            tmpl = int.from_bytes(sec[12:14], "big")
+            if tmpl != 0 or ln < 72:
+                raise ValueError("grid template 3.%d (only 3.0, regular lat/lon, is read)"
+                                 % tmpl)
+            basic, sub = int.from_bytes(sec[38:42], "big"), int.from_bytes(sec[42:46], "big")
+            unit = (1e-6 if basic in (0, 0xFFFFFFFF) or sub in (0, 0xFFFFFFFF)
+                    else basic / float(sub))
+            out["grid"] = {"ni": int.from_bytes(sec[30:34], "big"),
+                           "nj": int.from_bytes(sec[34:38], "big"),
+                           "la1": _sint(sec[46:50]) * unit, "lo1": _sint(sec[50:54]) * unit,
+                           "di": int.from_bytes(sec[63:67], "big") * unit,
+                           "dj": int.from_bytes(sec[67:71], "big") * unit, "scan": sec[71]}
+        elif num == 5:
+            tmpl = int.from_bytes(sec[9:11], "big")
+            if tmpl != 41 or ln < 21:
+                raise ValueError("data template 5.%d (only 5.41, PNG, is read)" % tmpl)
+            out["drs"] = {"R": struct.unpack(">f", sec[11:15])[0], "E": _sint(sec[15:17]),
+                          "D": _sint(sec[17:19]), "nbits": sec[19]}
+        elif num == 6:
+            if ln < 6 or sec[5] != 255:
+                raise ValueError("a bitmap (only fields without one are read)")
+        elif num == 7:
+            out["payload"] = bytes(sec[5:])
+            break                       # the first field is all MRMS writes
+        pos += ln
+    missing = [k for k in ("grid", "drs", "payload") if k not in out]
+    if missing:
+        raise ValueError("GRIB2 message without %s" % ", ".join(missing))
+    out.setdefault("ts", None)
+    return out
+
+
+def lcref_index(drs):
+    """raw packed value -> the lcref palette index of its reflectivity, EXACTLY: floor((dBZ
+    + 32) * 2) clipped to 0..254, dBZ = (R + raw * 2**E) / 10**D (rational arithmetic, so no
+    rounding error can move a value across an index). Below -32 dBZ, MRMS's "no echo"
+    (-99) and "no coverage" (-999) all give 0, as in lcref; 255 is lcref's "no data" and
+    is never written (a value beyond 95 dBZ reads as the strongest echo)."""
+    r = Fraction(drs["R"])
+    scale = Fraction(2) ** int(drs["E"])
+    div = Fraction(10) ** int(drs["D"])
+    table = {}
+
+    def index(raw):
+        v = table.get(raw)
+        if v is None:
+            v = math.floor(((r + raw * scale) / div + 32) * 2)
+            v = 0 if v < 0 else (254 if v > 254 else int(v))
+            table[raw] = v
+        return v
+    return index
+
+
+def aws_image(data, ts, box):
+    """The bucket's SeamlessHSR file of time ``ts`` as an lcref image: an "L" image on the
+    full lcref grid holding lcref's palette indices inside ``box`` (frame_box: the cells
+    the ring check and the maps read) and 0, "no echo", elsewhere — so the 98 MB the
+    decoded grid takes is held only for the moment of the crop. The file must be MRMS's
+    SeamlessHSR (AWS_PRODUCT_ID), of the time its name gives (GRIB_TIME_TOL) and on
+    lcref's grid; anything else is a FrameError."""
+    try:
+        raw = gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data
+        meta = parse_grib2(raw)
+    except (OSError, EOFError, ValueError, zlib.error, struct.error, IndexError) as e:
+        raise FrameError("unreadable GRIB2 (%s)" % _errtext(e)) from e
+    got = (meta["discipline"],) + tuple(meta["parameter"] or (None, None))
+    if got != AWS_PRODUCT_ID:
+        raise FrameError("not MRMS's %s (GRIB2 discipline %s, parameter %s.%s)"
+                         % ((AWS_PRODUCT,) + got))
+    drs = meta["drs"]
+    if not (math.isfinite(drs["R"]) and abs(drs["E"]) <= 64 and abs(drs["D"]) <= 20):
+        raise FrameError("packing R=%r E=%r D=%r is no reflectivity's"
+                         % (drs["R"], drs["E"], drs["D"]))
+    own = meta["ts"]
+    if own is None or abs(own.timestamp() - ts) > GRIB_TIME_TOL:
+        raise FrameError("the file of %s holds the data of %s" % (
+            _hhmm(ts), own.strftime("%Y-%m-%d %H:%M:%SZ") if own else "an unknown time"))
+    g = meta["grid"]
+    lo1 = g["lo1"] - 360.0 if g["lo1"] > 180.0 else g["lo1"]
+    if ((g["ni"], g["nj"], g["scan"]) != (GRID_W, GRID_H, 0)
+            or abs(g["la1"] - UL_LAT) > 1e-4 or abs(lo1 - UL_LON) > 1e-4
+            or abs(g["di"] - PX) > 1e-6 or abs(g["dj"] - PX) > 1e-6):
+        raise FrameError("grid of %dx%d cells of %gx%g deg from %.3f, %.3f, scan 0x%02x "
+                         "(not lcref's)" % (g["ni"], g["nj"], g["di"], g["dj"], g["la1"],
+                                            lo1, g["scan"]))
+    try:
+        im = Image.open(io.BytesIO(meta["payload"]))
+        if im.format != "PNG":
+            raise ValueError("payload is %s, not PNG" % im.format)
+        im.load()
+    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
+        raise FrameError("unreadable PNG payload (%s)" % _errtext(e)) from e
+    if im.size != (GRID_W, GRID_H) or im.mode not in ("I", "I;16", "I;16B", "I;16L", "L"):
+        raise FrameError("PNG payload of %dx%d in mode %s" % (im.size + (im.mode,)))
+    c0, r0, c1, r1 = box
+    crop = im.crop((c0, r0, c1, r1))
+    del im                              # the 98 MB grid goes here, before the 24.5 MB one
+    try:
+        index = lcref_index(drs)
+        cells = bytes(map(index, crop.getdata())) if crop.size[0] and crop.size[1] else b""
+    except (ArithmeticError, ValueError, TypeError) as e:
+        raise FrameError("values not convertible (%s)" % _errtext(e)) from e
+    out = Image.new("L", (GRID_W, GRID_H), 0)
+    if cells:
+        out.paste(Image.frombytes("L", crop.size, cells), (c0, r0))
+    return out
+
+
+def lcref_image(data):
+    """IEM's lcref PNG, checked: palette indices on the full lcref grid."""
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception as e:              # noqa: BLE001 - Pillow raises many kinds for bad bytes
+        raise FrameError("unreadable PNG (%s)" % _errtext(e)) from e
+    if img.mode not in ("P", "L") or img.size != (GRID_W, GRID_H):
+        raise FrameError("PNG of %dx%d in mode %s (lcref is %dx%d palette indices)"
+                         % (img.size + (img.mode, GRID_W, GRID_H)))
+    return img
+
+
+def fetch_frame(cfg, net, source, url, ts, box):
+    """The frame at ``url`` as an image of lcref palette indices: IEM's PNG as it is, the
+    bucket's GRIB2 converted (aws_image). SourceError / FrameError when it cannot be."""
+    status, body = net.request(source, url, timeout=FRAME_TIMEOUT, max_bytes=FRAME_MAX_BYTES)
+    if status != 200:
+        raise SourceError("HTTP %d for the frame of %s" % (status, _hhmm(ts)))
+    return aws_image(body, ts, box) if source == "aws" else lcref_image(body)
+
+
+def frame_box(cfg, thumbs=()):
+    """The grid cells ``(c0, r0, c1, r1)`` (c1, r1 exclusive) the ring check and the maps
+    read: the trigger ring around the site, the map region (RADAR_THUMB_HALF_DEG) and the
+    region of every map already built (a map drawn before a GPS position was adopted reads
+    its old region until it is rebuilt), plus FRAME_BOX_MARGIN_DEG."""
+    lat0, lon0 = cfg.GEOCODE
+    dlat = cfg.RADAR_TRIGGER_KM / 111.0
+    dlon = cfg.RADAR_TRIGGER_KM / (111.0 * max(0.05, math.cos(math.radians(lat0))))
+    boxes = [(lat0 - dlat, lat0 + dlat, lon0 - dlon, lon0 + dlon), _region(cfg)]
+    for t in thumbs:
+        tb = getattr(t, "_tilebox", None)
+        if tb:
+            gx0, gy0, gx1, gy1, z = tb
+            latmax, lonmin = _num2deg(gx0 / 256.0, gy0 / 256.0, z)
+            latmin, lonmax = _num2deg(gx1 / 256.0, gy1 / 256.0, z)
+            boxes.append((latmin, latmax, lonmin, lonmax))
+    m = FRAME_BOX_MARGIN_DEG
+    c0, r0 = latlon_to_px(max(b[1] for b in boxes) + m, min(b[2] for b in boxes) - m)
+    c1, r1 = latlon_to_px(min(b[0] for b in boxes) - m, max(b[3] for b in boxes) + m)
+    return (max(0, min(GRID_W, c0)), max(0, min(GRID_H, r0)),
+            max(0, min(GRID_W, c1 + 1)), max(0, min(GRID_H, r1 + 1)))
+
+
+# ---- in-ring check ------------------------------------------------------------
 def check_rain(cfg, img):
     """Scan the radar grid within RADAR_TRIGGER_KM of the dome. Returns (in_ring, nearest_km,
     count) — nearest_km is the closest echo >= RADAR_DBZ, or None if the ring is clear."""
@@ -1695,12 +2119,21 @@ class Thumbnailer:
 
 
 # ---- what the basemap is: attribution, notes, warnings, one-line summary ---------------
-def basemap_attribution(cfg, used):
+def radar_credit(cfg, frame_source=None):
+    """The radar-data credit: RADAR_ATTRIBUTION, plus the archive the frame in use came
+    from ("Radar: NOAA/NSSL MRMS via IEM"); without a frame yet, no archive is named."""
+    credit = str(getattr(cfg, "RADAR_ATTRIBUTION", _config.RADAR_ATTRIBUTION))
+    via = SOURCE_NAMES.get(frame_source)
+    return credit + (" via " + via if via else "")
+
+
+def basemap_attribution(cfg, used, frame_source=None):
     """The map's credit line, from the sources actually drawn. ``used`` = [(source,
     tile_url)] of the maps. Any CARTO map -> "© OpenStreetMap contributors, © CARTO"
     (CARTO's required line, which covers OSM too); OSM alone -> "© OpenStreetMap
     contributors"; a custom source is credited by its host (cartocdn / openstreetmap
-    hosts as above); nothing drawn -> the radar credit alone."""
+    hosts as above); nothing drawn -> the radar credit alone (radar_credit, naming the
+    archive of ``frame_source``)."""
     carto = osm = False
     hosts = []
     for src, url in used:
@@ -1721,7 +2154,7 @@ def basemap_attribution(cfg, used):
                 hosts.append(host)
     parts = [CARTO_CREDIT] if carto else ([OSM_CREDIT] if osm else [])
     parts += ["Map tiles: %s" % h for h in hosts]
-    parts.append(str(getattr(cfg, "RADAR_ATTRIBUTION", _config.RADAR_ATTRIBUTION)))
+    parts.append(radar_credit(cfg, frame_source))
     return " · ".join(parts)
 
 
@@ -1929,10 +2362,26 @@ class RadarPoller:
             if cfg.RADAR_DAY_ENABLED:
                 self._thumbs.append(Thumbnailer(cfg, cfg.RADAR_TILE_URL_DAY,
                                                 cfg.RADAR_THUMB_PATH_DAY, "light"))
-        self._last_ok_ts = None
         self._last_poll_ts = None
+        # the next poll comes RADAR_POLL_INTERVAL after a new frame, RADAR_RETRY_SEC after
+        # a poll that got none
+        self._poll_every = cfg.RADAR_POLL_INTERVAL
+        srcs = tuple(s for s in getattr(cfg, "RADAR_SOURCES", SOURCES) if s in SOURCES)
+        self._sources = srcs or SOURCES
+        # The frame held (checked, and drawn on the maps): its own time (epoch s) and the
+        # archive it came from. Fresh while younger than RADAR_STALE_AFTER_SEC BY ITS OWN
+        # TIME — not by when it was fetched, so a stalled feed cannot keep it current.
+        self._frame_ts = None
+        self._frame_source = None
+        # the time of the last frame counted in the streak: a frame counts once, whichever
+        # source delivered it and however often it is offered again
+        self._counted_ts = None
+        self._source_state = {}        # source -> what the last poll learnt of it
+        self._why = None               # why the last poll got no new frame (None: it did)
+        self._clock_ok = None          # the wrong-clock guard's last verdict (None: none yet)
+        self._clock_skew = None        # server minus this host's clock, s
         self._in_ring = False
-        self._ring_streak = 0          # consecutive polls with an in-ring echo
+        self._ring_streak = 0          # consecutive frames with an in-ring echo
         self._trigger_after = max(1, int(getattr(cfg, "RADAR_TRIGGER_AFTER", 2)))
         self._nearest_km = None
         self._count = 0
@@ -1977,6 +2426,9 @@ class RadarPoller:
             now = time.time()
         with self._lock:
             self._last_poll_ts = now
+            # the regular interval; a poll that gets no new frame shortens it
+            # (_no_new_frame) until one does
+            self._poll_every = self.cfg.RADAR_POLL_INTERVAL
         if not deps_available():
             return {"ok": False, "error": "pillow not installed"}
         if not site_in_coverage(*self.cfg.GEOCODE):
@@ -1987,60 +2439,175 @@ class RadarPoller:
                 self.log.record("CONFIG", reason="site outside MRMS coverage",
                                 result="radar layer disabled")
             return {"ok": False, "error": "site outside MRMS coverage"}
-        ts, url = latest_frame()
-        if not ts:
-            log.warning("no recent MRMS frame")
-            return {"ok": False, "error": "no frame"}
-        try:
-            img = Image.open(io.BytesIO(_get(url)))
-            img.load()
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            log.warning("radar fetch failed: %s", e)
-            return {"ok": False, "error": str(e)}
+        net = _PollNet(self.cfg)
+        with self._lock:
+            held = self._frame_ts
+        # 1. What each source has: the bucket's listing, IEM's newest frame (a HEAD or
+        # two). Both are asked every poll, so the page always shows whether the backup
+        # works, not only when it is needed.
+        states, found = {}, {}
+        for src in self._sources:
+            st = {"newest_ts": None, "error": None, "checked_ts": now}
+            net.phase(LOOKUP_BUDGET)
+            try:
+                got = newest_frame(src, self.cfg, net, now)
+            except SourceError as e:
+                st["error"] = str(e)
+            except Exception as e:      # noqa: BLE001 - one source's surprise never costs
+                log.exception("radar source %s lookup failed", src)   # the other its turn
+                st["error"] = "unexpected error (%s: %s)" % (type(e).__name__, e)
+            else:
+                if got is None:
+                    st["error"] = ("no frame in the last %d min"
+                                   % (self.cfg.RADAR_STALE_AFTER_SEC // 60))
+                else:
+                    st["newest_ts"] = got[0]
+                    found[src] = got
+            states[src] = st
+        # 2. The newest frame newer than the one held; failing that, the other source's.
+        # The same frame from both: IEM's (a smaller download, a lighter decode). Frame
+        # times less than SAME_FRAME_S apart are one frame (both archives name MRMS's
+        # even minutes, but nothing else may make one frame count twice).
+        cands = sorted(((ts, src, url) for src, (ts, url) in found.items()
+                        if held is None or ts - held >= SAME_FRAME_S),
+                       key=lambda c: (-c[0], c[1] != "iem"))
+        box = frame_box(self.cfg, self._thumbs)
+        net.phase(None)                 # the downloads: what is left of the poll's deadline
+        img = used = None
+        for ts, src, url in cands:
+            try:
+                img = fetch_frame(self.cfg, net, src, url, ts, box)
+            except Exception as e:      # noqa: BLE001 - a bad frame never blocks the other
+                if not isinstance(e, SourceError):
+                    log.exception("radar frame %s from %s: unexpected error", _hhmm(ts), src)
+                    e = "unexpected error (%s: %s)" % (type(e).__name__, e)
+                states[src]["error"] = "frame %s: %s" % (_hhmm(ts), e)
+                log.warning("radar frame %s from %s unusable: %s", _hhmm(ts),
+                            SOURCE_NAMES[src], e)
+                img = None
+                continue
+            used = (ts, src)
+            break
+        self._note_clock(net)
+        if img is None:
+            return self._no_new_frame(now, held, states, bool(cands))
+        ts, src = used
         in_ring, nearest, count = check_rain(self.cfg, img)
-        frame_txt = "MRMS " + ts.strftime("%Y-%m-%d %H:%MZ")
+        frame_txt = "MRMS %s · %s" % (_utc(ts).strftime("%Y-%m-%d %H:%MZ"), SOURCE_SHORT[src])
         # render every configured map (dark + optional light); primary = the first (dark)
         overlays = self._collect_overlays(now)
         sig = overlay_signature(self.cfg, overlays)
         results = [t.render(img, frame_txt, overlays) for t in self._thumbs]
+        img = None                      # the 24.5 MB grid is not kept between polls
         thumb_ok = bool(results and results[0])
         with self._lock:
             # a failed write leaves the old overlays on disk: None forces a redraw next pass
             self._drawn_sig = sig if (results and all(results)) else None
-            self._last_ok_ts = now
-            self._frame_utc = ts.isoformat()
+            prev_src = self._frame_source
+            self._frame_ts, self._frame_source = ts, src
+            self._frame_utc = _utc(ts).isoformat()
+            self._source_state = states
+            self._why = None
             self._in_ring = in_ring
             self._nearest_km = nearest
             self._count = count
             self._thumb_ok = thumb_ok
             # Consecutive-frame confirmation: one frame is an observation, N in a row are
-            # weather. A clear frame resets the count; a FAILED fetch does not (we return
-            # earlier, so a gap in the data never counts as "clear").
-            self._ring_streak = (self._ring_streak + 1) if in_ring else 0
-            confirmed = in_ring and self._ring_streak >= self._trigger_after
+            # weather. A clear frame resets the count; a poll without a new frame does not
+            # touch it (a gap in the data never counts as "clear"). A frame counts ONCE:
+            # one offered again — a stalled feed, the redraw after a clock step — is no new
+            # observation, so a one-frame artefact can never confirm itself. Frames either
+            # side of an outage longer than RADAR_STALE_AFTER_SEC are not consecutive.
+            repeat = self._counted_ts is not None and ts - self._counted_ts < SAME_FRAME_S
+            if not repeat:
+                if (self._counted_ts is not None
+                        and ts - self._counted_ts > self.cfg.RADAR_STALE_AFTER_SEC):
+                    self._ring_streak = 0
+                self._ring_streak = (self._ring_streak + 1) if in_ring else 0
+                self._counted_ts = ts
+            streak = self._ring_streak
+            confirmed = not repeat and in_ring and streak >= self._trigger_after
             if confirmed:
                 # the freeze starts only on a CONFIRMED detection, so a one-frame artefact
                 # cannot hold the veto for the whole post-rain freeze window
                 self._last_rain_ts = now
                 self._save_rain_ts()
+        if prev_src is not None and src != prev_src:
+            other = states.get(prev_src) or {}
+            why = other.get("error") or ("its newest frame is %s" % _hhmm(other["newest_ts"])
+                                         if other.get("newest_ts") else "no frame")
+            log.warning("radar frames now from %s (%s: %s)", SOURCE_NAMES[src],
+                        SOURCE_NAMES[prev_src], why)
+            self.log.record("RADAR-SOURCE", reason="%s: %s" % (SOURCE_NAMES[prev_src], why),
+                            result="frames from %s" % SOURCE_NAMES[src],
+                            frame=_hhmm(ts))
         if confirmed:
             self.log.record("RADAR-RAIN", reason=f"echo within {self.cfg.RADAR_TRIGGER_KM:g} km",
                             source="mrms", result="unsafe",
                             nearest=f"{nearest}km", pixels=count,
-                            frames=f"{self._ring_streak}/{self._trigger_after}")
-        elif in_ring:
+                            frames=f"{streak}/{self._trigger_after}",
+                            frame=f"{_hhmm(ts)} {SOURCE_SHORT[src]}")
+        elif in_ring and not repeat:
             log.info("radar echo within %g km (nearest %s km, %d px) — frame %d of %d, "
                      "not vetoing until confirmed",
-                     self.cfg.RADAR_TRIGGER_KM, nearest, count,
-                     self._ring_streak, self._trigger_after)
+                     self.cfg.RADAR_TRIGGER_KM, nearest, count, streak, self._trigger_after)
             self.log.record("RADAR-ECHO", reason=f"unconfirmed echo within "
                                                  f"{self.cfg.RADAR_TRIGGER_KM:g} km",
-                            source="mrms", result=f"frame {self._ring_streak} of "
+                            source="mrms", result=f"frame {streak} of "
                                                   f"{self._trigger_after}",
-                            nearest=f"{nearest}km", pixels=count)
+                            nearest=f"{nearest}km", pixels=count,
+                            frame=f"{_hhmm(ts)} {SOURCE_SHORT[src]}")
         self._retry_basemaps()
-        return {"ok": True, "in_ring": in_ring, "nearest_km": nearest, "count": count,
-                "streak": self._ring_streak, "confirmed": confirmed}
+        return {"ok": True, "new": not repeat, "source": src, "frame_ts": ts,
+                "in_ring": in_ring, "nearest_km": nearest, "count": count,
+                "streak": streak, "confirmed": confirmed}
+
+    def _no_new_frame(self, now, held, states, tried):
+        """The end of a poll without a new frame: the held one stays (fresh by its own time
+        until RADAR_STALE_AFTER_SEC), the reason is kept for the page, and the next try
+        comes after RADAR_RETRY_SEC instead of a full RADAR_POLL_INTERVAL."""
+        parts = []
+        for src, st in states.items():
+            if st["error"]:
+                parts.append("%s: %s" % (SOURCE_NAMES[src], st["error"]))
+            elif st["newest_ts"] is not None:
+                parts.append("%s: newest frame %s" % (SOURCE_NAMES[src], _hhmm(st["newest_ts"])))
+        why = ("no frame newer than %s; " % _hhmm(held) if held is not None and not tried
+               else "") + "; ".join(parts)
+        retry = max(1, min(int(getattr(self.cfg, "RADAR_RETRY_SEC", 60)),
+                           int(self.cfg.RADAR_POLL_INTERVAL)))
+        with self._lock:
+            self._poll_every = retry
+            self._source_state = states
+            prev, self._why = self._why, why
+        (log.warning if why != prev else log.info)(
+            "no new radar frame (%s) — next try in %d s", why, retry)
+        return {"ok": False, "new": False, "error": why}
+
+    def _note_clock(self, net):
+        """The wrong-clock guard's verdict on this poll's replies: the clock is right when
+        one radar server's Date agrees with it, wrong when every server that sent one
+        disagrees by more than SERVER_CLOCK_TOL_SEC (their frames were refused). Changes
+        go to the log and the event log."""
+        if not net.skews or not net.tol:
+            return
+        agree = [s for _, s in net.skews if abs(s) <= net.tol]
+        ok = bool(agree)
+        skews = sorted(s for _, s in net.skews)
+        skew = min(agree, key=abs) if ok else skews[len(skews) // 2]
+        with self._lock:
+            was = self._clock_ok
+            self._clock_ok, self._clock_skew = ok, skew
+        if not ok and was is not False:
+            msg = "%s: radar data refused until the clock is corrected" % (
+                servertime.clock_phrase(skew, "the radar servers'"))
+            log.error("WRONG SYSTEM CLOCK? %s", msg)
+            self.log.record("CLOCK", reason=servertime.clock_phrase(skew, "the radar servers'"),
+                            result="radar data refused")
+        elif ok and was is False:
+            log.warning("the system clock agrees with the radar servers again")
+            self.log.record("CLOCK", reason="system clock agrees with the radar servers again",
+                            result="radar data accepted")
 
     def _retry_basemaps(self):
         """Rebuild a basemap whose retry time has come — a missing or incomplete one every
@@ -2075,7 +2642,8 @@ class RadarPoller:
                    "chosen_by": {s.map_name: s.osm_by for s in maps if s.osm_by}}
         notes, warns = basemap_messages(self.cfg, maps)
         used = [(s.source, s.tile_url) for s in maps if isinstance(s.source, str)]
-        return basemap, notes, warns, basemap_attribution(self.cfg, used)
+        return (basemap, notes, warns,
+                basemap_attribution(self.cfg, used, getattr(self, "_frame_source", None)))
 
     def maybe_poll(self, sun_alt, now=None):
         # Radar polls DAY AND NIGHT (unlike WU/GLM): the data is free, daytime rain
@@ -2087,7 +2655,8 @@ class RadarPoller:
             return None
         with self._lock:
             elapsed = None if self._last_poll_ts is None else now - self._last_poll_ts
-            due = elapsed is None or elapsed < 0 or elapsed >= self.cfg.RADAR_POLL_INTERVAL
+            # every RADAR_POLL_INTERVAL; RADAR_RETRY_SEC after a poll that got no new frame
+            due = elapsed is None or elapsed < 0 or elapsed >= self._poll_every
         if due:
             r = self.poll_now(now)
             # a failed poll drew nothing: still put changed hazards on the last frame
@@ -2155,9 +2724,10 @@ class RadarPoller:
         return True
 
     def clock_stepped(self, pre_now: float, post_now: float) -> None:
-        """Restart the freeze if the step would evaporate it, and force a re-poll —
-        the frame URL is date-derived, so pre-step frames came from the wrong day."""
-        # the kept frame came from the wrong day too: never redraw hazards onto it
+        """Restart the freeze if the step would evaporate it, and force a re-poll that
+        draws the maps afresh: the frames were looked for by the old clock (the
+        wrong-clock guard refuses a wrong DAY's frames, not a few minutes' error)."""
+        # never redraw hazards onto a frame chosen by the old clock
         for t in self._thumbs:
             t.forget_frame()
         with self._lock:
@@ -2170,14 +2740,28 @@ class RadarPoller:
                 self._save_rain_ts()
                 log.warning("radar post-rain freeze restarted across a clock step")
             self._last_poll_ts = None
-            self._last_ok_ts = None         # wrong-clock frame must not read as fresh
+            self._poll_every = self.cfg.RADAR_POLL_INTERVAL
+            # The re-poll fetches the newest frame again and redraws it; one already
+            # counted is not counted twice (frame times are the servers', not this
+            # clock's). A count under a clock that ran far ahead is dropped with its
+            # streak: no real frame would be newer for as long as that clock was ahead.
+            self._frame_ts = None
+            if (self._counted_ts is not None
+                    and self._counted_ts > post_now + _future_tolerance(self.cfg)):
+                self._counted_ts = None
+                self._ring_streak = 0
 
     def component(self, sun_alt, now=None):
         if now is None:
             now = time.time()
         with self._lock:
-            fresh = (self._last_ok_ts is not None
-                     and (now - self._last_ok_ts) <= self.cfg.RADAR_STALE_AFTER_SEC)
+            # fresh by the frame's OWN time: a feed that stalls, or offers the same frame
+            # again, cannot keep an old frame current. A frame "from the future" beyond
+            # the clock tolerance (a backward clock step) is not current either.
+            ft = self._frame_ts
+            age = None if ft is None else now - ft
+            fresh = (age is not None and -_future_tolerance(self.cfg) <= age
+                     <= self.cfg.RADAR_STALE_AFTER_SEC)
             confirmed = self._ring_streak >= self._trigger_after
             live_unsafe = fresh and self._in_ring and confirmed
             # FREEZE after the last in-ring detection: hold the veto for RADAR_LATCH_SEC
@@ -2192,8 +2776,6 @@ class RadarPoller:
                 log.warning("radar rain timestamp in the future (clock step?) — clamping")
                 self._last_rain_ts = now
                 self._save_rain_ts()
-            if self._last_ok_ts is not None and self._last_ok_ts > now + 60:
-                self._last_ok_ts = now      # never present old data as freshly fetched
             latched = (self._last_rain_ts is not None
                        and (now - self._last_rain_ts) < self.cfg.RADAR_LATCH_SEC)
             # Pillow absent => radar never really ran; never veto from an artificial state.
@@ -2212,8 +2794,26 @@ class RadarPoller:
                 basemap = {"night": None, "day": None, "night_inverted": False,
                            "chosen_by": {}}
                 notes, warns = [], []
-                attribution = str(getattr(self.cfg, "RADAR_ATTRIBUTION",
-                                          _config.RADAR_ATTRIBUTION))
+                attribution = radar_credit(self.cfg, self._frame_source)
+            sources = {}
+            for src in self._sources:
+                st = self._source_state.get(src) or {}
+                newest, checked = st.get("newest_ts"), st.get("checked_ts")
+                sources[src] = {
+                    "name": SOURCE_NAMES[src],
+                    "newest_utc": _utc(newest).isoformat() if newest is not None else None,
+                    "newest_age_s": (max(0, round(now - newest))
+                                     if newest is not None else None),
+                    "error": st.get("error"),
+                    "checked_age_s": (max(0, round(now - checked))
+                                      if checked is not None else None)}
+            clock_wrong = self._clock_ok is False and self._clock_skew is not None
+            radar_warnings = []
+            if clock_wrong:
+                phrase = servertime.clock_phrase(self._clock_skew, "the radar servers'")
+                radar_warnings.append("%s — radar frames refused until the clock is "
+                                      "corrected (check chrony / the GPS time source)" % phrase)
+            src_used = self._frame_source
             return {
                 # Unsafe on a fresh in-ring frame, OR while the post-rain freeze holds. A stale
                 # frame with no recent detection is "unknown" (available False), no veto.
@@ -2239,7 +2839,19 @@ class RadarPoller:
                 "nearest_km": self._nearest_km if fresh else None,
                 "pixels": self._count if fresh else 0,
                 "frame_utc": self._frame_utc,
-                "age_s": round(now - self._last_ok_ts) if self._last_ok_ts else None,
+                # the frame's age by its own time (not since it was fetched)
+                "age_s": max(0, round(age)) if age is not None else None,
+                "stale_after_s": self.cfg.RADAR_STALE_AFTER_SEC,
+                # where the frame came from, what each source had at the last poll, and
+                # why that poll got no new frame (None when it did)
+                "frame_source": src_used,
+                "frame_source_name": SOURCE_NAMES.get(src_used),
+                "sources": sources,
+                "why": self._why,
+                "clock": {"ok": self._clock_ok, "skew_s": (
+                    round(self._clock_skew, 1) if self._clock_skew is not None else None),
+                    "tolerance_s": clock_tolerance(self.cfg)},
+                "warnings": radar_warnings,     # -> the monitor's "warnings" (no veto)
                 "trigger_km": self.cfg.RADAR_TRIGGER_KM,
                 "dbz": self.cfg.RADAR_DBZ,
                 "polling_active": polling_active,
@@ -2254,7 +2866,9 @@ class RadarPoller:
                 "basemap_notes": notes,
                 "basemap_warnings": warns,      # -> the monitor's "warnings" (no veto)
                 "attribution": attribution,
-                "source": "NOAA/NSSL MRMS composite reflectivity via IEM",
+                "source": "NOAA/NSSL MRMS SeamlessHSR reflectivity " + (
+                    "via " + SOURCE_NAMES[src_used] if src_used in SOURCE_NAMES
+                    else "(%s)" % ", ".join(SOURCE_NAMES[s] for s in self._sources)),
             }
 
 
@@ -2265,10 +2879,14 @@ def unavailable_component(cfg):
         "trigger_after": getattr(cfg, "RADAR_TRIGGER_AFTER", 2),
         "latched": False, "seconds_remaining": 0, "freeze_sec": cfg.RADAR_LATCH_SEC,
         "nearest_km": None, "pixels": 0, "frame_utc": None, "age_s": None,
+        "stale_after_s": getattr(cfg, "RADAR_STALE_AFTER_SEC", 1200),
+        "frame_source": None, "frame_source_name": None, "sources": {}, "why": None,
+        "clock": {"ok": None, "skew_s": None, "tolerance_s": clock_tolerance(cfg)},
+        "warnings": [],
         "trigger_km": cfg.RADAR_TRIGGER_KM, "dbz": cfg.RADAR_DBZ, "polling_active": False,
         "thumb_available": False, "thumb_path": cfg.RADAR_THUMB_PATH, "thumb_path_day": None,
         "basemap": {"night": None, "day": None, "night_inverted": False, "chosen_by": {}},
         "basemap_notes": [], "basemap_warnings": [],
         "attribution": basemap_attribution(cfg, []),
-        "source": "NOAA/NSSL MRMS composite reflectivity via IEM (disabled)",
+        "source": "NOAA/NSSL MRMS SeamlessHSR reflectivity (disabled)",
     }

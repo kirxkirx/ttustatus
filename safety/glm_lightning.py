@@ -8,8 +8,14 @@ OUTSIDE the lock, so SafetyMonitor.evaluate() and the HTTP handlers (which only 
 cached latch via component()) never block on a poll.
 
 Fail-safe: a fetch error — or missing numpy/netCDF4 — never clears an active latch and never
-forces unsafe on its own; an active latch keeps IsSafe false regardless. GLM flashes are
-already geodetic lat/lon, so no projection is needed.
+forces unsafe on its own; an active latch keeps IsSafe false regardless. A window in which
+no granule could be read (GLM writes one every 20 s, flashes or not) is no data, never "no
+lightning". GLM flashes are already geodetic lat/lon, so no projection is needed.
+
+Wrong-clock guard: the bucket keeps years of granules and the listing names the hour from
+THIS host's clock, so a Pi booted with a wrong clock would read another day's lightning as
+current. A listing whose Date header disagrees with the clock by more than
+SERVER_CLOCK_TOL_SEC is refused (servertime.py), and the component carries a warning.
 """
 from __future__ import annotations
 
@@ -31,6 +37,8 @@ try:
 except Exception:                       # pragma: no cover - optional heavy deps
     np = None
     netCDF4 = None
+
+from . import servertime
 
 log = logging.getLogger("ttu.safety.glm")
 PREFIX = "GLM-L2-LCFA"
@@ -56,16 +64,34 @@ def site_in_fov(lat, lon, max_arc_deg=70.0):
 
 
 # ----- low-level fetch/parse (all in RAM) -----------------------------------
-def _get(url, timeout=15):
+def _fetch(url, timeout=15):
+    """GET -> (body, response headers, this host's clock when the headers arrived)."""
     req = urllib.request.Request(url, headers={"User-Agent": "ttu-safety-glm/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+        received = time.time()
+        return r.read(), r.headers, received
+
+
+def _get(url, timeout=15):
+    return _fetch(url, timeout)[0]
 
 
 def _list_keys(bucket, prefix):
+    """(the keys under ``prefix``, the S3 server's clock minus this host's in s — None
+    without a Date header)."""
     url = f"https://{bucket}.s3.amazonaws.com/?list-type=2&max-keys=1000&prefix={prefix}"
-    xml = _get(url).decode("utf-8", "replace")
-    return re.findall(r"<Key>([^<]+)</Key>", xml)
+    reply = _fetch(url)
+    body, headers = reply[0], reply[1]
+    return (re.findall(r"<Key>([^<]+)</Key>", body.decode("utf-8", "replace")),
+            servertime.skew_s(headers, reply[2] if len(reply) > 2 else None))
+
+
+def _clock_tolerance(cfg) -> float:
+    try:
+        v = float(getattr(cfg, "SERVER_CLOCK_TOL_SEC", 60))
+    except (TypeError, ValueError):
+        v = 60.0
+    return v if v > 0 and math.isfinite(v) else 0.0
 
 
 def _key_start(key):
@@ -137,12 +163,19 @@ def poll_flashes(cfg):
         return {"ok": False, "error": "numpy/netCDF4 not installed"}
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=cfg.GLM_WINDOW_MIN)
+    tol = _clock_tolerance(cfg)
     keys = []
     for dt in (now, now - timedelta(hours=1)):     # cover a window crossing the hour
         try:
-            keys += _list_keys(cfg.GLM_BUCKET, f"{PREFIX}/{dt:%Y}/{dt:%j}/{dt:%H}/")
+            got, skew = _list_keys(cfg.GLM_BUCKET, f"{PREFIX}/{dt:%Y}/{dt:%j}/{dt:%H}/")
         except (urllib.error.URLError, OSError, ValueError) as e:
             return {"ok": False, "error": f"list: {e}"}
+        if tol and skew is not None and abs(skew) > tol:
+            # the hours listed are the wrong clock's: another day's granules
+            return {"ok": False, "clock_skew_s": skew,
+                    "error": "%s (AWS S3): GLM granules refused until the clock is corrected"
+                             % servertime.clock_phrase(skew)}
+        keys += got
     granules = sorted({k for k in keys if (_key_start(k) or now) >= cutoff})
 
     lat0, lon0 = cfg.GEOCODE
@@ -164,6 +197,13 @@ def poll_flashes(cfg):
         if nearest_km is None or d[i] < nearest_km:
             nearest_km = float(d[i])
             nearest_ll = (float(lats[i]), float(lons[i]))
+    # GLM writes a granule every 20 s, flashes or not: a window without one read is a
+    # feed outage (or a clock off by most of the window), never "no lightning"
+    if scanned == 0:
+        return {"ok": False, "granules_scanned": 0, "error": (
+            "no GLM granule in the last %d min" % cfg.GLM_WINDOW_MIN if not granules else
+            "none of the %d GLM granules of the last %d min could be read"
+            % (len(granules), cfg.GLM_WINDOW_MIN))}
     brng = _cardinal(_bearing(lat0, lon0, *nearest_ll)) if nearest_ll else None
     return {"ok": True, "error": None, "granules_scanned": scanned,
             "in_ring": within > 0, "flashes_in_ring": within,
@@ -315,8 +355,13 @@ class GlmLightningPoller:
             # last night's nearest-flash must not be presented as today's data
             fresh = (self._last_poll_ts is not None
                      and (now - self._last_poll_ts) <= self.cfg.GLM_STALE_AFTER_SEC)
+            # the wrong-clock guard refused the last poll: say so (the monitor shows it)
+            clock_refused = (fresh and not res.get("ok")
+                             and res.get("clock_skew_s") is not None)
             return {
                 "safe": not latched, "enabled": deps_available(),
+                "error": None if res.get("ok") else res.get("error"),
+                "warnings": [str(res.get("error"))] if clock_refused else [],
                 "available": deps_available() and bool(res.get("ok")) and fresh,
                 "latched": latched, "latched_until": self._latch_until,
                 "seconds_remaining": remaining, "last_flash_ts": self._last_flash_ts,
@@ -335,6 +380,7 @@ def unavailable_component(cfg):
     """Component dict when GLM is disabled/absent (does not affect IsSafe)."""
     return {
         "safe": True, "enabled": False, "available": False, "latched": False,
+        "error": None, "warnings": [],
         "latched_until": None, "seconds_remaining": 0, "last_flash_ts": None,
         "in_ring": False, "nearest_km": None, "nearest_bearing": None,
         "polling_active": False, "last_poll_ts": None, "granules_scanned": 0,

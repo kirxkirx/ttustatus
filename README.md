@@ -10,7 +10,8 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    snapshot (disabled by default; `TTU_STATUS_CAMERA=1` re-enables it).
 2. **Alpaca SafetyMonitor** (`safety_monitor.py` + `safety/`) — a small always-on daemon
    that aggregates **sun altitude**, **humidity**, **Weather Underground rain**, the
-   **NWS forecast**, **GOES GLM lightning**, **MRMS radar**, **NWS warnings** (a Tornado,
+   **NWS forecast**, **GOES GLM lightning**, **MRMS radar** (from NOAA's AWS bucket or the
+   Iowa Environmental Mesonet, whichever has the newer frame), **NWS warnings** (a Tornado,
    Dust Storm or High Wind Warning over the site, for the warning's duration) and an
    **internet-loss watchdog** into a single `IsSafe` boolean, served as an ASCOM **Alpaca
    SafetyMonitor** (device 0) so NINA can react (park/close on unsafe). The status page

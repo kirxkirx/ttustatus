@@ -157,7 +157,7 @@ def test_cached_carto_composite_is_used_with_zero_network(tmp_path, monkeypatch)
     assert basemap == {"night": "carto-cached", "day": "carto-cached", "night_inverted": False,
                        "chosen_by": {}}
     assert notes == [] and warns == []
-    assert attr == "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS via IEM"
+    assert attr == "© OpenStreetMap contributors, © CARTO · Radar: NOAA/NSSL MRMS"
 
 
 # ---- step 2: CARTO with the key --------------------------------------------------------
@@ -226,7 +226,7 @@ def test_rejected_key_falls_back_to_osm_with_a_warning_and_is_remembered(
     basemap, notes, warns, attr = _poller(cfg, (night, day))._basemap_status()
     assert ("TTU_SAFETY_CARTO_KEY was not accepted by CARTO (tiles still watermarked); "
             "the map uses OSM") in warns
-    assert attr == "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS via IEM"
+    assert attr == "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS"
     blob = json.dumps([basemap, notes, warns, attr])
     assert BAD_KEY not in blob
 
@@ -272,7 +272,7 @@ def test_no_key_never_requests_carto_not_even_the_probe(tmp_path, monkeypatch):
     basemap, notes, warns, attr = _poller(cfg, (night, day))._basemap_status()
     assert basemap == {"night": "osm", "day": "osm", "night_inverted": True, "chosen_by": {}}
     assert "for CARTO maps set TTU_SAFETY_CARTO_KEY (free key: carto.com/basemaps/apikey)" in notes
-    assert attr == "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS via IEM"
+    assert attr == "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS"
     # the default UA names the app but carries no contact: warned (not a veto)
     assert any(w.startswith("Set TTU_SAFETY_NWS_UA with a real contact e-mail:")
                and "(now: 'ttu-safety-monitor')" in w for w in warns)
@@ -291,7 +291,7 @@ def test_mode_carto_never_touches_osm(tmp_path, monkeypatch):
     assert day.basemap_source == "none" and day.carto_state == "rejected"
     assert net.hits("openstreetmap") == [] and night.osm_state is None
     _, notes, warns, attr = _poller(cfg, (night, day))._basemap_status()
-    assert attr == "Radar: NOAA/NSSL MRMS via IEM"
+    assert attr == "Radar: NOAA/NSSL MRMS"
     assert "the map uses nothing (plain background)" in " ".join(warns)
     assert not any("TTU_SAFETY_NWS_UA" in w for w in warns)   # OSM never in play
 
@@ -308,7 +308,7 @@ def test_mode_osm_never_uses_carto_not_even_cached(tmp_path, monkeypatch):
     assert net.hits("cartocdn") == [] and len(net.hits("openstreetmap")) == 2 * len(night._tiles)
     basemap, notes, warns, attr = _poller(cfg, (night, day))._basemap_status()
     assert notes == [] and warns == []          # a real e-mail: nothing to warn about
-    assert attr == "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS via IEM"
+    assert attr == "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS"
     # OpenStreetMap is the configured choice here, not "the key-free fallback"
     assert basemap["chosen_by"] == {"night": "TTU_SAFETY_RADAR_BASEMAP=osm",
                                     "day": "TTU_SAFETY_RADAR_BASEMAP=osm"}
@@ -327,7 +327,7 @@ def test_auto_chain_order_and_custom_source(tmp_path, monkeypatch):
     cfg.RADAR_BASEMAP = "carto"
     assert custom.basemap_chain() == ["custom-cached", "custom"]
     assert rd.basemap_attribution(cfg, [("custom", custom.tile_url)]) \
-        == "Map tiles: tiles.example.net · Radar: NOAA/NSSL MRMS via IEM"
+        == "Map tiles: tiles.example.net · Radar: NOAA/NSSL MRMS"
     assert "T0K" not in rd.redact("GET " + custom.tile_url)
 
 
@@ -446,7 +446,7 @@ def test_the_key_never_reaches_logs_state_or_component(tmp_path, monkeypatch, ca
     ([], None),
 ])
 def test_attribution_follows_the_sources_drawn(used, credit):
-    radar = " · Radar: NOAA/NSSL MRMS via IEM"
+    radar = " · Radar: NOAA/NSSL MRMS"
     got = rd.basemap_attribution(config, used)
     assert got == (credit + radar if credit else radar[3:])
 
@@ -456,7 +456,7 @@ def test_unavailable_component_carries_the_basemap_keys():
     assert c["basemap"] == {"night": None, "day": None, "night_inverted": False,
                             "chosen_by": {}}
     assert c["basemap_notes"] == [] and c["basemap_warnings"] == []
-    assert c["attribution"] == "Radar: NOAA/NSSL MRMS via IEM"
+    assert c["attribution"] == "Radar: NOAA/NSSL MRMS"
 
 
 # ---- retries ------------------------------------------------------------------------------
@@ -522,7 +522,7 @@ def test_page_names_the_basemap_in_use():
     h = _page({"basemap": {"night": "osm", "day": "osm", "night_inverted": True},
                "basemap_notes": ["for CARTO maps set TTU_SAFETY_CARTO_KEY (free key: "
                                  "carto.com/basemaps/apikey)"],
-               "attribution": "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS via IEM"})
+               "attribution": "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS"})
     assert ("Basemap: OpenStreetMap standard tiles (night map colour-inverted), the key-free "
             "fallback; for CARTO maps set TTU_SAFETY_CARTO_KEY (free key: "
             "carto.com/basemaps/apikey).") in h
@@ -571,7 +571,7 @@ def test_setup_page_shows_the_same_basemap_line():
         "basemap": {"night": "osm", "day": "osm", "night_inverted": True},
         "basemap_notes": ["for CARTO maps set TTU_SAFETY_CARTO_KEY (free key: "
                           "carto.com/basemaps/apikey)"],
-        "attribution": "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS via IEM"}
+        "attribution": "© OpenStreetMap contributors · Radar: NOAA/NSSL MRMS"}
     st["warnings"] = ["Set TTU_SAFETY_NWS_UA with a real contact e-mail: x (now: 'y')"]
     mon = types.SimpleNamespace(evaluate=lambda: st)
     h = _setup_html(mon, config)
@@ -883,7 +883,7 @@ def test_a_basemap_status_error_never_reaches_the_verdict(tmp_path, monkeypatch,
         c2 = p.component(None, 1001.0)
     assert c1["safe"] is True and c2["basemap"]["night"] is None
     assert c1["basemap_notes"] == [] and c1["basemap_warnings"] == []
-    assert c1["attribution"] == "Radar: NOAA/NSSL MRMS via IEM"
+    assert c1["attribution"] == "Radar: NOAA/NSSL MRMS"
     assert caplog.text.count("radar basemap status unavailable") == 1      # logged once
 
 

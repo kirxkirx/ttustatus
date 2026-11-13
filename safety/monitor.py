@@ -629,11 +629,14 @@ class SafetyMonitor:
         # Basemap configuration problems (a CARTO key CARTO did not accept, a User-Agent
         # OpenStreetMap blocks or that lacks a contact): shown as warnings, NEVER a veto —
         # the basemap is decoration, the rain check never reads it.
-        bw = radar.get("basemap_warnings")
-        if isinstance(bw, list):
-            for w in bw:
-                if isinstance(w, str) and w and w not in warnings:
-                    warnings.append(w)
+        # The radar's and GLM's own warnings (the wrong-clock guard: "this host's clock is
+        # 158 d behind the radar servers' — radar frames refused ...") are shown the same
+        # way: the layer already reports itself unavailable, which never vetoes on its own.
+        for wl in (radar.get("basemap_warnings"), radar.get("warnings"), glm.get("warnings")):
+            if isinstance(wl, list):
+                for w in wl:
+                    if isinstance(w, str) and w and w not in warnings:
+                        warnings.append(w)
 
         # Connectivity watchdog (loss of internet). HARD veto after the offline threshold.
         if self.conn is not None:

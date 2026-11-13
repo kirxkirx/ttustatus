@@ -115,7 +115,7 @@ def test_default_basemap_is_carto_first_with_osm_as_the_key_free_backup():
     assert config.RADAR_BASEMAP == "auto" and config.CARTO_API_KEY == ""
     assert config.RADAR_TILE_DARK_INVERT is True
     # the static part is the radar credit only; the map credit follows the basemap drawn
-    assert config.RADAR_ATTRIBUTION == "Radar: NOAA/NSSL MRMS via IEM"
+    assert config.RADAR_ATTRIBUTION == "Radar: NOAA/NSSL MRMS"
 
 
 class _Resp:

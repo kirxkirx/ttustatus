@@ -14,12 +14,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Only the daemon's core deps. Heavy/optional libs — Pi hardware (board, adafruit_dht,
-      # gps, astropy, numpy) and the lightning stack (netCDF4 for GLM, websocket for
-      # Blitzortung) — are intentionally NOT installed; the tests mock/guard them, so this
-      # step is the real CI environment the suite must pass in.
+      # The daemon's core deps, plus Pillow: the radar layer's only dependency (apt
+      # python3-pil on the Pi), so its frame decoding (IEM's PNG, the AWS bucket's GRIB2)
+      # and map rendering are tested here, not skipped. Heavy/optional libs — Pi hardware
+      # (board, adafruit_dht, gps, astropy, numpy) and the lightning stack (netCDF4 for GLM,
+      # websocket for Blitzortung) — are intentionally NOT installed; the tests mock/guard
+      # them, so this step is the real CI environment the suite must pass in.
       - name: Install dependencies
-        run: pip install flask waitress pytest flake8
+        run: pip install flask waitress pytest flake8 pillow
 
       - name: Lint (flake8)
         run: flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety

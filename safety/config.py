@@ -149,6 +149,28 @@ HUMIDITY_CLEAR_BELOW = 93.0     # hysteresis: clear humidity-unsafe below this
 RAIN_LATCH_HOURS = _env_float("TTU_SAFETY_RAIN_LATCH_HOURS", 1.0)
 INPUTS_STALE_SEC = _env_int("TTU_SAFETY_INPUTS_STALE_SEC", 600)  # older => fail safe
 CLOCK_SKEW_TOLERANCE_SEC = 5    # future-dated inputs beyond this => also stale
+# WRONG-CLOCK GUARD (safety/servertime.py). The radar archives and the GLM bucket keep
+# years of data, and every request asks for "now" by THIS host's clock: a Pi booting with
+# a wrong clock (the 2026-08 "March" RTC) would fetch that date's radar frames and
+# lightning granules and read them as current. Their replies carry the server's own time
+# (the Date header), so the radar and GLM layers refuse data while it disagrees with
+# this host's clock by more than this many seconds (a warning names the offset). 0 = off;
+# otherwise at least 60 s (the header's 1-s resolution, transit). Kept well below GLM's
+# 5-min window: a clock fast by most of the window would leave little of it examined.
+# A chrony-synced Pi is off by milliseconds; a wrong boot clock by hours to months.
+SERVER_CLOCK_TOL_SEC = _env_int("TTU_SAFETY_SERVER_CLOCK_TOL_SEC", 60)
+if SERVER_CLOCK_TOL_SEC < 0:
+    CONFIG_WARNINGS.append(f"TTU_SAFETY_SERVER_CLOCK_TOL_SEC={SERVER_CLOCK_TOL_SEC} is "
+                           "negative — using the default 60 (0 switches the guard off)")
+    SERVER_CLOCK_TOL_SEC = 60
+elif 0 < SERVER_CLOCK_TOL_SEC < 60:
+    CONFIG_WARNINGS.append(f"TTU_SAFETY_SERVER_CLOCK_TOL_SEC={SERVER_CLOCK_TOL_SEC} is "
+                           "below 60 s, too tight for an HTTP Date — using 60")
+    SERVER_CLOCK_TOL_SEC = 60
+elif SERVER_CLOCK_TOL_SEC == 0:
+    CONFIG_WARNINGS.append("TTU_SAFETY_SERVER_CLOCK_TOL_SEC=0: the wrong-clock guard is "
+                           "OFF — a wrong system clock would make the radar and GLM read "
+                           "another day's data as current")
 
 # --- NWS forecast component (pre-emptive cloud/precip/thunder) --------------
 # Pulls the raw NWS gridpoint forecast every NWS_POLL_INTERVAL and flags UNSAFE if THIS
@@ -221,9 +243,10 @@ GLM_LATCH_FILE = _env_str("TTU_SAFETY_GLM_LATCH_FILE",
 GLM_STALE_AFTER_SEC = _env_int("TTU_SAFETY_GLM_STALE_SEC", 900)  # older poll => no data
 
 # --- MRMS radar (rain within a radius) --------------------------------------
-# Every RADAR_POLL_INTERVAL (DAY AND NIGHT — free data) fetch the latest MRMS composite
-# reflectivity and declare UNSAFE if ANY echo >= RADAR_DBZ is within RADAR_TRIGGER_KM of
-# the observatory. Deliberately simple — a plain 30 km "any rain" ring, no upwind logic.
+# Every RADAR_POLL_INTERVAL (DAY AND NIGHT — free data) read the newest MRMS SeamlessHSR
+# reflectivity frame (RADAR_SOURCES below) and declare UNSAFE if ANY echo >= RADAR_DBZ is
+# within RADAR_TRIGGER_KM of the observatory. Deliberately simple — a plain 30 km "any
+# rain" ring, no upwind logic.
 # Also renders a TTU-centered radar thumbnail (a CARTO or OpenStreetMap basemap, see the
 # basemap block below, cached to disk) with the 30 km ring + scale bars for the status
 # page. Needs Pillow (apt: python3-pil); absent => radar disabled (other layers
@@ -233,20 +256,58 @@ RADAR_ENABLED = _env_str("TTU_SAFETY_RADAR", "1").strip().lower() not in ("0", "
 RADAR_TRIGGER_KM = _env_float("TTU_SAFETY_RADAR_KM", 30.0)
 RADAR_DBZ = _env_float("TTU_SAFETY_RADAR_DBZ", 20.0)        # echo >= this = rain
 RADAR_POLL_INTERVAL = _env_int("TTU_SAFETY_RADAR_POLL_INTERVAL", 300)   # 5 min
-# CONFIRMATION: how many CONSECUTIVE polls must see an in-ring echo before the radar
-# vetoes. MRMS composites occasionally carry a single-frame artefact (aircraft, anomalous
-# propagation, a ground-clutter or de-aliasing glitch), and one such frame should not
-# close the dome. Costs one poll interval (~5 min) of extra latency on real rain, which is
-# affordable for a 30 km early-warning ring — the close-in layers (WU stations, GLM) are
-# unaffected. Set to 1 to trigger on a single frame again.
+# CONFIRMATION: how many CONSECUTIVE frames (one per poll; each frame counts once, so a
+# stalled feed offering the same frame again confirms nothing) must show an in-ring echo
+# before the radar vetoes. MRMS composites occasionally carry a single-frame artefact
+# (aircraft, anomalous propagation, a ground-clutter or de-aliasing glitch), and one such
+# frame should not close the dome. Costs one poll interval (~5 min) of extra latency on
+# real rain, which is affordable for a 30 km early-warning ring — the close-in layers (WU
+# stations, GLM) are unaffected. Set to 1 to trigger on a single frame again.
 RADAR_TRIGGER_AFTER = _env_int("TTU_SAFETY_RADAR_TRIGGER_AFTER", 2)
 # NOTE: radar polls day AND night (free data, daytime rain matters, live map) — unlike
 # the WU/GLM night gates.
+# A frame older than this BY ITS OWN TIME is "no data" (unavailable): measured from the
+# frame's time, not from when it was fetched, so a stalled feed cannot keep it current.
 RADAR_STALE_AFTER_SEC = _env_int("TTU_SAFETY_RADAR_STALE_SEC", 1200)  # older => unavailable
+# FRAME SOURCES (safety/radar.py): the same MRMS frames from two free, key-less archives.
+#   aws — NOAA's Open Data bucket on AWS: MRMS's own GRIB2, ~1 min after the frame time;
+#   iem — the Iowa Environmental Mesonet's lcref PNG of the same grid, ~5.5 min after.
+# Every poll asks each listed source for its newest frame and reads the NEWEST; the other
+# stands in when that one cannot be had (they failed at different times over the 120
+# days measured). Both by default; one name alone leaves no fallback.
+_RADAR_SOURCE_NAMES = ("aws", "iem")
+
+
+def _parse_radar_sources(raw: str, var: str = "TTU_SAFETY_RADAR_SOURCES") -> tuple:
+    names = [s.strip().lower() for s in str(raw).replace(";", ",").split(",") if s.strip()]
+    bad = [n for n in names if n not in _RADAR_SOURCE_NAMES]
+    good = tuple(dict.fromkeys(n for n in names if n in _RADAR_SOURCE_NAMES))
+    if bad:
+        CONFIG_WARNINGS.append(f"{var}: ignoring unknown radar source(s) {', '.join(bad)} "
+                               f"(known: {', '.join(_RADAR_SOURCE_NAMES)})")
+    if not good:
+        CONFIG_WARNINGS.append(f"{var}={raw!r} names no radar source — using "
+                               f"{','.join(_RADAR_SOURCE_NAMES)}")
+        good = _RADAR_SOURCE_NAMES
+    return good
+
+
+RADAR_SOURCES = _parse_radar_sources(_env_str("TTU_SAFETY_RADAR_SOURCES", "aws,iem"))
+_RADAR_AWS_DEFAULT = "https://noaa-mrms-pds.s3.amazonaws.com"
+RADAR_AWS_URL = _env_str("TTU_SAFETY_RADAR_AWS_URL", _RADAR_AWS_DEFAULT).strip().rstrip("/")
+if not RADAR_AWS_URL.startswith(("http://", "https://")):
+    CONFIG_WARNINGS.append(f"TTU_SAFETY_RADAR_AWS_URL={RADAR_AWS_URL!r} is not an http(s) "
+                           f"URL — using {_RADAR_AWS_DEFAULT}")
+    RADAR_AWS_URL = _RADAR_AWS_DEFAULT
+# A poll that got no new frame (a source late or down) is retried this soon instead of
+# after a full RADAR_POLL_INTERVAL: a missed frame costs a minute, not five.
+RADAR_RETRY_SEC = _clamp("TTU_SAFETY_RADAR_RETRY_SEC",
+                         _env_int("TTU_SAFETY_RADAR_RETRY_SEC", 60), 30,
+                         max(30, RADAR_POLL_INTERVAL))
 # FREEZE TIME after the last in-ring detection: hold the veto this long even if later
 # frames are clear, so the dome does not reopen the moment a cell's leading edge leaves
-# the ring (and so a ranged echo can't reopen it when IEM goes blind, since a cell inside
-# the ring may sit over no WU station at all).
+# the ring (and so a ranged echo can't reopen it when the radar feed goes blind, since a
+# cell inside the ring may sit over no WU station at all).
 RADAR_LATCH_SEC = _env_int("TTU_SAFETY_RADAR_LATCH_SEC", 900)   # 15 min post-rain freeze
 RADAR_LATCH_FILE = _env_str("TTU_SAFETY_RADAR_LATCH_FILE",
                             os.path.expanduser("~/safety_radar_latch.json"))
@@ -417,8 +478,9 @@ RADAR_THUMB_VIA_SHM = (_env_str("TTU_SAFETY_RADAR_THUMB_SHM", "1").strip().lower
                        not in ("0", "false", "no")) and os.path.isdir("/dev/shm")
 # The radar-data credit. The map's full attribution line is COMPUTED from the basemap
 # actually drawn (radar.basemap_attribution): "© OpenStreetMap contributors, © CARTO"
-# when a CARTO map is shown, "© OpenStreetMap contributors" for OSM alone, then this.
-RADAR_ATTRIBUTION = "Radar: NOAA/NSSL MRMS via IEM"
+# when a CARTO map is shown, "© OpenStreetMap contributors" for OSM alone, then this,
+# with the archive the frame came from ("... via NOAA Open Data (AWS)" / "... via IEM").
+RADAR_ATTRIBUTION = "Radar: NOAA/NSSL MRMS"
 # (Persistence note: the radar keeps its OWN post-rain freeze above — it does NOT rely on the
 # WU rain latch, which only arms when rain reaches a nearby station, not for ranged echoes.)
 

@@ -290,9 +290,14 @@ def _setup_html(monitor, cfg) -> str:
                 rk, rad.get("seconds_remaining", 0) // 60,
                 "" if rad.get("available") else " (no fresh frame)")
         elif not rad.get("available"):
-            rv, rad_unknown = "no fresh frame (radar unreachable?)", True
+            why = rad.get("why")
+            rv = ("no fresh frame — %s" % str(why)[:200] if why
+                  else "no fresh frame (radar unreachable?)")
+            rad_unknown = True
         else:
             rv = "no rain within %g km" % rk
+            if rad.get("frame_source_name"):
+                rv += " (frame from %s)" % rad["frame_source_name"]
         rows.append(row("Radar (MRMS ≤%g km)" % rk, rv, rad.get("safe", True),
                         unknown=rad_unknown))
     # The radar map's basemap (CARTO / OpenStreetMap / none) and what to configure — the

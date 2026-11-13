@@ -32,7 +32,7 @@ def _poller(monkeypatch, deps=True, tmp_path=None):
 def test_unsafe_when_rain_in_ring_and_fresh(monkeypatch):
     p = _poller(monkeypatch)
     now = 1000.0
-    p._last_ok_ts = now
+    p._frame_ts = now
     p._in_ring = True
     p._ring_streak = p._trigger_after          # confirmed over consecutive frames
     p._nearest_km = 12.0
@@ -46,7 +46,7 @@ def test_single_echo_does_not_trigger(monkeypatch):
     # propagation, clutter) show up for a single frame and must not close the dome.
     p = _poller(monkeypatch)
     now = 1000.0
-    p._last_ok_ts = now
+    p._frame_ts = now
     p._in_ring = True
     p._ring_streak = 1
     p._nearest_km = 12.0
@@ -61,16 +61,16 @@ def test_single_echo_does_not_trigger(monkeypatch):
 def test_safe_when_ring_clear(monkeypatch):
     p = _poller(monkeypatch)
     now = 1000.0
-    p._last_ok_ts = now
+    p._frame_ts = now
     p._in_ring = False
     assert p.component(-10.0, now)["safe"] is True
 
 
 def test_stale_frame_is_unavailable_not_veto(monkeypatch):
-    # rain was seen, but the last successful poll is old -> unknown, does not veto
+    # rain was seen, but the frame is old BY ITS OWN TIME -> unknown, does not veto
     p = _poller(monkeypatch)
     p._in_ring = True
-    p._last_ok_ts = 1.0
+    p._frame_ts = 1.0
     c = p.component(-10.0, 1.0 + config.RADAR_STALE_AFTER_SEC + 10)
     assert c["available"] is False and c["safe"] is True
 
@@ -82,7 +82,7 @@ def test_latch_holds_veto_during_blind_gap(monkeypatch):
     now = 1000.0
     p._in_ring = True
     p._last_rain_ts = now - 60
-    p._last_ok_ts = now - (config.RADAR_STALE_AFTER_SEC + 100)   # stale / blind
+    p._frame_ts = now - (config.RADAR_STALE_AFTER_SEC + 100)   # stale / blind
     c = p.component(-10.0, now)
     assert c["available"] is False and c["safe"] is False and c["latched"] is True
 
@@ -94,7 +94,7 @@ def test_freeze_survives_a_fresh_clear_frame(monkeypatch):
     now = 1000.0
     p._in_ring = False
     p._last_rain_ts = now - 60          # rain a minute ago
-    p._last_ok_ts = now                 # fresh & clear right now
+    p._frame_ts = now                 # fresh & clear right now
     c = p.component(-10.0, now)
     assert c["safe"] is False and c["latched"] is True
     assert c["available"] is True       # the frame itself is current...
@@ -109,7 +109,7 @@ def test_freeze_clears_when_the_window_elapses(monkeypatch):
     now = 1000.0
     p._in_ring = False
     p._last_rain_ts = now - (config.RADAR_LATCH_SEC + 1)
-    p._last_ok_ts = now
+    p._frame_ts = now
     c = p.component(-10.0, now)
     assert c["safe"] is True and c["latched"] is False and c["seconds_remaining"] == 0
 
@@ -125,14 +125,14 @@ def test_latch_expires_bounded(monkeypatch):
     now = 1000.0
     p._in_ring = True
     p._last_rain_ts = now - (config.RADAR_LATCH_SEC + 10)
-    p._last_ok_ts = now - (config.RADAR_STALE_AFTER_SEC + 100)
+    p._frame_ts = now - (config.RADAR_STALE_AFTER_SEC + 100)
     assert p.component(-10.0, now)["safe"] is True
 
 
 def test_deps_absent_disables(monkeypatch):
     p = _poller(monkeypatch, deps=False)
     p._in_ring = True
-    p._last_ok_ts = time.time()
+    p._frame_ts = time.time()
     c = p.component(-10.0)
     assert c["enabled"] is False and c["available"] is False and c["safe"] is True
     assert p.maybe_poll(-10.0) is None
@@ -158,23 +158,15 @@ def test_maybe_poll_runs_day_and_night(monkeypatch):
 
 
 def test_poll_now_sets_state(monkeypatch):
-    # exercise poll_now without real PIL: stub the fetch, image, and check
+    # exercise poll_now without real PIL: stub the sources, the download and the check
     p = _poller(monkeypatch)
-    monkeypatch.setattr(rd, "latest_frame",
-                        lambda: (__import__("datetime").datetime(2026, 1, 1,
-                                 tzinfo=__import__("datetime").timezone.utc),
-                                 "http://x/lcref.png"))
-    monkeypatch.setattr(rd, "_get", lambda url, timeout=25, **kw: b"x")
-
-    class _Img:
-        def load(self):
-            return None
-    monkeypatch.setattr(rd, "Image", type("I", (), {"open": staticmethod(lambda b: _Img())}))
+    _stub_sources(monkeypatch)
     monkeypatch.setattr(rd, "check_rain", lambda cfg, img: (True, 8.5, 42))
     p._trigger_after = 1                       # confirmation is exercised separately
     r = p.poll_now(now=1000.0)
-    assert r["ok"] and r["in_ring"] is True
-    assert p._in_ring is True and p._nearest_km == 8.5 and p._last_ok_ts == 1000.0
+    assert r["ok"] and r["in_ring"] is True and r["source"] == "aws"
+    assert p._in_ring is True and p._nearest_km == 8.5
+    assert p._frame_ts == 1000.0 - 60          # the frame's own time, not the poll's
     assert p.component(-10.0, 1000.0)["safe"] is False
 
 
@@ -209,18 +201,43 @@ def test_thumbnailer_geometry():
     assert lonmin < config.GEOCODE[1] < lonmax
 
 
-def _stub_fetch(monkeypatch, ring_sequence):
-    """Drive poll_now without PIL: each call returns the next (in_ring, nearest) pair."""
-    import datetime as _dt
-    monkeypatch.setattr(rd, "latest_frame",
-                        lambda: (_dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc),
-                                 "http://x/lcref.png"))
-    monkeypatch.setattr(rd, "_get", lambda url, timeout=25, **kw: b"x")
+def _stub_sources(monkeypatch, frames=None, lag=60):
+    """Both frame sources stubbed, no network: AWS has a NEW frame ``lag`` s before every
+    poll's ``now`` (as the bucket does, ~1 min behind) unless ``frames["aws"]`` says
+    otherwise — None: no frame, an exception instance: it raises, a tuple: that frame;
+    IEM has ``frames.get("iem")`` (None by default). fetch_frame hands out a stand-in
+    image (check_rain is stubbed where it matters), counting the downloads in
+    ``frames["fetched"]`` and the URLs in ``frames["urls"]``; ``frames["fetch_error"]``
+    (a dict source -> exception) makes a download fail."""
+    frames = {} if frames is None else frames
 
-    class _Img:
-        def load(self):
-            return None
-    monkeypatch.setattr(rd, "Image", type("I", (), {"open": staticmethod(lambda b: _Img())}))
+    def _newest(name):
+        def finder(cfg, net, now):
+            got = frames.get(name, "new" if name == "aws" else None)
+            if got == "new":
+                return (now - lag, "http://x/%s/%d" % (name, now - lag))
+            if isinstance(got, Exception):
+                raise got
+            return got
+        return finder
+
+    def _fetch(cfg, net, source, url, ts, box):
+        err = (frames.get("fetch_error") or {}).get(source)
+        if err is not None:
+            raise err
+        frames["fetched"] = frames.get("fetched", 0) + 1
+        frames.setdefault("urls", []).append(url)
+        return object()
+    monkeypatch.setattr(rd, "aws_newest", _newest("aws"))
+    monkeypatch.setattr(rd, "iem_newest", _newest("iem"))
+    monkeypatch.setattr(rd, "fetch_frame", _fetch)
+    return frames
+
+
+def _stub_fetch(monkeypatch, ring_sequence, frames=None):
+    """Drive poll_now without PIL: each new frame's check returns the next (in_ring,
+    nearest) pair of ``ring_sequence``."""
+    _stub_sources(monkeypatch, frames)
     seq = list(ring_sequence)
 
     def _check(cfg, img):
@@ -470,13 +487,7 @@ class _FakeThumb:
 def _hazard_poller(monkeypatch, sources, frames):
     monkeypatch.setattr(rd, "deps_available", lambda: True)
     monkeypatch.setattr(config, "RADAR_LATCH_FILE", "/nonexistent-dir/radar_latch.json")
-    _stub_fetch(monkeypatch, [False] * 20)
-    monkeypatch.setattr(rd, "latest_frame", lambda: frames.get("next", (TS, "http://x/l.png")))
-
-    def _get(url, timeout=25, **kw):
-        frames["fetched"] = frames.get("fetched", 0) + 1
-        return b"x"
-    monkeypatch.setattr(rd, "_get", _get)
+    _stub_fetch(monkeypatch, [False] * 20, frames)
     p = rd.RadarPoller(config, _Log(), overlay_sources=sources)
     p._thumbs = [_FakeThumb(), _FakeThumb()]  # the dark and the light map
     return p
@@ -511,7 +522,7 @@ def test_failed_poll_still_redraws_changed_hazards(monkeypatch):
     current, frames = [], {}
     p = _hazard_poller(monkeypatch, [lambda: list(current)], frames)
     p.maybe_poll(None, now=1000.0)
-    frames["next"] = (None, None)  # IEM has no new frame
+    frames["aws"] = None  # neither source has a new frame
     current.append(TOR)
     p.maybe_poll(None, now=1000.0 + config.RADAR_POLL_INTERVAL)  # due, fails, still redraws
     assert frames["fetched"] == 1
@@ -838,17 +849,22 @@ def test_poller_end_to_end_redraws_both_pngs_without_refetch(tmp_path, monkeypat
     _frame().save(buf, format="PNG")
     png, fetched = buf.getvalue(), []
 
-    def _get(url, timeout=25, **kw):
-        if url.endswith("lcref.png"):
+    def _http(url, method="GET", timeout=10, max_bytes=None):
+        if url.endswith("lcref.png"):           # the real lcref decode path
             fetched.append(url)
-            return png
+            return 200, {}, png
+        raise urllib.error.URLError("network blocked in tests")
+
+    def _blocked(url, timeout=25, **kw):
         raise urllib.error.URLError("network blocked in tests")  # basemap tiles
 
     def reds(path):
         with Image.open(path) as im:
             return _count(im.convert("RGB"), (255, 0, 0))
-    monkeypatch.setattr(rd, "_get", _get)
-    monkeypatch.setattr(rd, "latest_frame", lambda: (TS, "http://x/lcref.png"))
+    monkeypatch.setattr(rd, "_http", _http)
+    monkeypatch.setattr(rd, "_get", _blocked)
+    monkeypatch.setattr(rd, "aws_newest", lambda cfg, net, now: None)
+    monkeypatch.setattr(rd, "iem_newest", lambda cfg, net, now: (now - 360, "http://x/lcref.png"))
     cfg, current = _cfg(tmp_path), []
     p = rd.RadarPoller(cfg, _Log(), overlay_sources=[lambda: list(current)])
     assert [t.colors for t in p._thumbs] == [rd._THEME["dark"], rd._THEME["light"]]

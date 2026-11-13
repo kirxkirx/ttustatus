@@ -12,6 +12,7 @@ import shlex
 import warnings
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 
 import numpy as np
 
@@ -2987,6 +2988,42 @@ def radar_basemap_summary(basemap, notes=()):
     return "Basemap: " + desc + "".join("; " + n for n in notes) + "."
 
 
+def _radar_frame_text(rad):
+    """'2026-11-11 02:10Z from NOAA Open Data (AWS)' for the radar's frame line (the raw
+    value when it is not an ISO time; '?' without one)."""
+    raw = rad.get("frame_utc")
+    ts = _hz_iso_ts(raw) if isinstance(raw, str) else None
+    text = (datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+            if ts is not None else str(raw or "?"))
+    name = rad.get("frame_source_name")
+    return text + (" from %s" % name if isinstance(name, str) and name else "")
+
+
+def _radar_sources_html(rad):
+    """'Frame sources: NOAA Open Data (AWS) — newest 02:10Z (in use); IEM — newest 02:06Z.'
+    with a source's problem in the warning colour, so a dead backup is seen before it is
+    needed. Empty for an older daemon (no "sources")."""
+    srcs = rad.get("sources")
+    if not isinstance(srcs, dict) or not srcs:
+        return ""
+    parts = []
+    for key, s in srcs.items():
+        if not isinstance(s, dict):
+            continue
+        name = html.escape(str(s.get("name") or key))
+        if s.get("error"):
+            parts.append('%s &mdash; <span style="color:var(--warn)">%s</span>'
+                         % (name, html.escape(str(s["error"])[:200])))
+            continue
+        ts = _hz_iso_ts(s.get("newest_utc"))
+        if ts is None:
+            continue
+        parts.append("%s &mdash; newest %s%s" % (
+            name, datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%MZ"),
+            " (in use)" if rad.get("frame_source") == key else ""))
+    return ("Frame sources: " + "; ".join(parts) + ".") if parts else ""
+
+
 def build_radar_html(state):
     rad = ((state or {}).get("components", {}) or {}).get("radar")
     if not rad or not rad.get("enabled"):
@@ -3025,7 +3062,11 @@ def build_radar_html(state):
     elif rad.get("available"):
         verdict = safety_dot_html(True) + ("no rain within %g km" % rk)
     else:
-        verdict = safety_dot_html(True, unknown=True) + "no fresh frame (radar unreachable?)"
+        # the daemon says why (each frame source's problem); an older one does not
+        why = rad.get("why")
+        verdict = safety_dot_html(True, unknown=True) + (
+            "no fresh frame &mdash; %s" % html.escape(str(why)[:300]) if why
+            else "no fresh frame (radar unreachable?)")
 
     # The <img> uses a relative basename, which only resolves if the thumbnail lives in the
     # same web directory as status.html. There are up to two maps — a dark (night) and a
@@ -3061,14 +3102,20 @@ def build_radar_html(state):
         img = ('<div class="lede" style="color:var(--muted)">Radar image not available '
                'yet (generated on the next radar poll, within 5&nbsp;min).</div>')
 
-    frame = html.escape(str(rad.get("frame_utc") or "?"))
+    frame = html.escape(_radar_frame_text(rad))
     attribution = html.escape(str(rad.get("attribution") or ""))
     source = (
-        "Map: NOAA/NSSL <b>MRMS</b> composite radar reflectivity (every US weather radar "
-        "fused, ~1&nbsp;km, updated every 2&nbsp;min), fetched from the Iowa Environmental "
-        "Mesonet. The cyan ring is the <b>%g&nbsp;km</b> rain trigger: any echo inside it "
-        "marks the monitor UNSAFE. Colours run green (light) &rarr; red/magenta "
-        "(downpour). Polled every 5&nbsp;min, day and night." % rk)
+        "Map: NOAA/NSSL <b>MRMS</b> radar reflectivity (every US weather radar's lowest "
+        "unblocked beam, fused, ~1&nbsp;km, updated every 2&nbsp;min), read from whichever "
+        "of two archives has the newer frame: NOAA's Open Data bucket on AWS (about "
+        "1&nbsp;min behind) or the Iowa Environmental Mesonet (about 5&nbsp;min behind), "
+        "so one of them failing leaves the other. The cyan ring is the <b>%g&nbsp;km</b> "
+        "rain trigger: any echo inside it marks the monitor UNSAFE. Colours run green "
+        "(light) &rarr; red/magenta (downpour). Polled every 5&nbsp;min, day and night."
+        % rk)
+    sources_line = _radar_sources_html(rad)
+    if sources_line:
+        source += " " + sources_line
     _comp = state.get("components") or {}
     if isinstance(_comp.get("hazards"), dict) or isinstance(_comp.get("hazard_info"), dict):
         source += (" Active NWS alert areas and other hazards are drawn over the radar when "

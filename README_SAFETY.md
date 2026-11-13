@@ -327,6 +327,15 @@ active (227329 min left)"*). The daemon defends itself:
   and a latch that the step would silently *evaporate* (armed under the old clock,
   "expired" under the new one) is **re-armed for its full duration** — the rain was
   recent in real time regardless of what the clock said.
+- **The radar and GLM check the servers' clocks** (`TTU_SAFETY_SERVER_CLOCK_TOL_SEC`,
+  60 s). Both radar archives and the GOES bucket keep years of data and are asked for
+  "now" by *this* clock, so a boot under a March clock would read a March date's radar
+  frames and lightning as current. Every reply carries the server's own time (its `Date`
+  header): while it disagrees with the Pi's clock by more than the tolerance, the data
+  is refused — the layer reads *unavailable*, never "clear" — and a warning on both
+  pages names the offset (*"this host's clock is 158 d behind the radar servers' —
+  radar frames refused until the clock is corrected"*), with a `CLOCK` event when it
+  starts and ends.
 - Pollers treat a **backward** step as "poll now" instead of stalling until the wall
   clock catches up; the connectivity watchdog runs entirely on the monotonic clock, so
   steps can neither fake a huge offline window nor neutralize it.
@@ -342,9 +351,9 @@ active (227329 min left)"*). The daemon defends itself:
   page shows *why* it is unavailable (e.g. the TLS "certificate is not yet valid"
   failures a wrong clock causes).
 
-None of this replaces NTP — until the clock syncs, date-derived data sources (GLM S3
-prefixes, MRMS frame URLs) still fetch the wrong day's data. It bounds the damage and
-makes the condition loud instead of silent.
+None of this replaces NTP — until the clock syncs, the radar and GLM have no data and
+everything computed from the clock (the sun's altitude above all) is as wrong as the
+clock. It bounds the damage and makes the condition loud instead of silent.
 
 **Pi ops — keep the boot clock close:** `fake-hwclock` is NOT installed on every image
 (it was absent on the observatory Pi — the 2026-08 incident's "March" boot time came from
@@ -455,9 +464,14 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR` | `1` | enable the MRMS radar component (`0` disables) |
 | `TTU_SAFETY_RADAR_KM` | `30` | any echo within this radius → UNSAFE |
 | `TTU_SAFETY_RADAR_DBZ` | `20` | reflectivity ≥ this counts as rain |
-| `TTU_SAFETY_RADAR_TRIGGER_AFTER` | `2` | consecutive polls that must show an in-ring echo before it triggers (`1` = trigger on a single frame) |
+| `TTU_SAFETY_RADAR_TRIGGER_AFTER` | `2` | consecutive frames (each counted once) that must show an in-ring echo before it triggers (`1` = trigger on a single frame) |
 | `TTU_SAFETY_RADAR_LATCH_SEC` | `900` | freeze time (s) after the last in-ring echo; clear frames do not cancel it |
 | `TTU_SAFETY_RADAR_POLL_INTERVAL` | `300` | seconds between radar polls (day and night) |
+| `TTU_SAFETY_RADAR_STALE_SEC` | `1200` | a frame older than this **by its own time** is "no data" (unavailable) |
+| `TTU_SAFETY_RADAR_SOURCES` | `aws,iem` | the frame sources asked every poll, the newest frame read: `aws` = NOAA's MRMS bucket on AWS (~1 min behind), `iem` = IEM's lcref archive (~5.5 min behind). One name alone leaves no fallback; unknown names are ignored (warned) |
+| `TTU_SAFETY_RADAR_AWS_URL` | `https://noaa-mrms-pds.s3.amazonaws.com` | base URL of the MRMS bucket |
+| `TTU_SAFETY_RADAR_RETRY_SEC` | `60` | a poll that got no new frame is retried after this many seconds (30 … the poll interval) |
+| `TTU_SAFETY_SERVER_CLOCK_TOL_SEC` | `60` | wrong-clock guard: radar frames and GLM granules are refused while the server's `Date` disagrees with the Pi's clock by more than this (`0` = off, warned; otherwise at least 60) |
 | `TTU_SAFETY_RADAR_THUMB` | `/var/www/html/ttu_radar.png` | thumbnail path (beside status.html) |
 | `TTU_SAFETY_RADAR_BASEMAP` | `auto` | basemap chain: `auto` = cached CARTO → CARTO with the key → OpenStreetMap → plain background; `carto` = never OpenStreetMap; `osm` = never CARTO, not even the cached maps (anything else ⇒ `auto`, warned) |
 | `TTU_SAFETY_CARTO_KEY` | (unset) | CARTO Basemaps API key, sent as `?key=` on CARTO tile URLs — a secret: never logged, never on the page, `/setup` or in a file name. Needed only to fetch new CARTO tiles; cached CARTO maps are used without it. Free, no account: request it by e-mail at [carto.com/basemaps/apikey](https://carto.com/basemaps/apikey) (free up to 5M requests/month, non-commercial) |
@@ -535,24 +549,63 @@ silently unavailable (no internet). A response of any kind (even an HTTP error) 
 
 ### MRMS radar component
 
-Every 5 min — **day and night** (the data is free) — the daemon pulls the latest **MRMS composite reflectivity** (NOAA
-via the Iowa Environmental Mesonet, free/no key) and declares **UNSAFE if any echo ≥ 20 dBZ
-is within 30 km** of the dome — a deliberately simple radius, no upwind logic. It also
+Every 5 min — **day and night** (the data is free) — the daemon reads the newest **MRMS
+reflectivity frame** (NOAA/NSSL's SeamlessHSR: every US weather radar's lowest unblocked
+beam, fused on a ~1 km grid every 2 min; free, no key) and declares **UNSAFE if any echo
+≥ 20 dBZ is within 30 km** of the dome — a deliberately simple radius, no upwind logic. It also
 renders a **TTU-centered radar thumbnail** over a basemap (see *Radar basemap* below) with
 the **30 km ring** and **10 km / 10 mi scale bars**, written beside `status.html`; the
 observatory page shows it with a source note that names the basemap in use and the
 matching attribution. **Two versions are rendered — a dark map for the night page style
 and a light (`ttu_radar_day.png`) map for the day style — and CSS shows whichever matches
-the page's day/night toggle.** An echo must appear on **two consecutive polls** (~5 min apart) before
+the page's day/night toggle.** An echo must appear on **two consecutive frames** (one per
+poll, ~5 min apart) before
 it triggers: MRMS composites occasionally carry a one-frame artefact — an aircraft,
 anomalous propagation, ground clutter — and a single frame should not close the dome. The
 first, unconfirmed frame is shown on both pages as *"echo within 30 km — unconfirmed (1 of
 2 frames), not triggering"* with a grey dot, and it starts no freeze. Live check: unsafe
 while a **confirmed** echo is in the ring **and for 15 min after the last one** — a freeze that clear frames do not cancel, so the roof does not
-reopen the moment a cell's edge leaves the ring (it also covers the feed going blind). A
-fetch error or stale frame → *unavailable*, which does not veto on its own. The
+reopen the moment a cell's edge leaves the ring (it also covers the feed going blind). No
+frame younger than 20 min → *unavailable*, which does not veto on its own. The
 slow tile/radar fetch + render runs in its own thread, so it never delays page/monitor
 refresh. Needs Pillow (`sudo apt install python3-pil`); absent → radar disabled.
+
+**Two frame sources, the newer one wins.** The same MRMS frames come from two free
+archives, and every poll asks both what they have:
+
+| Source | What | Behind the frame time |
+|---|---|---|
+| NOAA Open Data on AWS (`noaa-mrms-pds`) | MRMS's own GRIB2 file (~1 MB) | ~1 min |
+| Iowa Environmental Mesonet (IEM) | the same grid as an indexed PNG, `lcref` (~0.6 MB) | ~5.5 min |
+
+The poll downloads the **newest** frame (normally the bucket's, so the radar is about 4.5
+min fresher than with IEM alone) and, when that one cannot be had — the source does not
+answer, lags, or its file is not what it should be — the other source's newest frame in
+the same poll. The bucket's GRIB2 is converted to IEM's palette indices exactly
+(`floor((dBZ + 32) × 2)`, 0 for "no echo" and "no radar coverage" alike); checked against
+IEM's PNG of the same time, cell for cell over the whole grid. A file counts only when it
+is MRMS's SeamlessHSR product, of the time its name gives, on IEM's grid; anything else is
+refused, never guessed at. Over 120 days (2026-07-13 to 11-10) the two failed at different
+times: IEM stalled for 40–70 min on 07-25, 08-05 and 10-09 while the bucket had every file
+within ~1.5 min; the bucket stalled for an hour on 09-11, never received 94 min of files
+on 10-07 and ran 25–30 min late on 11-10, while IEM was on time. With IEM alone those
+three IEM outages left the radar blind for 34–49 min each.
+
+- **A frame counts once**, whichever source delivered it: a stalled feed that keeps
+  offering its last frame neither confirms an echo with it (a single artefact frame could
+  otherwise "confirm" itself on the next poll) nor is re-downloaded. Frames either side
+  of a gap longer than 20 min are not consecutive.
+- **Fresh by the frame's own time** (`TTU_SAFETY_RADAR_STALE_SEC`, 20 min), not by when
+  it was fetched: a stalled feed cannot keep an old frame current (with IEM alone, frames
+  up to 35 min old used to count as live during its stalls).
+- A poll without a new frame is **retried after a minute** (`TTU_SAFETY_RADAR_RETRY_SEC`)
+  instead of five. A host that does not answer is asked nothing more that poll, each
+  source's lookup gets at most 30 s (a slow, overloaded source cannot starve the other),
+  and no request starts after 120 s: a dead source costs one timeout.
+- The pages say where the frame came from ("frame 02:10Z from NOAA Open Data (AWS)") and
+  list each source's newest frame or its problem, so a dead backup shows up before it is
+  needed; a source switch is a `RADAR-SOURCE` event. A reply whose `Date` disagrees with
+  the Pi's clock is refused (*Clock robustness* above).
 
 **Radar basemap: CARTO first, OpenStreetMap as the backup.** The basemap is built once
 per site and map and cached in `~/.cache/ttu-radar/` (`basemap_<hash>.png`), so tiles are
