@@ -35,12 +35,38 @@ fi
 echo "== $PRETTY_NAME (Debian $(cat /etc/debian_version)), $(uname -m)," \
      "$(head -1 /etc/rpi-issue 2>/dev/null || echo 'not a Raspberry Pi OS image')"
 
+# What this script changes outside the throwaway user, undone on the way out however it
+# ends: a policy-rc.d that keeps apt from starting services (a chroot has no init to stop
+# them again, and one left running keeps the image busy when CI unmounts it), a tmpfs on
+# /dev/shm, and the daemon with anything else of the throwaway user still running.
+POLICY=/usr/sbin/policy-rc.d
+CREATED_POLICY=0
+SHM_MOUNTED=0
+PID=
+cleanup() {
+    if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; fi
+    pkill -u "$U" 2>/dev/null || true
+    sleep 1
+    if [ "$SHM_MOUNTED" = 1 ]; then umount /dev/shm 2>/dev/null || true; fi
+    if [ "$CREATED_POLICY" = 1 ]; then rm -f "$POLICY"; fi
+}
+trap cleanup EXIT
+
 # ---- 1. the packages ---------------------------------------------------------------------
 if [ "${SKIP_APT:-0}" != 1 ]; then
+    if [ ! -e "$POLICY" ]; then
+        printf '#!/bin/sh\nexit 101\n' > "$POLICY" && chmod +x "$POLICY" && CREATED_POLICY=1
+    fi
     apt-get -q update
     # README.md's line, plus the test tools (python3-pytest, flake8) and curl
     apt-get -q install -y --no-install-recommends python3-flask python3-waitress git chrony \
         python3-pil python3-numpy python3-netcdf4 python3-pytest flake8 curl
+fi
+# /dev/shm must be the RAM tmpfs it is on the Pi: the daemon keeps its state, the weather
+# log and the radar maps there, and reads GLM granules from it. CI's chroot gets the host's
+# /dev without its submounts, which leaves the image's bare, root-only /dev/shm directory.
+if ! mountpoint -q /dev/shm; then
+    mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm && SHM_MOUNTED=1
 fi
 python3 - <<'PY'
 import importlib.metadata as md, sys
@@ -79,7 +105,14 @@ grep -qx "WorkingDirectory=$APP" "$UNIT"
 grep -qx "ExecStart=/usr/bin/python3 $APP/safety_monitor.py" "$UNIT"
 grep -qx "EnvironmentFile=-/home/$U/ttustatus.env" "$UNIT"
 grep -qx "systemctl enable --now ttu-safety" "$SHIM/calls"
-echo "install.sh: unit OK ($(grep -c . "$SHIM/calls") systemctl calls)"
+# the journal cap, and that journald reads it: the image's own setting stays in force
+# (Raspberry Pi OS: Storage=volatile) and only the size limit is added
+grep -qx "SystemMaxUse=1G" /etc/systemd/journald.conf.d/60-ttu-safety.conf
+if command -v systemd-analyze >/dev/null; then
+    systemd-analyze cat-config systemd/journald.conf > "$SHIM/journald.conf"
+    grep -qx "SystemMaxUse=1G" "$SHIM/journald.conf"
+fi
+echo "install.sh: unit and journal cap OK ($(grep -c . "$SHIM/calls") systemctl calls)"
 
 # the daemon as the unit starts it: its user, its EnvironmentFile, its working directory.
 # The status page generator needs the Pi's hardware (DHT11, GPS), so it is off and the
@@ -105,9 +138,7 @@ setpriv --reuid="$U" --regid="$U" --init-groups env -i HOME="/home/$U" USER="$U"
     export TTU_SAFETY_RADAR_BASEMAP=carto
     export TTU_SAFETY_NWS_UA='ttu-safety-monitor CI (+https://github.com/kirxkirx/ttustatus)'
     cd $APP && exec /usr/bin/python3 $APP/safety_monitor.py" > "$LOG" 2>&1 &
-PID=$!
-stop() { kill "$PID" 2>/dev/null || true; }
-trap stop EXIT
+PID=$!                                     # (stopped by cleanup if anything below fails)
 API=http://127.0.0.1:$PORT
 for _ in $(seq 1 180); do                   # emulated ARM: imports take a while
     curl -sf "$API/management/apiversions" >/dev/null && break
@@ -175,7 +206,7 @@ PY
 kill -TERM "$PID"
 for _ in $(seq 1 60); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
 if kill -0 "$PID" 2>/dev/null; then echo "the daemon ignored SIGTERM"; exit 1; fi
-trap - EXIT
+PID=
 grep -q "SHUTDOWN" "/home/$U/safety_events.log"
 if grep -n "Traceback" "$LOG"; then cat "$LOG"; echo "a traceback in the daemon's log"; exit 1; fi
 # Raspberry Pi OS's HDF5 printed an error stack for every GLM granule read from memory in

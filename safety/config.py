@@ -714,10 +714,13 @@ if not CLOCK_SYNC_ENABLED:
                            "would compute the sun for the wrong time of day")
 CLOCK_CHECK_SEC = _clamp("TTU_SAFETY_CLOCK_CHECK_SEC",
                          _env_int("TTU_SAFETY_CLOCK_CHECK_SEC", 30), 5, 600)
-# chrony's error bound on a synchronised Pi is microseconds (GPS) to tens of milliseconds
-# (NTP over the internet); seconds mean it is still correcting a large error
+# chrony's error bound on a synchronised Pi is microseconds (GPS PPS) to a few hundred ms
+# (GPS NMEA alone, NTP over the internet); a second or more means it is still correcting a
+# large error (1 s: the owner's choice, 2026-11-13). The bound also grows while chrony has
+# no source at all — by its estimated drift, typically 1-20 µs per second — so a Pi that
+# loses the GPS AND every NTP server reaches 1 s after roughly half a day to a few days.
 CLOCK_MAX_ERROR_SEC = _clamp("TTU_SAFETY_CLOCK_MAX_ERROR_SEC",
-                             _env_float("TTU_SAFETY_CLOCK_MAX_ERROR_SEC", 5.0), 0.01, 60.0)
+                             _env_float("TTU_SAFETY_CLOCK_MAX_ERROR_SEC", 1.0), 0.01, 60.0)
 CLOCK_GRACE_SEC = _clamp("TTU_SAFETY_CLOCK_GRACE_SEC",
                          _env_int("TTU_SAFETY_CLOCK_GRACE_SEC", 600), 0, 3600)
 CLOCK_CHRONYC = _env_str("TTU_SAFETY_CHRONYC", "chronyc").strip() or "chronyc"
@@ -743,6 +746,12 @@ STATE_WRITE_HEARTBEAT_SEC = _env_int("TTU_SAFETY_STATE_HEARTBEAT_SEC", 60)
 # Durable (survive reboot): the rain latch and the audit log.
 LATCH_FILE = _env_str("TTU_SAFETY_LATCH_FILE", os.path.expanduser("~/safety_latch.json"))
 EVENT_LOG = _env_str("TTU_SAFETY_EVENT_LOG", os.path.expanduser("~/safety_events.log"))
+# Size cap of the audit log TOGETHER with its one backup (safety_events.log.1): at half
+# of it the file is renamed .1 and a new one starts (eventlog.py). The log used to grow
+# without limit; at a few kB a day 1 GB is decades, so the cap only rules out the
+# pathological case (an event storm) filling the SD card. The owner's choice, 2026-11-13.
+EVENT_LOG_MAX_MB = _clamp("TTU_SAFETY_EVENT_LOG_MAX_MB",
+                          _env_float("TTU_SAFETY_EVENT_LOG_MAX_MB", 1024.0), 1.0)
 
 # --- Alpaca server ----------------------------------------------------------
 HTTP_HOST = _env_str("TTU_SAFETY_HTTP_HOST", "0.0.0.0")   # LAN-reachable for NINA

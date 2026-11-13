@@ -34,7 +34,8 @@ must never wear the SD card; both are regenerated within seconds of a restart.)
 
 Durable files (survive reboot): `~/safety_latch.json` (the rain latch), the GLM / radar /
 NWS-warning latches beside it, and `~/safety_events.log` (the audit trail, also mirrored
-to stdout).
+to stdout; size-capped with its one backup `~/safety_events.log.1`, see
+[SD-card wear](#sd-card-wear)).
 
 ## Safety logic
 
@@ -42,7 +43,7 @@ to stdout).
 
 | Input | Unsafe when | Source |
 |------|-------------|--------|
-| System clock | chrony is **not synchronised to the GPS or an NTP server** (`chronyc tracking`), or its error bound is over 5 s — every other row is computed from the clock (see *Clock robustness*) | this daemon |
+| System clock | chrony is **not synchronised to the GPS or an NTP server** (`chronyc tracking`), or its error bound is over 1 s — every other row is computed from the clock (see *Clock robustness*) | this daemon |
 | Sun altitude | `> 0°` (no refraction / angular-size correction) | make_status_page.py |
 | Humidity | `> 95 %` (clears again below 93 %, small hysteresis) | make_status_page.py (DHT) |
 | Rain | **any** WU station reports `precipRate > 0` | this daemon |
@@ -332,8 +333,10 @@ active (227329 min left)"*). The daemon defends itself:
     trusting its own clock);
   - stratum 1–15 and a leap status other than *Not synchronised*;
   - chrony's own bound on the clock's error (|offset| + root delay/2 + root dispersion)
-    within `TTU_SAFETY_CLOCK_MAX_ERROR_SEC` (5 s; a synchronised Pi shows microseconds to
-    milliseconds).
+    within `TTU_SAFETY_CLOCK_MAX_ERROR_SEC` (1 s; a synchronised Pi shows microseconds with
+    the GPS's PPS, tens to a few hundred milliseconds with GPS NMEA alone or internet NTP).
+    The bound also grows while chrony has no source at all, so a Pi that has lost the GPS
+    *and* every NTP server reads UNSAFE after roughly half a day to a few days.
 
   chronyc missing, chronyd not running, a timeout or unreadable output all count as *not
   confirmed*. Once the clock has been confirmed, a failed check is tolerated for
@@ -414,7 +417,7 @@ The Pi runs 24/7 from an SD card on imperfect power, so every recurring write ma
 | `/dev/shm/ttu_radar*.png` + `/dev/shm/status.html` (symlinked from `/var/www/html`) | every 90 s / 5 min | RAM |
 | `~/safety_latch.json`, `~/safety_glm_latch.json`, `~/safety_radar_latch.json` | only on rain/lightning events | SD (must survive reboot) |
 | `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning; written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
-| `~/safety_events.log` (audit trail) | only on events | SD (its purpose) |
+| `~/safety_events.log` (audit trail) | only on events | SD (its purpose). Capped at 1 GB together with its one backup (`TTU_SAFETY_EVENT_LOG_MAX_MB`): at half the cap it is renamed `safety_events.log.1` (replacing the older backup) and a new file starts. At a few kB a day that is decades, so the cap only guards against an event storm filling the card |
 | `/dev/shm/ttu_weather_log/` (weather-log rows not archived yet) | every 5 min, plus every WU poll | RAM |
 | `/dev/shm/tmp*.nc` (one GLM granule while it is read, then deleted) | ~15 per GLM poll, at night | RAM |
 | `/var/www/html/weather_log/*.csv` (weather-log archive) | one append per monthly file every 24 h, in daytime, and when the daemon is stopped | SD (its purpose; about 0.2 MB a day) |
@@ -443,8 +446,17 @@ sudo apachectl configtest && sudo systemctl reload apache2
 ```
 (edit files in `sites-available/`, not the `sites-enabled/` symlinks — `sed -i` would
 silently replace a symlink with a regular file)
-Also: bound journald (`/etc/systemd/journald.conf`: `SystemMaxUse=64M`) while keeping
-`Storage=persistent` for reboot forensics; check swap (`swapon --show` — zram = RAM =
+Also the journal, where the daemon's own log lines go. Raspberry Pi OS keeps it **in
+RAM** (`Storage=volatile`, set by `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`).
+That means no SD writes and a cap of its own (10 % of the size of `/run`: tens of MB),
+but it is **lost at every reboot**. `deploy/install.sh` adds
+`/etc/systemd/journald.conf.d/60-ttu-safety.conf` with `SystemMaxUse=1G`. It does nothing
+while the journal is in RAM, and caps it at 1 GB if you keep it on the card for reboot
+forensics. To keep it on the card, add `Storage=persistent` (in a drop-in of your own,
+named to sort after `40-`), then `sudo systemctl restart systemd-journald`. Expect a
+steady trickle of small SD writes from then on. Check what is in force with
+`systemd-analyze cat-config systemd/journald.conf | grep -E '^(Storage|SystemMaxUse)'` and
+`journalctl --disk-usage`. Check swap (`swapon --show` — zram = RAM =
 good; a `dphys-swapfile` swapfile lives ON the SD); `sudo systemctl disable --now
 packagekit` on a headless Pi; confirm `noatime` on root (`findmnt -o OPTIONS /`); keep
 chrony's drift file (it makes the clock accurate quickly after reboot); and re-check
@@ -488,6 +500,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_LOCAL_TZ` | `America/Chicago` | timezone of the forecast table (invalid ⇒ loud UTC fallback) |
 | `TTU_SAFETY_STATE_HEARTBEAT_SEC` | `60` | max interval between unchanged state-file writes (SD-wear throttle) |
 | `TTU_SAFETY_INPUTS_FILE` / `_STATE_FILE` / `_LATCH_FILE` / `_EVENT_LOG` | see `config.py` | file paths |
+| `TTU_SAFETY_EVENT_LOG_MAX_MB` | `1024` | size cap of the event log **together with its one backup** (`.1`): at half of it the file becomes `.1` and a new one starts |
 | `TTU_SAFETY_NWS` | `1` | enable the NWS forecast component (`0` disables) |
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent of the NWS, IEM radar, hazard-feed and map-tile requests (WU, GLM and the connectivity probe send their own). **Absolutely crucial: put a REAL e-mail address in it**: `ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)` with `you@example.org` replaced by your own address (double-quoted in `ttustatus.env`). OpenStreetMap blocks a placeholder like `you@example.org` — the daemon then requests no OSM tiles, and a map with no CARTO basemap (cached or keyed) has no basemap — and NWS asks for a contact. The default names the app but has no contact (warned at startup, and on the page when OSM is used) |
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
@@ -521,7 +534,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes |
 | `TTU_SAFETY_CLOCK_SYNC` | `1` | the clock check: device 0 UNSAFE until chrony is synchronised to the GPS or an NTP server (`0` switches it off, warned at startup) |
 | `TTU_SAFETY_CLOCK_CHECK_SEC` | `30` | seconds between `chronyc tracking` checks (5 … 600) |
-| `TTU_SAFETY_CLOCK_MAX_ERROR_SEC` | `5` | largest error bound chrony may report (\|offset\| + root delay/2 + root dispersion) and still count as synchronised (0.01 … 60) |
+| `TTU_SAFETY_CLOCK_MAX_ERROR_SEC` | `1` | largest error bound chrony may report (\|offset\| + root delay/2 + root dispersion) and still count as synchronised (0.01 … 60) |
 | `TTU_SAFETY_CLOCK_GRACE_SEC` | `600` | once the clock was confirmed, a failed check is tolerated this long (a chronyd restart); a clock step ends it (0 … 3600) |
 | `TTU_SAFETY_CHRONYC` | `chronyc` | the chronyc program to ask |
 | `TTU_SAFETY_HAZARDS` | `1` | enable the NWS active-alerts layer (`0` disables it: no warning veto, no alert lists or map areas) |

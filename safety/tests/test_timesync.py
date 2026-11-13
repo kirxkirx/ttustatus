@@ -158,7 +158,9 @@ def test_the_wrapper_runs_chronyc_numeric_csv_and_reports_its_failure(tmp_path, 
     with pytest.raises(RuntimeError, match="exit status 3"):
         REAL_RUN(_cfg(CLOCK_CHRONYC=other))
     monkeypatch.setattr(timesync, "RUN_TIMEOUT_SEC", 0.3)
-    hung = _script(tmp_path, "hung", "sleep 5")
+    # (exec: the timeout kills the sleep itself — a plain `sleep` would be orphaned and live
+    # on in the test's working directory, which in CI kept the image from unmounting)
+    hung = _script(tmp_path, "hung", "exec sleep 5")
     with pytest.raises(subprocess.TimeoutExpired):
         REAL_RUN(_cfg(CLOCK_CHRONYC=hung))
 
@@ -475,7 +477,7 @@ def _config_with(**env):
 def test_clock_settings_from_the_environment():
     plain = _config_with()
     assert (plain["on"], plain["every"], plain["err"], plain["grace"], plain["chronyc"]) \
-        == (True, 30, 5.0, 600, "chronyc")
+        == (True, 30, 1.0, 600, "chronyc")
     assert not any("CLOCK" in w for w in plain["warnings"])
     off = _config_with(TTU_SAFETY_CLOCK_SYNC="0")
     assert off["on"] is False
@@ -527,3 +529,16 @@ def test_a_grace_under_a_minute_is_said_in_seconds(env, write_inputs):
     w.component = (lambda real: lambda mono=None: real(555.0))(w.component)
     st = SafetyMonitor(env["cfg"], env["log"], env["poller"], clock=w).evaluate()
     assert any("tolerated for another 45 s" in x for x in st["warnings"]), st["warnings"]
+
+
+def test_the_default_error_bound_is_one_second():
+    assert config.CLOCK_MAX_ERROR_SEC == 1.0             # the owner's choice, 2026-11-13
+    # the GPS's NMEA alone (no PPS yet): root delay 0.2 s, as chrony.conf usually sets it
+    # for an NMEA reference clock — about 0.12 s: synchronised
+    nmea = NTP.replace("8176014E,129.118.1.78,4", "4E4D4541,NMEA,1", 1).replace(
+        "0.070391133", "0.200000000", 1)
+    r = parse_tracking(nmea, config.CLOCK_MAX_ERROR_SEC)
+    assert r["ok"] is True and r["reference"] == "NMEA"
+    # 1.2 s of offset that chrony is still slewing away: not yet
+    r = parse_tracking(NTP.replace("0.000027697", "1.200000000", 1), config.CLOCK_MAX_ERROR_SEC)
+    assert r["ok"] is False and "more than the 1 s allowed" in r["why"]

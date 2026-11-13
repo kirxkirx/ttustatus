@@ -1494,7 +1494,12 @@ def storm(rig, tmp_path, monkeypatch):
     monkeypatch.setattr(glm_lightning, "poll_flashes", poll_flashes)
     lightning = glm_lightning.GlmLightningPoller(config, rig["log"])
     rig["monitor"].glm = lightning
-    t0, m0 = time.time(), time.monotonic()
+    # The monotonic base is a whole number of seconds. These tests check holds to the
+    # second (930 + 1800), and a fractional base rounds once thousands of seconds are
+    # added to it: on a freshly booted CI machine (time.monotonic() a few hundred seconds,
+    # fractional) 1800 s came out as 1799.9999999999998 and a hold "had not yet ended".
+    # (time.time() is safe: adding whole seconds to it stays exact until 2038.)
+    t0, m0 = time.time(), 1_000_000.0
     clock = {"now": t0}
     monkeypatch.setattr(time, "time", lambda: clock["now"])
     monkeypatch.setattr(time, "monotonic", lambda: m0 + (clock["now"] - t0))

@@ -197,8 +197,12 @@ The env file (step 3), in short — details in README_SAFETY.md:
 That's the whole deployment: **one service**. The safety daemon spawns
 `make_status_page.py` every ~90 s as an isolated subprocess (a page crash or hang is
 logged and killed after 30 min — it can never take the safety logic down). Logs go to
-journald (`journalctl -u ttu-safety -f`) with automatic rotation. A code update needs
-only `sudo systemctl restart ttu-safety`; rerun the installer if the unit file changed.
+journald (`journalctl -u ttu-safety -f`) with automatic rotation. Raspberry Pi OS keeps
+the journal in RAM, so it does not survive a reboot; the installer caps it at 1 GB in case
+it is kept on the SD card (README_SAFETY.md, "SD-card wear"). The audit trail
+`~/safety_events.log` is on the card, capped at 1 GB with its `.1` backup. A code update
+needs only `sudo systemctl restart ttu-safety`; rerun the installer if the unit file
+changed.
 (Migrating from the old setup: remove the `@reboot` line from `crontab -e` and
 `pkill -f run_status_page.sh`.)
 

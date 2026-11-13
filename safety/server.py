@@ -195,7 +195,7 @@ def main(argv=None):
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = config
 
-    eventlog = EventLog(cfg.EVENT_LOG)
+    eventlog = EventLog(cfg.EVENT_LOG, max_mb=cfg.EVENT_LOG_MAX_MB)
     poller = RainPoller(cfg, eventlog)
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
     glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
