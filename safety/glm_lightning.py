@@ -23,6 +23,9 @@ Wrong-clock guard: the bucket keeps years of granules and the listing names the 
 THIS host's clock, so a Pi booted with a wrong clock would read another day's lightning as
 current. A listing whose Date header disagrees with the clock by more than
 SERVER_CLOCK_TOL_SEC is refused (servertime.py), and the component carries a warning.
+Once refused, the clock has to agree to within the tolerance less
+servertime.HYSTERESIS_SEC before granules are accepted again (no flicker at the edge),
+and both changes are logged with a CLOCK event.
 """
 from __future__ import annotations
 
@@ -146,6 +149,21 @@ def _clock_tolerance(cfg) -> float:
     return v if v > 0 and math.isfinite(v) else 0.0
 
 
+class _WithLimit:
+    """``cfg`` with SERVER_CLOCK_TOL_SEC replaced by the limit in force for one poll (the
+    tolerance, or a little less while the clock is believed wrong — see
+    servertime.HYSTERESIS_SEC); every other setting is read through from cfg. The poller
+    hands this to poll_flashes(cfg), so the function keeps its one-argument signature (and
+    every stand-in for it in the tests keeps working)."""
+
+    def __init__(self, cfg, limit):
+        self._cfg = cfg
+        self.SERVER_CLOCK_TOL_SEC = limit
+
+    def __getattr__(self, name):
+        return getattr(self._cfg, name)
+
+
 def _key_start(key):
     """A granule key's start time (its ``_s`` field: YYYYDDDHHMMSS plus tenths), or None."""
     m = re.search(r"_s(\d{14})", key) if isinstance(key, str) else None
@@ -189,41 +207,53 @@ def _read_flash_vars(ds):
     return _as_float_1d("flash_lat", vlat), _as_float_1d("flash_lon", vlon)
 
 
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _flashes_from_buffer(buf):
-    """(lats, lons) from a GLM granule, parsed IN RAM (in-memory; /dev/shm RAM fallback).
+    """(lats, lons) from a GLM granule, parsed IN RAM: from a file in /dev/shm (a RAM
+    tmpfs) when there is one, else from the bytes in memory. NEVER from the SD card.
+
+    Why /dev/shm first: GLM polls in a thread of its own, and Raspberry Pi OS's HDF5
+    (trixie: 1.14, built thread-safe) keeps its "print errors" switch per thread. Opened
+    from memory, libnetcdf first probes the dataset's NAME as a file; that probe fails,
+    and in any thread but the main one HDF5 prints the failure as a ~20-line error stack
+    on stderr — although the open itself then works. That was every granule, ~15 per poll,
+    some 3600 journal lines an hour at night (seen in the Raspberry Pi OS test, CI's
+    raspios.yml). A real file has nothing to probe in vain. Its name starts "ttu-glm-": the
+    daemon's start-up sweep removes a file that a killed poll left behind.
 
     Raises ValueError for a granule whose flash variables are not two 1-D arrays of one
     length, or that declares more than MAX_FLASHES_PER_GRANULE flashes (checked before
-    anything is read). The fallback is taken only when the in-memory open itself fails."""
-    try:
-        ds = netCDF4.Dataset("inmem.nc", mode="r", memory=buf)
-    except (ValueError, OSError, TypeError):
-        ds = None
-    if ds is not None:
+    anything is read)."""
+    path = None
+    if os.path.isdir("/dev/shm"):
         try:
-            return _read_flash_vars(ds)
-        finally:
-            ds.close()
-    # Fallback ONLY to /dev/shm (a RAM tmpfs). NEVER write granules to the SD card: if
-    # there's no RAM-backed tmpfs, skip this granule rather than touch disk. The prefix
-    # lets the daemon's start-up sweep remove a file a killed poll left behind.
-    if not os.path.isdir("/dev/shm"):
-        raise RuntimeError("no in-memory netCDF and no /dev/shm; "
-                           "skipping granule (refusing to write to disk)")
-    fd, path = tempfile.mkstemp(dir="/dev/shm", prefix="ttu-glm-", suffix=".nc")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(buf)
-        ds = netCDF4.Dataset(path, "r")
+            fd, path = tempfile.mkstemp(dir="/dev/shm", prefix="ttu-glm-", suffix=".nc")
+            with os.fdopen(fd, "wb") as f:
+                f.write(buf)
+        except OSError:                 # /dev/shm unusable (full?): from memory below
+            if path is not None:
+                _unlink(path)
+            path = None
+    if path is not None:
         try:
-            return _read_flash_vars(ds)
+            ds = netCDF4.Dataset(path, "r")
+            try:
+                return _read_flash_vars(ds)
+            finally:
+                ds.close()
         finally:
-            ds.close()
+            _unlink(path)
+    ds = netCDF4.Dataset("inmem.nc", mode="r", memory=buf)
+    try:
+        return _read_flash_vars(ds)
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        ds.close()
 
 
 def _hav_km(lat, lon, lats, lons):
@@ -378,6 +408,10 @@ def poll_flashes(cfg, since=None, now=None):
     minutes = int(round((end - lo) / 60.0))
     tol = _clock_tolerance(cfg)
     keys = []
+    # The bucket's clock as measured on a listing that was ACCEPTED (None: no Date
+    # header). Returned as "server_skew_s" so the poller learns that the clock agrees
+    # again after a refusal; a refusal itself returns "clock_skew_s" instead.
+    agreed = None
     for prefix in _hour_prefixes(lo, end):
         left = deadline_at - _mono()
         if left < MIN_REQUEST_S:
@@ -391,6 +425,8 @@ def poll_flashes(cfg, since=None, now=None):
             return {"ok": False, "clock_skew_s": skew,
                     "error": "%s (AWS S3): GLM granules refused until the clock is corrected"
                              % servertime.clock_phrase(skew)}
+        if skew is not None:
+            agreed = skew
         keys += got
     # one key per start time (a reprocessed copy sorts after the first by its _c field);
     # a key without a readable start time cannot be placed in the window: dropped
@@ -445,10 +481,11 @@ def poll_flashes(cfg, since=None, now=None):
     # GLM writes a granule every 20 s, flashes or not: a window without one read is a
     # feed outage (or a clock off by most of the window), never "no lightning"
     if not read:
-        out = {"ok": False, "granules_scanned": 0, "granules_in_window": 0, "error": (
-            "no GLM granule in the last %d min" % minutes if not starts else
-            "none of the %d GLM granules of the last %d min could be read"
-            % (len(starts), minutes))}
+        error = ("no GLM granule in the last %d min" % minutes if not starts else
+                 "none of the %d GLM granules of the last %d min could be read"
+                 % (len(starts), minutes))
+        out = {"ok": False, "granules_scanned": 0, "granules_in_window": 0,
+               "server_skew_s": agreed, "error": error}
         if starts and first_error:
             log.warning("GLM poll: no granule read (%s)", first_error)
         return out
@@ -464,7 +501,7 @@ def poll_flashes(cfg, since=None, now=None):
             "granules_listed": len(starts), "granules_unread": failed + unreached,
             "in_ring": within > 0, "flashes_in_ring": within, "flashes_dropped": dropped,
             "nearest_km": round(nearest_km, 1) if nearest_km is not None else None,
-            "nearest_bearing": brng,
+            "nearest_bearing": brng, "server_skew_s": agreed,
             "partial": bool(problems), "coverage": "; ".join(problems) or None,
             "window_start": lo, "window_end": end,
             "cursor": _cursor_after(starts, read, lo, since)}
@@ -487,6 +524,16 @@ class GlmLightningPoller:
         # the start (epoch s) of the newest granule up to which every granule was read;
         # None after a start or a clock step: the next poll reads the configured window
         self._cursor = None
+        # The wrong-clock guard's verdict from the bucket's Date headers: None (nothing
+        # known yet), True (the last listing agreed), False (the last listing was
+        # refused). It sets the next poll's limit (servertime.limit: hysteresis) and its
+        # changes go to the log and the event log, as the radar's do.
+        self._clock_ok = None
+        # How the last poll failed: None (it did not), "clock" (the wrong-clock guard
+        # refused it) or "poll" (anything else). A failed poll used to leave no trace in
+        # the log at all; now each change between these is logged once — kept apart so a
+        # feed outage right after a clock refusal is still reported.
+        self._failing = None
         self._load_latch()
 
     def _load_latch(self):
@@ -543,12 +590,23 @@ class GlmLightningPoller:
             now = time.time()
         with self._lock:
             since = self._cursor
+            clock_ok = self._clock_ok
+        cfg = _WithLimit(self.cfg, servertime.limit(_clock_tolerance(self.cfg), clock_ok))
         # SLOW, outside the lock. (The first poll is called without a cursor at all.)
-        res = (poll_flashes(self.cfg) if since is None
-               else poll_flashes(self.cfg, since=since))
+        res = poll_flashes(cfg) if since is None else poll_flashes(cfg, since=since)
+        if not isinstance(res, dict):
+            res = {"ok": False, "error": "poll returned %s" % type(res).__name__}
         with self._lock:
             self._last_poll_ts = now
             self._last_result = res
+            was_clock, was_failing = self._clock_ok, self._failing
+            if not res.get("ok") and res.get("clock_skew_s") is not None:
+                self._clock_ok = False
+            elif res.get("server_skew_s") is not None:
+                self._clock_ok = True
+            self._failing = (None if res.get("ok") else
+                             "clock" if res.get("clock_skew_s") is not None else "poll")
+            clock_now = self._clock_ok
             if res.get("ok"):
                 cursor = _finite_ts(res.get("cursor"))
                 if cursor is not None:
@@ -563,7 +621,31 @@ class GlmLightningPoller:
                         "LIGHTNING", reason=f"GLM flash within {self.cfg.GLM_TRIGGER_KM:g} km",
                         source="glm", result=f"latch {self.cfg.GLM_COOLOFF_HOURS:g}h",
                         nearest=f"{res.get('nearest_km')}km {res.get('nearest_bearing')}")
+        self._log_changes(res, was_clock, clock_now, was_failing)
         return res
+
+    def _log_changes(self, res, was_clock, clock_now, was_failing):
+        """Changes only, never every poll (the event log is on the SD card): the clock
+        found wrong by the bucket's Date and right again (log + CLOCK event, as the radar
+        does — before, a GLM refusal left no trace in either log), and polls starting to
+        fail or working again (log only)."""
+        if clock_now is False and was_clock is not False:
+            skew = res.get("clock_skew_s")
+            log.error("WRONG SYSTEM CLOCK? %s", res.get("error"))
+            self.log.record("CLOCK", reason=servertime.clock_phrase(skew, "the GOES bucket's"),
+                            result="GLM granules refused")
+        elif clock_now is True and was_clock is False:
+            log.warning("the system clock agrees with the GOES bucket again")
+            self.log.record("CLOCK", reason="system clock agrees with the GOES bucket again",
+                            result="GLM granules accepted")
+        if res.get("ok"):
+            if was_failing is not None:
+                log.info("GLM polls work again (%s granules read)", res.get("granules_scanned"))
+        elif res.get("clock_skew_s") is None and was_failing != "poll":
+            # (a clock refusal is logged above, as an error; this is any other failure,
+            # including a feed outage that follows a refusal)
+            log.warning("GLM poll failed: %s — lightning data unavailable until a poll "
+                        "succeeds (an active latch stays)", res.get("error"))
 
     def maybe_poll(self, sun_alt, now=None):
         if now is None:
@@ -628,9 +710,14 @@ class GlmLightningPoller:
             # the wrong-clock guard refused the last poll: say so (the monitor shows it)
             clock_refused = (fresh and not res.get("ok")
                              and res.get("clock_skew_s") is not None)
+            # The nearest flash belongs to the last GOOD poll. After a failed, refused or
+            # granule-less poll there is no current distance: exporting the previous one
+            # would present an old measurement as current (the weather log, which has no
+            # GLM-availability column, recorded it as if it had just been measured).
+            current = fresh and bool(res.get("ok"))
             # the last poll read what it could, but left a hole or a lag in its window: a
             # flash in it has counted; "no flash" is not a clear window
-            partial = fresh and bool(res.get("ok")) and bool(res.get("partial"))
+            partial = current and bool(res.get("partial"))
             warnings = [str(res.get("error"))] if clock_refused else []
             if partial:
                 warnings.append("GLM lightning: the last poll did not read its whole window "
@@ -645,8 +732,8 @@ class GlmLightningPoller:
                 "latched": latched, "latched_until": self._latch_until,
                 "seconds_remaining": remaining, "last_flash_ts": self._last_flash_ts,
                 "in_ring": bool(res.get("in_ring")) and fresh,
-                "nearest_km": self._nearest_km if fresh else None,
-                "nearest_bearing": self._nearest_bearing if fresh else None,
+                "nearest_km": self._nearest_km if current else None,
+                "nearest_bearing": self._nearest_bearing if current else None,
                 "polling_active": polling_active, "last_poll_ts": self._last_poll_ts,
                 "granules_scanned": res.get("granules_scanned", 0),
                 # read in the last GLM_WINDOW_MIN: what the dew monitor judges a poll by

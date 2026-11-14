@@ -11,6 +11,9 @@ Threads:
                    SPC, storm reports).
   * weather-log  — every ~60 s: if due (once a day, in daytime), copy the weather-log
                    rows collected in RAM to the SD card. The only thread that does.
+  * clock-check  — every CLOCK_CHECK_SEC (and at once after a clock step): ask chrony
+                   whether the system clock is synchronised (device 0 is UNSAFE until
+                   it is); in its own thread so IsSafe never waits for chronyc.
   * discovery    — UDP responder so NINA can auto-find us.
   * main thread  — waitress serving the Alpaca HTTP API.
 
@@ -28,7 +31,8 @@ import sys
 import threading
 import time
 
-from . import config, discovery, glm_lightning, housekeeping, radar as radar_mod
+from . import (config, discovery, glm_lightning, housekeeping, radar as radar_mod,
+               servertime)
 from .alpaca import create_app
 from .connectivity import ConnectivityWatch
 from .dew import DewMonitor
@@ -38,6 +42,7 @@ from .monitor import (HAZARD_FEEDS_IMPORT_ERROR, NWS_ALERTS_IMPORT_ERROR, RainPo
 from .nws_forecast import NwsForecastPoller
 from .glm_lightning import GlmLightningPoller
 from .radar import RadarPoller
+from .timesync import ClockSyncWatch
 from .weatherlog import WeatherLog
 
 log = logging.getLogger("ttu.safety")
@@ -229,7 +234,7 @@ def main(argv=None):
 
 def _run(cfg):
     """The daemon proper (main() holds the single-instance lock around it)."""
-    eventlog = EventLog(cfg.EVENT_LOG)
+    eventlog = EventLog(cfg.EVENT_LOG, max_mb=cfg.EVENT_LOG_MAX_MB)
     poller = RainPoller(cfg, eventlog)
     nws = NwsForecastPoller(cfg) if cfg.NWS_ENABLED else None
     glm = GlmLightningPoller(cfg, eventlog) if cfg.GLM_ENABLED else None
@@ -249,11 +254,15 @@ def _run(cfg):
     weatherlog = (_make_optional(lambda: WeatherLog(cfg, eventlog), "weather log", eventlog,
                                  "no weather log (IsSafe unaffected)")
                   if cfg.WEATHER_LOG_ENABLED else None)
+    # Device 0 is UNSAFE until chrony confirms the clock (safety/timesync.py). Created
+    # directly, NOT via _make_optional: if this check could not be created the daemon must
+    # not start without it and serve "safe" from a clock nobody confirmed.
+    clock = ClockSyncWatch(cfg, eventlog) if cfg.CLOCK_SYNC_ENABLED else None
     monitor = SafetyMonitor(cfg, eventlog, poller, nws=nws, glm=glm, radar=radar, conn=conn,
                             hazards=hazards, hazard_feeds=hazard_info,
                             hazards_error=layer_errors.get("hazards"),
                             hazard_feeds_error=layer_errors.get("hazard_info"),
-                            dew=dew, weatherlog=weatherlog)
+                            dew=dew, weatherlog=weatherlog, clock=clock)
 
     for w in cfg.CONFIG_WARNINGS:
         log.warning("CONFIG: %s", w)
@@ -322,7 +331,7 @@ def _run(cfg):
                     eventlog.record("CLOCK-STEP", reason=f"{step:+.0f}s",
                                     result="latches re-checked, all layers re-polled")
                     for comp in (poller, nws, glm, radar, hazards, hazard_info, dew,
-                                 weatherlog):
+                                 weatherlog, clock):
                         if comp is not None:
                             try:
                                 comp.clock_stepped(last_wall, wall)
@@ -402,6 +411,18 @@ def _run(cfg):
                 log.exception("weather log archive run failed")
             stop.wait(60)
 
+    def clock_loop():
+        # Ask chrony in a thread of its own, so IsSafe never waits for chronyc: every
+        # CLOCK_CHECK_SEC, and at once after a clock step (clock.wait returns early).
+        while not stop.is_set():
+            clock.wait(stop, cfg.CLOCK_CHECK_SEC)
+            if stop.is_set():
+                break
+            try:
+                clock.check_now()
+            except Exception:
+                log.exception("clock check failed")
+
     def conn_loop():
         # Probe internet reachability day and night so the "offline > 1 h" clock is accurate.
         while not stop.is_set():
@@ -422,6 +443,19 @@ def _run(cfg):
                 elapsed = 0.0
             stop.wait(max(1.0, cfg.PAGE_INTERVAL - elapsed))
 
+    if clock is not None:
+        log.info("clock check: device %d is UNSAFE until chrony is synchronised to the GPS or "
+                 "an NTP server, with an error bound of at most %g s (checked every %d s; a "
+                 "failed check is tolerated for %s once the clock was confirmed)",
+                 cfg.DEVICE_NUMBER, cfg.CLOCK_MAX_ERROR_SEC, cfg.CLOCK_CHECK_SEC,
+                 servertime.describe(cfg.CLOCK_GRACE_SEC))
+        # The first check BEFORE the evaluator starts: with chrony synchronised the very
+        # first verdict is then not spoiled by "the clock has not been checked yet".
+        try:
+            clock.check_now()
+        except Exception:
+            log.exception("clock check failed")
+        _start_thread(clock_loop, "clock-check")
     _start_thread(evaluator, "evaluator")
     _start_thread(rain_loop, "rain-poller")
     if nws is not None:

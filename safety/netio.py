@@ -138,7 +138,7 @@ def gunzip_capped(data: bytes, max_bytes: int, step: int = INFLATE_STEP) -> byte
     except zlib.error as e:
         raise ValueError("not a readable gzip stream: %s" % e) from None
     if not z.eof:
-        raise ValueError("the gzip stream is cut short")
+        raise ValueError("the gzip stream ends early: the file is cut short")
     if z.unused_data.strip(b"\0"):
         raise ValueError("%d bytes after the gzip stream" % len(z.unused_data))
     return b"".join(parts)

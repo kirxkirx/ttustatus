@@ -22,7 +22,9 @@ from flask import Flask, jsonify, request
 
 from . import __version__
 from .radar import basemap_summary
+from .servertime import describe
 from .textclean import clean_text
+from .timesync import describe_error
 
 # The /setup page links to the source code (make_status_page.py has its own SOURCE_URL).
 SOURCE_URL = "https://github.com/kirxkirx/ttustatus"
@@ -203,6 +205,28 @@ def _setup_html(monitor, cfg) -> str:
         return (f'<tr><td>{html.escape(name)}</td><td>{html.escape(str(value))}</td>'
                 f'<td><span style="color:{dot}">&#9679;</span></td></tr>')
 
+    # The system clock first: every other row is computed from it (absent from an older
+    # daemon's state).
+    clk = comp.get("clock")
+    if isinstance(clk, dict):
+        state = clk.get("state")
+        if not clk.get("enabled"):
+            cv, clk_unknown = "check switched off (TTU_SAFETY_CLOCK_SYNC=0)", True
+        elif state == "synchronised":
+            cv = "synchronised to %s (stratum %s, error ≤ %s)" % (
+                clk.get("reference") or "?", clk.get("stratum"),
+                describe_error(clk.get("max_error_s")))
+            clk_unknown = False
+        elif state == "grace":
+            cv = "not confirmed (%s) — tolerated for another %s" % (
+                clk.get("why"), describe(clk.get("grace_left_s") or 0))
+            clk_unknown = True
+        else:
+            cv = "NOT CONFIRMED — %s; unsafe until chrony is synchronised" % clk.get("why")
+            clk_unknown = False
+        rows.append(row("System clock (chrony)", cv, bool(clk.get("safe", True)),
+                        unknown=clk_unknown))
+
     sun = comp["sun"]
     if sun.get("stale"):
         rows.append(row("Sun altitude", "unknown (inputs stale)", False, unknown=True))
@@ -269,7 +293,12 @@ def _setup_html(monitor, cfg) -> str:
         elif not glm.get("polling_active"):
             gv, glm_unknown = "polling paused (daytime) — no current data", True
         elif not glm.get("available"):
-            gv, glm_unknown = "no fresh data (no recent successful poll)", True
+            # the last poll's own reason when there is one (a refused clock, a feed
+            # outage), instead of a generic "no data"
+            err = glm.get("error")
+            gv = ("no fresh data — %s" % str(err)[:200] if err
+                  else "no fresh data (no recent successful poll)")
+            glm_unknown = True
         elif glm.get("partial"):
             # the last poll did not read its whole window: not a veto, not "clear" either
             nk = glm.get("nearest_km")

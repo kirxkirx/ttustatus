@@ -3,6 +3,8 @@ that combines sun altitude, humidity, and rain into a single IsSafe boolean.
 
 Design rules:
   * FAIL SAFE — any missing/stale input, or any unmet condition, means UNSAFE.
+  * The system clock must be confirmed by chrony (timesync.py) — synchronised to the GPS
+    or an NTP server — before anything else can be trusted: until then IsSafe is false.
   * Rain trips on the FIRST detection by ANY station (no confirmation), and stays unsafe
     for RAIN_LATCH_HOURS after the last rain seen (the latch is persisted to disk).
   * WU is only polled when the sun is below RAIN_POLL_SUN_BELOW_DEG (saves API calls).
@@ -25,7 +27,8 @@ import time
 from datetime import datetime, timezone
 
 from . import (connectivity as conn_mod, dew as dew_mod, glm_lightning, nws_forecast,
-               radar as radar_mod, weatherlog as weatherlog_mod, wu_poll)
+               radar as radar_mod, servertime, timesync, weatherlog as weatherlog_mod,
+               wu_poll)
 
 log = logging.getLogger("ttu.safety.monitor")
 
@@ -606,10 +609,13 @@ class SafetyMonitor:
 
     def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None, radar=None,
                  conn=None, hazards=None, hazard_feeds=None, hazards_error=None,
-                 hazard_feeds_error=None, dew=None, weatherlog=None):
+                 hazard_feeds_error=None, dew=None, weatherlog=None, clock=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
+        # timesync.ClockSyncWatch, or None (TTU_SAFETY_CLOCK_SYNC=0): device 0 is UNSAFE
+        # until chrony confirms the system clock, on which every other check depends
+        self.clock = clock
         self.nws = nws                  # NwsForecastPoller or None (component fails to unknown)
         self.glm = glm                  # GlmLightningPoller or None
         self.radar = radar              # RadarPoller or None
@@ -724,6 +730,23 @@ class SafetyMonitor:
         reasons: list[str] = []
         warnings: list[str] = []
         self._update_geocode(inp, warnings)
+
+        # The SYSTEM CLOCK first: HARD veto until chrony confirms it is synchronised to
+        # the GPS or an NTP server. Every check below depends on the clock — the sun's
+        # altitude (computed by the page from it), the age of every input, which radar
+        # frame and lightning granules are "now" — and a Pi can boot with a clock months
+        # off. The radar and GLM refuse data from a clock their servers disagree with,
+        # but a refused layer only reads "unavailable", which never vetoes on its own.
+        clock = self._clock_component()
+        clock_safe = bool(clock.get("safe"))
+        if not clock_safe:
+            reasons.append("system clock not confirmed by chrony — %s (unsafe until chrony is "
+                           "synchronised to the GPS or an NTP server)" % clock.get("why"))
+        elif clock.get("state") == "grace":
+            warnings.append("chrony could not confirm the clock (%s) — tolerated for another "
+                            "%s, as it was synchronised before"
+                            % (clock.get("why"), servertime.describe(clock.get("grace_left_s")
+                                                                     or 0)))
 
         # The page may serve humidity from its sensor cache: honor the measurement's real
         # age (file ts alone would launder a stale reading as fresh).
@@ -866,7 +889,7 @@ class SafetyMonitor:
         # only, and deliberately not referenced below (tests pin this).
         hazard_info = self._hazard_info_component(now)
 
-        is_safe = bool(sun_safe and hum_safe and rain_safe and nws_safe
+        is_safe = bool(clock_safe and sun_safe and hum_safe and rain_safe and nws_safe
                        and glm_safe and radar_safe and conn_safe and hazards_safe
                        and not stale)
 
@@ -895,6 +918,7 @@ class SafetyMonitor:
             "geocode": {"lat": self.cfg.GEOCODE[0], "lon": self.cfg.GEOCODE[1],
                         "source": self.cfg.GEOCODE_SOURCE},
             "components": {
+                "clock": clock,
                 "sun": {"value_deg": sun_alt,
                         "threshold_deg": self.cfg.SUN_UNSAFE_ABOVE_DEG,
                         "safe": sun_safe, "stale": stale,
@@ -1055,6 +1079,22 @@ class SafetyMonitor:
             warnings.append("rain check blind: 0/%d WU stations reporting for %d min (%s)"
                             % (_finite(rain.get("stations_total")) or 0,
                                max(0, round((now - since) / 60)), radar))
+
+    def _clock_component(self) -> dict:
+        """The clock check's component. Fail-safe: an exception in it is UNSAFE — the check
+        exists to keep a wrong clock from passing as a right one, so an unknown state must
+        not pass either."""
+        if self.clock is None:
+            return timesync.unavailable_component(self.cfg)
+        try:
+            c = self.clock.component()
+            if not isinstance(c, dict):
+                raise TypeError("component is %s, not a dict" % type(c).__name__)
+            return c
+        except Exception as e:
+            self._log_component_error("clock", e)
+            return {"safe": False, "enabled": True, "state": "unconfirmed",
+                    "synchronised": False, "why": "clock check error: %s" % str(e)[:120]}
 
     # -- dew monitor (Alpaca device 1) and weather log ---------------------------
     def _forecast_outlook(self, now):

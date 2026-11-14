@@ -2852,7 +2852,12 @@ def build_safety_tiles_html(comp, state_stale=False):
         glm_s = safety_dot_html(True, unknown=True) + "not polling (daytime)"
     elif not glm.get("available"):
         glm_v = '<div class="v mono">no&nbsp;data</div>'
-        glm_s = safety_dot_html(True, unknown=True) + "no successful poll yet"
+        # the daemon says why the last poll failed (a refused clock, a feed outage);
+        # "no successful poll yet" is true only when there is no such reason
+        err = glm.get("error")
+        glm_s = safety_dot_html(True, unknown=True) + (
+            "last poll failed &mdash; %s" % html.escape(str(err)[:90]) if err
+            else "no successful poll yet")
     elif glm.get("partial"):
         # the last poll did not read its whole window: "no strike" there is not proof of
         # none (not a veto; the component's warning says why)

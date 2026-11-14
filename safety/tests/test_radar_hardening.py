@@ -4,7 +4,7 @@
   the cached basemap) are opened by Pillow's PNG (and, for the map, JPEG) reader only,
   after a magic-byte check, so an EPS reply never reaches Ghostscript; their size and
   mode are checked on the header BEFORE a pixel is decoded;
-* the bucket's gzip'ed file is inflated in steps up to FRAME_INFLATED_MAX, never whole;
+* the bucket's gzip'ed file is inflated in steps up to GRIB_MAX_BYTES, never whole;
 * every reply body is read against a cap and a deadline for the whole body (frames,
   listings and tiles), so a trickling server cannot hold the radar thread;
 * the crop's values are read without Image.getdata, which goes in Pillow 14.
@@ -249,7 +249,7 @@ def test_the_cached_composite_is_read_as_png_or_jpeg_of_the_map_s_size(tmp_path,
     assert img.size == (t._ox, t._oy) and img.getpixel((0, 0)) == (1, 2, 3)
 
 
-# ---- D2: the bucket's file is inflated in steps, up to FRAME_INFLATED_MAX --------------
+# ---- D2: the bucket's file is inflated in steps, up to GRIB_MAX_BYTES --------------
 def _gzip_of_zeros(n):
     """A gzip file of ``n`` zero bytes, built without holding them (~1000:1)."""
     z = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
@@ -259,7 +259,7 @@ def _gzip_of_zeros(n):
 
 
 def test_a_gzip_bomb_is_refused_without_inflating_it(small_grid):
-    bomb = _gzip_of_zeros(rd.FRAME_INFLATED_MAX + (32 << 20))     # 64 MB from ~64 kB
+    bomb = _gzip_of_zeros(rd.GRIB_MAX_BYTES + (32 << 20))     # 48 MB from ~48 kB
     assert len(bomb) < 200 << 10
     tracemalloc.start()
     try:
@@ -268,7 +268,7 @@ def test_a_gzip_bomb_is_refused_without_inflating_it(small_grid):
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert peak < rd.FRAME_INFLATED_MAX + (8 << 20)         # never the whole 64 MB
+    assert peak < rd.GRIB_MAX_BYTES + (8 << 20)         # never the whole 48 MB
 
 
 def test_a_gzip_file_with_data_behind_it_is_refused(small_grid):
@@ -282,7 +282,7 @@ def test_a_gzip_file_with_data_behind_it_is_refused(small_grid):
 
 def test_the_inflated_limit_leaves_room_for_a_real_file():
     # the bucket's SeamlessHSR file of 2026-11-10 inflated to 1 003 393 bytes
-    assert rd.FRAME_INFLATED_MAX >= 16 * 1003393
+    assert rd.GRIB_MAX_BYTES >= 16 * 1003393
 
 
 # ---- D3: a reply's body is read against a cap and a deadline -----------------------------
@@ -401,14 +401,14 @@ def test_pixels_uses_get_flattened_data_where_pillow_has_it():
     class Old:                          # the apt Pillow of Bookworm (9.4) and Trixie (11.x)
         def getdata(self):
             return [1, 2, 3]
-    assert list(rd._pixels(New())) == list(rd._pixels(Old())) == [1, 2, 3]
+    assert list(rd._values(New())) == list(rd._values(Old())) == [1, 2, 3]
 
 
 def test_pixels_of_a_real_image_are_its_values_row_by_row():
     im = Image.new("I;16", (3, 2), 0)
     for i, (c, r) in enumerate((c, r) for r in range(2) for c in range(3)):
         im.putpixel((c, r), 9000 + i)
-    assert list(rd._pixels(im)) == [9000, 9001, 9002, 9003, 9004, 9005]
+    assert list(rd._values(im)) == [9000, 9001, 9002, 9003, 9004, 9005]
 
 
 def test_the_frame_conversion_uses_no_deprecated_pillow_call(small_grid):

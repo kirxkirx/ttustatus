@@ -34,7 +34,8 @@ must never wear the SD card; both are regenerated within seconds of a restart.)
 
 Durable files (survive reboot): `~/safety_latch.json` (the rain latch), the GLM / radar /
 NWS-warning latches beside it, and `~/safety_events.log` (the audit trail, also mirrored
-to stdout).
+to stdout; size-capped with its one backup `~/safety_events.log.1`, see
+[SD-card wear](#sd-card-wear)).
 
 **One daemon at a time.** Before it creates any layer, starts any thread or writes any
 file, the daemon takes an exclusive, non-blocking `flock` on `~/.ttu-safety.lock`
@@ -64,6 +65,7 @@ state file, and the page's `safety_inputs.json.tmp`, `status_page_cache.json.tmp
 
 | Input | Unsafe when | Source |
 |------|-------------|--------|
+| System clock | chrony is **not synchronised to the GPS or an NTP server** (`chronyc tracking`), or its error bound is over 1 s — every other row is computed from the clock (see *Clock robustness*) | this daemon |
 | Sun altitude | `> 0°` (no refraction / angular-size correction) | make_status_page.py |
 | Humidity | `> 95 %` (clears again below 93 %, small hysteresis) | make_status_page.py (DHT) |
 | Rain | **any** WU station reports `precipRate > 0` (0 of N stations reporting counts as no rain: shown as a *rain check blind* warning, never a veto — see below) | this daemon |
@@ -327,9 +329,13 @@ If a later version changes the columns in the middle of a month, that month cont
    system-wide `pip3` (PEP 668 "externally-managed-environment"), so install via apt — then
    `/usr/bin/python3` (and the systemd unit below) find them with no path changes:
    ```bash
-   sudo apt update && sudo apt install python3-flask python3-waitress
+   sudo apt update && sudo apt install python3-flask python3-waitress chrony
    python3 -c "import flask, waitress; print('ok')"      # verify
+   chronyc tracking                                      # "Leap status : Normal"
    ```
+   **chrony is required:** device 0 reads UNSAFE until `chronyc tracking` shows the clock
+   synchronised to the GPS or an NTP server (*Clock robustness* below). Installing chrony
+   replaces Raspberry Pi OS's default systemd-timesyncd.
    Alternative — a dedicated venv (no system packages, newer Flask):
    ```bash
    python3 -m venv ~/safety-venv
@@ -399,6 +405,33 @@ The Pi has no battery-backed RTC: after a power cut it boots with whatever time
 incident: a boot under a March clock read the persisted August latches as *"rain latch
 active (227329 min left)"*). The daemon defends itself:
 
+- **UNSAFE until chrony confirms the clock** (`safety/timesync.py`). Every check is
+  computed from the clock — the sun's altitude above all: at true noon on 13 Nov the sun
+  stands at +37.6° over the site, but a clock 6 h slow computes −16.4°, "night" — so
+  device 0 reads **UNSAFE** until
+  `chronyc -n -c tracking` (asked every 30 s, in a thread of its own) shows all of:
+  - a real reference: the GPS's reference clock (e.g. `PPS`) or an NTP server — not
+    `00000000` (none) and not chrony's `local` self-reference (`7F7F0101`, the Pi
+    trusting its own clock);
+  - stratum 1–15 and a leap status other than *Not synchronised*;
+  - chrony's own bound on the clock's error (|offset| + root delay/2 + root dispersion)
+    within `TTU_SAFETY_CLOCK_MAX_ERROR_SEC` (1 s; a synchronised Pi shows microseconds with
+    the GPS's PPS, tens to a few hundred milliseconds with GPS NMEA alone or internet NTP).
+    The bound also grows while chrony has no source at all, so a Pi that has lost the GPS
+    *and* every NTP server reads UNSAFE after roughly half a day to a few days.
+
+  chronyc missing, chronyd not running, a timeout or unreadable output all count as *not
+  confirmed*. Once the clock has been confirmed, a failed check is tolerated for
+  `TTU_SAFETY_CLOCK_GRACE_SEC` (10 min: a chronyd restart during a package upgrade must
+  not close the dome; a clock that was right cannot drift meaningfully in that time). A
+  **clock step ends that grace at once** — the clock just changed, so it is confirmed
+  anew (within a second when chrony made the step). The reason is shown on both pages
+  (*"system clock not confirmed by chrony — chrony is not synchronised to any time source
+  yet"*), the `/setup` page has a *System clock (chrony)* row (*"synchronised to PPS
+  (stratum 1, error ≤ 11 µs)"*), and a `CLOCK-SYNC` event marks the start and the end of
+  an unconfirmed spell. All timing is on the monotonic clock; nothing is persisted (a
+  restarted daemon asks chrony before its first verdict). `TTU_SAFETY_CLOCK_SYNC=0`
+  switches the check off (warned at startup).
 - **Persisted latch timestamps are clamped** at load *and* at every check: a rain latch
   can never exceed one full `RAIN_LATCH_HOURS`, GLM one cool-off, the radar freeze one
   `RADAR_LATCH_SEC` — whatever a wrong clock did, the worst case is one full latch
@@ -416,8 +449,13 @@ active (227329 min left)"*). The daemon defends itself:
   header): while it disagrees with the Pi's clock by more than the tolerance, the data
   is refused — the layer reads *unavailable*, never "clear" — and a warning on both
   pages names the offset (*"this host's clock is 158 d behind the radar servers' —
-  radar frames refused until the clock is corrected"*), with a `CLOCK` event when it
-  starts and ends.
+  radar frames refused until the clock is corrected"*), with a `CLOCK` event (and an
+  error in the log) from the radar and from GLM when it starts and ends. Once refused,
+  the clock must agree to within the tolerance **less 10 s** before data is accepted
+  again: a `Date` has whole seconds, and a clock off by almost exactly the tolerance
+  would otherwise be refused and accepted by turns, each flip an event on the SD card.
+  (While chrony is synchronised the Pi's clock is microseconds off, so this guard is
+  the second line behind the chrony check above: it catches a wrong time source.)
 - Pollers treat a **backward** step as "poll now" instead of stalling until the wall
   clock catches up; the connectivity watchdog runs entirely on the monotonic clock, so
   steps can neither fake a huge offline window nor neutralize it.
@@ -436,7 +474,8 @@ active (227329 min left)"*). The daemon defends itself:
 
 None of this replaces NTP — until the clock syncs, the radar and GLM have no data and
 everything computed from the clock (the sun's altitude above all) is as wrong as the
-clock. It bounds the damage and makes the condition loud instead of silent.
+clock; that is why device 0 stays UNSAFE until chrony confirms it. The rest bounds the
+damage and makes the condition loud instead of silent.
 
 **Pi ops — keep the boot clock close:** `fake-hwclock` is NOT installed on every image
 (it was absent on the observatory Pi — the 2026-08 incident's "March" boot time came from
@@ -461,9 +500,10 @@ The Pi runs 24/7 from an SD card on imperfect power, so every recurring write ma
 | `/dev/shm/ttu_radar*.png` + `/dev/shm/status.html` (symlinked from `/var/www/html`) | every 90 s / 5 min | RAM |
 | `~/safety_latch.json`, `~/safety_glm_latch.json`, `~/safety_radar_latch.json` | only on rain/lightning events | SD (must survive reboot) |
 | `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning, and at most hourly while a long warning keeps being listed (its 24 h release bound is renewed); written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
-| `~/safety_events.log` (audit trail) | only on events | SD (its purpose) |
+| `~/safety_events.log` (audit trail) | only on events | SD (its purpose). Capped at 1 GB together with its one backup (`TTU_SAFETY_EVENT_LOG_MAX_MB`): at half the cap it is renamed `safety_events.log.1` (replacing the older backup) and a new file starts. At a few kB a day that is decades, so the cap only guards against an event storm filling the card |
 | `~/.ttu-safety.lock` (single-instance lock) | created once; one short line at each daemon start | SD (a few bytes per start) |
 | `/dev/shm/ttu_weather_log/` (weather-log rows not archived yet) | every 5 min, plus every WU poll | RAM |
+| `/dev/shm/tmp*.nc` (one GLM granule while it is read, then deleted) | ~15 per GLM poll, at night | RAM |
 | `/var/www/html/weather_log/*.csv` (weather-log archive) | one append per monthly file every 24 h, in daytime, and when the daemon is stopped | SD (its purpose; about 0.2 MB a day) |
 | `~/.cache/ttu-radar/` basemaps | once ever (per site, theme and source — CARTO or OpenStreetMap; never a partial one, never one with a refused tile) | SD (avoids re-fetching map tiles per boot) |
 | `~/.cache/ttu-hazards/zones/<type>_<ID>.json` (NWS zone outlines), `points_<lat>_<lon>.json` (the site's zones) | once per zone (never re-fetched while the site stays put; a zone without a usable outline once a day); the site's zones only if NWS changes them | SD (~200 KB for a three-state event: simplified outlines near the map, bounding boxes far away) |
@@ -490,8 +530,17 @@ sudo apachectl configtest && sudo systemctl reload apache2
 ```
 (edit files in `sites-available/`, not the `sites-enabled/` symlinks — `sed -i` would
 silently replace a symlink with a regular file)
-Also: bound journald (`/etc/systemd/journald.conf`: `SystemMaxUse=64M`) while keeping
-`Storage=persistent` for reboot forensics; check swap (`swapon --show` — zram = RAM =
+Also the journal, where the daemon's own log lines go. Raspberry Pi OS keeps it **in
+RAM** (`Storage=volatile`, set by `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`).
+That means no SD writes and a cap of its own (10 % of the size of `/run`: tens of MB),
+but it is **lost at every reboot**. `deploy/install.sh` adds
+`/etc/systemd/journald.conf.d/60-ttu-safety.conf` with `SystemMaxUse=1G`. It does nothing
+while the journal is in RAM, and caps it at 1 GB if you keep it on the card for reboot
+forensics. To keep it on the card, add `Storage=persistent` (in a drop-in of your own,
+named to sort after `40-`), then `sudo systemctl restart systemd-journald`. Expect a
+steady trickle of small SD writes from then on. Check what is in force with
+`systemd-analyze cat-config systemd/journald.conf | grep -E '^(Storage|SystemMaxUse)'` and
+`journalctl --disk-usage`. Check swap (`swapon --show` — zram = RAM =
 good; a `dphys-swapfile` swapfile lives ON the SD); `sudo systemctl disable --now
 packagekit` on a headless Pi; confirm `noatime` on root (`findmnt -o OPTIONS /`); keep
 chrony's drift file (it makes the clock accurate quickly after reboot); and re-check
@@ -536,6 +585,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_LOCAL_TZ` | `America/Chicago` | timezone of the forecast table (invalid ⇒ loud UTC fallback) |
 | `TTU_SAFETY_STATE_HEARTBEAT_SEC` | `60` | max interval between unchanged state-file writes (SD-wear throttle; 10-120) |
 | `TTU_SAFETY_INPUTS_FILE` / `_STATE_FILE` / `_LATCH_FILE` / `_EVENT_LOG` | see `config.py` | file paths |
+| `TTU_SAFETY_EVENT_LOG_MAX_MB` | `1024` | size cap of the event log **together with its one backup** (`.1`): at half of it the file becomes `.1` and a new one starts |
 | `TTU_SAFETY_LOCK_FILE` | `~/.ttu-safety.lock` | the single-instance lock: a second daemon exits with status 1 (see Architecture); empty = the default |
 | `TTU_SAFETY_NWS` | `1` | enable the NWS forecast component (`0` disables) |
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent of the NWS, IEM radar, hazard-feed and map-tile requests (WU, GLM and the connectivity probe send their own). **Absolutely crucial: put a REAL e-mail address in it**: `ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)` with `you@example.org` replaced by your own address (double-quoted in `ttustatus.env`). OpenStreetMap blocks a placeholder like `you@example.org` — the daemon then requests no OSM tiles, and a map with no CARTO basemap (cached or keyed) has no basemap — and NWS asks for a contact. The default names the app but has no contact (warned at startup, and on the page when OSM is used) |
@@ -558,8 +608,8 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_RADAR_STALE_SEC` | `1200` | a frame older than this **by its own time** is "no data" (unavailable; 600-3600) |
 | `TTU_SAFETY_RADAR_SOURCES` | `aws,iem` | the frame sources asked every poll, the newest frame read: `aws` = NOAA's MRMS bucket on AWS (~1 min behind), `iem` = IEM's lcref archive (~5.5 min behind). One name alone leaves no fallback; unknown names are ignored (warned) |
 | `TTU_SAFETY_RADAR_AWS_URL` | `https://noaa-mrms-pds.s3.amazonaws.com` | base URL of the MRMS bucket |
-| `TTU_SAFETY_RADAR_RETRY_SEC` | `60` | a poll that got no new frame is retried after this many seconds (30 … the poll interval) |
-| `TTU_SAFETY_SERVER_CLOCK_TOL_SEC` | `60` | wrong-clock guard: radar frames and GLM granules are refused while the server's `Date` disagrees with the Pi's clock by more than this (`0` = off, warned; otherwise at least 60) |
+| `TTU_SAFETY_RADAR_RETRY_SEC` | `60` | a poll that got no new frame is retried after this many seconds (30 … the poll interval) — the first three misses in a row; then every `TTU_SAFETY_RADAR_POLL_INTERVAL` until a frame arrives |
+| `TTU_SAFETY_SERVER_CLOCK_TOL_SEC` | `60` | wrong-clock guard: radar frames and GLM granules are refused while the server's `Date` disagrees with the Pi's clock by more than this (`0` = off, warned; otherwise at least 60); once refused, accepted again only within this less 10 s |
 | `TTU_SAFETY_RADAR_THUMB` | `/var/www/html/ttu_radar.png` | thumbnail path (beside status.html) |
 | `TTU_SAFETY_RADAR_BASEMAP` | `auto` | basemap chain: `auto` = cached CARTO → CARTO with the key → OpenStreetMap → plain background; `carto` = never OpenStreetMap; `osm` = never CARTO, not even the cached maps (anything else ⇒ `auto`, warned) |
 | `TTU_SAFETY_CARTO_KEY` | (unset) | CARTO Basemaps API key, sent as `?key=` on CARTO tile URLs — a secret: never logged, never on the page, `/setup` or in a file name. Needed only to fetch new CARTO tiles; cached CARTO maps are used without it. Free, no account: request it by e-mail at [carto.com/basemaps/apikey](https://carto.com/basemaps/apikey) (free up to 5M requests/month, non-commercial) |
@@ -570,6 +620,11 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_CONN` | `1` | enable the connectivity watchdog (`0` disables) |
 | `TTU_SAFETY_OFFLINE_UNSAFE_SEC` | `3600` | UNSAFE after this long with no internet (600-86400, and at least two probe intervals) |
 | `TTU_SAFETY_CONN_PROBE_INTERVAL` | `300` | seconds between reachability probes (30-3600) |
+| `TTU_SAFETY_CLOCK_SYNC` | `1` | the clock check: device 0 UNSAFE until chrony is synchronised to the GPS or an NTP server (`0` switches it off, warned at startup) |
+| `TTU_SAFETY_CLOCK_CHECK_SEC` | `30` | seconds between `chronyc tracking` checks (5 … 600) |
+| `TTU_SAFETY_CLOCK_MAX_ERROR_SEC` | `1` | largest error bound chrony may report (\|offset\| + root delay/2 + root dispersion) and still count as synchronised (0.01 … 60) |
+| `TTU_SAFETY_CLOCK_GRACE_SEC` | `600` | once the clock was confirmed, a failed check is tolerated this long (a chronyd restart); a clock step ends it (0 … 3600) |
+| `TTU_SAFETY_CHRONYC` | `chronyc` | the chronyc program to ask |
 | `TTU_SAFETY_HAZARDS` | `1` | enable the NWS active-alerts layer (`0` disables it: no warning veto, no alert lists or map areas) |
 | `TTU_SAFETY_HAZARD_VETO_EVENTS` | `Tornado Warning,Dust Storm Warning,High Wind Warning` | NWS events that make the monitor UNSAFE while in effect over the site, for the warning's duration (comma list, case-insensitive; empty = every alert display-only, announced at startup; a name NWS does not know is kept but warned about) |
 | `TTU_SAFETY_HAZARD_VETO_ONSET_LEAD_SEC` | `900` | a veto warning issued ahead of its onset vetoes from this long before the onset (shown as *scheduled* until then) |
@@ -692,9 +747,11 @@ three IEM outages left the radar blind for 34–49 min each.
   it was fetched: a stalled feed cannot keep an old frame current (with IEM alone, frames
   up to 35 min old used to count as live during its stalls).
 - A poll without a new frame is **retried after a minute** (`TTU_SAFETY_RADAR_RETRY_SEC`)
-  instead of five. A host that does not answer is asked nothing more that poll, each
-  source's lookup gets at most 30 s (a slow, overloaded source cannot starve the other),
-  and no request starts after 120 s: a dead source costs one timeout.
+  instead of five — three times in a row at most; a source that stays down or stalled is
+  then asked every 5 min until a frame arrives (asking every minute walked IEM's whole
+  20-min window ~480 times an hour). A host that does not answer is asked nothing more
+  that poll, each source's lookup gets at most 30 s (a slow, overloaded source cannot
+  starve the other), and no request starts after 120 s: a dead source costs one timeout.
 - **Every reply is bounded as a whole**, not only each wait on the socket: a frame must
   arrive within 30 s, a HEAD or listing within 10 s (never more than is left of the
   lookup's 30 s or the poll's 120 s), a reply larger than 32 MB (a listing: 1 MB) is
@@ -702,7 +759,7 @@ three IEM outages left the radar blind for 34–49 min each.
   cut off at the deadline, the host then asked nothing more that poll. Before, such a
   server held the radar thread for as long as it liked, and the radar went *unavailable*
   meanwhile. The bucket's gzip'ed file (~1 MB inflated) is inflated in steps and refused
-  beyond 32 MB inflated, so a few kB of gzip cannot inflate to gigabytes in the daemon.
+  beyond 16 MB inflated, so a few kB of gzip cannot inflate to gigabytes in the daemon.
 - **Only PNG reaches the image decoder**: IEM's frame and the PNG inside the bucket's
   GRIB2 are checked for PNG's signature and opened by Pillow's PNG reader alone (a
   Pillow too old to restrict the format is refused), so a reply in another format, an EPS
@@ -711,6 +768,13 @@ three IEM outages left the radar blind for 34–49 min each.
   7000 × 3500 lcref grid in palette or grey indices (the GRIB2 payload: 8 or 16-bit grey)
   is refused, and Pillow's decompression-bomb warning is an error. A PNG of 136 kB that
   declares 12000 × 12000 pixels used to cost 144 MB before it was refused.
+- A file **refused for what it contains** (not MRMS's product, another grid or time,
+  unreadable) is not downloaded again — the same URL gives the same bytes; the page keeps
+  its reason, marked *not downloaded again*, until a newer frame appears. A download that
+  failed (no answer, an HTTP error, a reply cut short) is tried again.
+- The ring check and the frame's decoded area always describe **the same site**: if the
+  GPS position is adopted while a poll is downloading, that frame is set aside and fetched
+  again for the new site a minute later.
 - The pages say where the frame came from ("frame 02:10Z from NOAA Open Data (AWS)") and
   list each source's newest frame or its problem, so a dead backup shows up before it is
   needed; a source switch is a `RADAR-SOURCE` event. A reply whose `Date` disagrees with
@@ -818,8 +882,11 @@ Every 5 min **while the sun is below 5°** (night, like WU rain) the daemon fetc
 **GOES-19 GLM total-lightning** granules published since its last poll (at least the last
 5 min) from AWS Open Data (anonymous S3, no key)
 and **latches UNSAFE for 30 min** (the freeze time) if any flash is within **50 km**. Parsing is **entirely in
-RAM** (in-memory netCDF, `/dev/shm` fallback) — **no SD-card writes** — and the slow
-S3/netCDF poll runs in its own thread, so it never blocks `evaluate()` or the status page.
+RAM** (each granule from a file in `/dev/shm`, in-memory netCDF where there is no
+`/dev/shm`) — **no SD-card writes** — and the slow S3/netCDF poll runs in its own thread, so
+it never blocks `evaluate()` or the status page. (Read from memory in that thread,
+Raspberry Pi OS's HDF5 printed a ~20-line error stack per granule — some 3600 journal lines
+an hour at night — although the read itself worked: found by the Raspberry Pi OS test.)
 Needs `numpy` + `netCDF4` (`sudo apt install python3-numpy python3-netcdf4`); if absent, GLM
 is disabled and the other layers are unaffected. Both status pages show the trigger state and
 the distance to the nearest strike. Fail-safe: a fetch error never clears an active latch and
@@ -1149,11 +1216,33 @@ The daemon needs no Pi hardware (it only reads JSON and polls WU over the networ
 ```bash
 pip install flask waitress pytest flake8
 python -m pytest safety/tests -q                       # unit + smoke tests (hardware and network stubbed)
-# smoke test: feed inputs and hit the API
-# (a lock file of its own: the default one, ~/.ttu-safety.lock, is a running daemon's)
-TTU_SAFETY_INPUTS_FILE=/tmp/in.json TTU_SAFETY_HTTP_PORT=11234 \
+# smoke test: feed inputs and hit the API (CLOCK_SYNC=0: a laptop without chrony would
+# otherwise read UNSAFE, "system clock not confirmed by chrony"; a lock file of its own:
+# the default one, ~/.ttu-safety.lock, is a running daemon's)
+TTU_SAFETY_CLOCK_SYNC=0 TTU_SAFETY_INPUTS_FILE=/tmp/in.json TTU_SAFETY_HTTP_PORT=11234 \
     TTU_SAFETY_LOCK_FILE=/tmp/ttu-test.lock python safety_monitor.py &
 echo '{"ts":'$(date +%s)',"sun_altitude_deg":-10,"humidity_pct":40}' > /tmp/in.json
 curl -X PUT localhost:11234/api/v1/safetymonitor/0/connected -d Connected=true
 curl localhost:11234/api/v1/safetymonitor/0/issafe          # -> Value: true
 ```
+
+**On Raspberry Pi OS itself.** Normal CI (`ci.yml`) runs the suite on x86 with the newest
+pip packages. `raspios.yml` runs it inside real Raspberry Pi OS 64-bit images under QEMU,
+with the Pi's own packages from apt, and test-deploys the daemon there:
+`ci/raspios_test.sh` installs README.md's packages, runs flake8 and the suite, runs
+`deploy/install.sh` for a throwaway user `ttuci` (systemctl stood in for — nothing boots in
+a chroot), starts the daemon the way the installed unit does (live NOAA radar and GLM data
+included; no map tiles), asks both Alpaca devices and `/setup`, and stops it with SIGTERM.
+One image is pinned to the Pi's release (trixie), the other is whatever Raspberry Pi
+currently publishes as its newest, so a new OS release is tested before the Pi is
+upgraded. It runs on pushes to main (not for documentation-only changes), weekly and by
+hand (*Actions → Raspberry Pi OS → Run workflow*). The script also runs as root in any
+throwaway Raspberry Pi OS system (`sudo ci/raspios_test.sh` on a scratch SD card) — **never
+on the observatory Pi**: it installs a `ttu-safety` unit, and it refuses to run where a
+`ttu-safety` unit for any other user exists.
+In CI the image is a plain chroot that shares the runner VM's processes, so the script
+never picks processes by user: it stops only its own daemon's process group, and `ttuci`
+gets a fixed UID (4242) that cannot be the GitHub runner's (1001). If a run ends
+"cancelled" without anyone cancelling it, read the full job log
+(`gh api repos/kirxkirx/ttustatus/actions/jobs/<job id>/logs`): `gh run view --log` drops
+the line "The runner has received a shutdown signal".
