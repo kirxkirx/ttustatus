@@ -43,11 +43,24 @@ POLICY=/usr/sbin/policy-rc.d
 CREATED_POLICY=0
 SHM_MOUNTED=0
 PID=
+PGID=
 cleanup() {
-    if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; fi
-    pkill -u "$U" 2>/dev/null || true
-    sleep 1
-    if [ "$SHM_MOUNTED" = 1 ]; then umount /dev/shm 2>/dev/null || true; fi
+    # The daemon's process group - everything it started, and only that (setsid, below):
+    # TERM, up to 30 s to go, then KILL. Nothing here is chosen by user name or UID. The
+    # CI chroot shares the runner VM's process table: `pkill -u "$U"` once sent SIGTERM to
+    # GitHub's own runner (U had UID 1001, the runner's), and a run that had passed
+    # everything ended "cancelled" a second later.
+    if [ -n "$PGID" ]; then
+        kill -TERM -- "-$PGID" 2>/dev/null || true
+        for _ in $(seq 1 30); do kill -0 -- "-$PGID" 2>/dev/null || break; sleep 1; done
+        kill -KILL -- "-$PGID" 2>/dev/null || true
+    fi
+    # Never leave the tmpfs on /dev/shm: the image's /dev is the HOST's /dev, bound in, and
+    # the action's own clean-up answers a /dev it cannot unmount with `fuser -k` on it.
+    # Lazily, if a process still holds a file there.
+    if [ "$SHM_MOUNTED" = 1 ]; then
+        umount /dev/shm 2>/dev/null || umount -l /dev/shm 2>/dev/null || true
+    fi
     if [ "$CREATED_POLICY" = 1 ]; then rm -f "$POLICY"; fi
 }
 trap cleanup EXIT
@@ -84,7 +97,19 @@ python3 -m pytest safety/tests -q -p no:cacheprovider
 # A user of its own (U, above), so no real user's home is ever touched — made afresh every
 # run, so nothing of an earlier run (event log, latches, caches) can pass for this one's.
 if id "$U" >/dev/null 2>&1; then userdel --remove "$U" 2>/dev/null || true; fi
-useradd --create-home "$U"
+# (userdel leaves a home it does not consider U's, and useradd would then reuse it as it
+# is - with the old owner, unreadable for the new U)
+rm -rf "/home/${U:?}"
+# A UID of its own. useradd's next free one is 1001 in these images (pi has 1000), and in
+# the CI chroot, which shares the runner VM's processes, 1001 is GitHub's "runner" user:
+# the daemon would run AS the runner (it could signal it, read its /proc, count against
+# its process limit). Nobody uses 4242 on GitHub's runners; refuse if anything here does.
+U_UID=4242
+if ps -eo ruid=,euid= | tr -s ' ' '\n' | grep -qx "$U_UID"; then
+    echo "UID $U_UID is in use by a process on this machine: pick another U_UID" >&2
+    exit 1
+fi
+useradd --create-home --uid "$U_UID" "$U"
 APP=/home/$U/ttustatus
 mkdir -p "$APP"
 tar -C "$REPO" --exclude=.git -cf - . | tar -C "$APP" -xf -
@@ -127,7 +152,11 @@ EOF
 chown "$U": "$RUN/inputs.json"
 # (setpriv, not runuser: it execs, so $! is the daemon itself and gets the SIGTERM below;
 # env -i: a service's environment is as bare as this, plus its EnvironmentFile)
-setpriv --reuid="$U" --regid="$U" --init-groups env -i HOME="/home/$U" USER="$U" \
+# (setsid: a session and process group of its own - the daemon's PID is its group ID - so
+# cleanup can stop it together with anything it started, and only that. A background job
+# of this non-interactive shell is no group leader, so setsid does not fork and $! stays
+# the daemon's PID.)
+setsid setpriv --reuid="$U" --regid="$U" --init-groups env -i HOME="/home/$U" USER="$U" \
     LOGNAME="$U" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 /bin/bash -c "
     set -a; . /home/$U/ttustatus.env; set +a
     export TTU_SAFETY_PAGE=0 TTU_SAFETY_HTTP_HOST=127.0.0.1 TTU_SAFETY_HTTP_PORT=$PORT
@@ -138,7 +167,8 @@ setpriv --reuid="$U" --regid="$U" --init-groups env -i HOME="/home/$U" USER="$U"
     export TTU_SAFETY_RADAR_BASEMAP=carto
     export TTU_SAFETY_NWS_UA='ttu-safety-monitor CI (+https://github.com/kirxkirx/ttustatus)'
     cd $APP && exec /usr/bin/python3 $APP/safety_monitor.py" > "$LOG" 2>&1 &
-PID=$!                                     # (stopped by cleanup if anything below fails)
+PID=$!
+PGID=$PID                                  # (stopped by cleanup, however the script ends)
 API=http://127.0.0.1:$PORT
 for _ in $(seq 1 180); do                   # emulated ARM: imports take a while
     curl -sf "$API/management/apiversions" >/dev/null && break
@@ -146,6 +176,12 @@ for _ in $(seq 1 180); do                   # emulated ARM: imports take a while
     sleep 1
 done
 curl -sf "$API/management/apiversions" >/dev/null || { cat "$LOG"; echo "no answer"; exit 1; }
+# what cleanup relies on: the daemon leads its own process group
+if [ "$(ps -o pgid= -p "$PID" | tr -d ' ')" != "$PID" ]; then
+    ps -o pid,pgid,sid,user,args -p "$PID" || true
+    echo "the daemon is not in a process group of its own"
+    exit 1
+fi
 # The radar polls at once, day and night, and GLM too (the inputs above say "night"):
 # give both a moment to read real data — a real AWS frame decoded with the Pi's Pillow,
 # real GLM granules read with its netCDF4/HDF5. (Not a failure if NOAA is slow today.)

@@ -996,3 +996,9 @@ hand (*Actions → Raspberry Pi OS → Run workflow*). The script also runs as r
 throwaway Raspberry Pi OS system (`sudo ci/raspios_test.sh` on a scratch SD card) — **never
 on the observatory Pi**: it installs a `ttu-safety` unit, and it refuses to run where a
 `ttu-safety` unit for any other user exists.
+In CI the image is a plain chroot that shares the runner VM's processes, so the script
+never picks processes by user: it stops only its own daemon's process group, and `ttuci`
+gets a fixed UID (4242) that cannot be the GitHub runner's (1001). If a run ends
+"cancelled" without anyone cancelling it, read the full job log
+(`gh api repos/kirxkirx/ttustatus/actions/jobs/<job id>/logs`): `gh run view --log` drops
+the line "The runner has received a shutdown signal".
