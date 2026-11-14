@@ -20,6 +20,11 @@ on:
     - cron: "23 7 * * 1"           # Mondays, 07:23 UTC
   workflow_dispatch:
 
+# The job only reads the checkout: its token gets no write access to anything (the
+# arm-runner action does not use the token at all).
+permissions:
+  contents: read
+
 concurrency:
   group: raspios-${{ github.ref }}
   cancel-in-progress: true
@@ -39,7 +44,10 @@ jobs:
           - name: Raspberry Pi OS, newest image
             image: latest
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by commit, as in ci.yml: a tag can be moved to other code, a commit hash
+      # cannot. To update, look up the commit the tag names now and replace hash and comment
+      # together. (checkout v5, as in ci.yml: v4 runs on the retired Node 20.)
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
 
       - name: Image to test
         id: image
@@ -59,7 +67,8 @@ jobs:
           echo "testing $url"
 
       - name: Test and deploy inside the image
-        uses: pguyot/arm-runner-action@v2
+        # (a composite action that uses no other action: this hash pins all it runs)
+        uses: pguyot/arm-runner-action@e1773de1ed6eb61848f5693de824d836f0b0ea25  # v2.6.5 (= v2 on 2026-11-13)
         with:
           base_image: ${{ steps.image.outputs.url }}
           cpu: max:cortex-a72           # the Raspberry Pi 4's CPU

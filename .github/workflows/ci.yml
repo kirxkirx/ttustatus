@@ -47,6 +47,6 @@ jobs:
 
       - name: Shell script syntax
         run: |
-          for f in deploy/install.sh run_safety_monitor.sh run_status_page.sh; do
+          for f in deploy/install.sh run_safety_monitor.sh run_status_page.sh ci/raspios_test.sh; do
             bash -n "$f"
           done
