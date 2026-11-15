@@ -33,11 +33,17 @@ log = logging.getLogger("ttu.safety.wu")
 # timeout bounds each wait on the socket, not the reply (safety/netio.py).
 MAX_REPLY_BYTES = 256 * 1024
 READ_DEADLINE_S = 30.0
-# Retry-After of a 429/503 is honoured, but never beyond this: a rain check paused for
-# longer than an hour on one header would be a rain check switched off.
+# The Retry-After of a 429 is read for the log and the state only, bounded to this. It
+# never holds the next poll back (monitor.RainPoller polls again at the normal interval):
+# a one-hour Retry-After used to pause all WU rain detection for that hour, and a rain
+# check paused on one header is a rain check switched off.
 RETRY_AFTER_MAX_S = 3600.0
-# HTTP statuses that mean "WU (or its CDN) is overloaded: stop asking for this poll".
-THROTTLE_STATUSES = (429, 503)
+# HTTP statuses that mean "WU's rate limit: stop asking for this poll". Only 429: the
+# stations after it would only spend calls the limit refuses. A 503 (or any other 5xx) is
+# NOT one of them: it is a server error for that one request (a CDN node, a backend
+# hiccup), and the next station may well answer. Ending the poll there missed rain that
+# another station was reporting in the same poll.
+THROTTLE_STATUSES = (429,)
 # HTTP statuses that mean "this station is not there": they count toward the dead-station
 # backoff like a 204. Every other HTTP error is an API problem (a bad key, a server
 # error) that says nothing about the station.
@@ -58,8 +64,9 @@ class WuBadReply(WuError):
 class WuApiError(WuError):
     """An API or network problem (HTTP 429/5xx or another HTTP error, a timeout, a
     refused or broken connection): it says nothing about the station and NEVER counts
-    toward the backoff. `throttled` (HTTP 429 or 503) ends the poll; `retry_after` is
-    the server's Retry-After in seconds (bounded), or None."""
+    toward the backoff. `throttled` (HTTP 429, WU's rate limit) ends the poll; any other
+    status is this one station's error. `retry_after` is the server's Retry-After in
+    seconds (bounded), or None."""
     state = "error"
 
     def __init__(self, msg, status=None, retry_after=None):
@@ -263,7 +270,7 @@ OBS_FIELDS = ("obs_ts", "temp_f", "dewpt_f", "humidity_pct", "wind_mph", "gust_m
 
 # Result states that count toward the dead-station backoff (monitor.RainPoller): the
 # station itself sent nothing usable. "error" (an API or network problem) and "not-asked"
-# (the poll stopped at a 429/503 before this station) never do.
+# (the poll stopped at a 429 before this station) never do.
 BACKOFF_STATES = ("offline", "bad-reply")
 
 
@@ -277,10 +284,11 @@ def poll_stations(stations, max_age_min: int | None = None) -> dict:
     One station can never stop the poll: whatever reading it raises is caught and the
     station gets a state — "offline" (no observation), "bad-reply" (a reply that cannot
     be used), "error" (an API or network problem: HTTP 429/5xx, a timeout, a broken
-    connection, or anything unexpected). Only HTTP 429 or 503 ends the poll early: WU
-    asked to be left alone, so the stations after it are "not-asked", and 'throttle'
-    says so ({"status", "retry_after_s"}; retry_after_s None when no usable Retry-After
-    came). 'errors' counts the "error" stations.
+    connection, or anything unexpected). Only HTTP 429, WU's rate limit, ends the poll
+    early: the stations after it are "not-asked", and 'throttle' says so ({"status",
+    "retry_after_s"}; retry_after_s None when no usable Retry-After came). A 503 or any
+    other 5xx is that one station's "error", and the next station is asked as usual.
+    'errors' counts the "error" stations.
     """
     if max_age_min is None:
         max_age_min = config.MAX_OBS_AGE_MIN

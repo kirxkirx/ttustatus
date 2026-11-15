@@ -1,10 +1,13 @@
-"""What one GLM poll reads: the cursor that leaves no time unread between polls, partial
-polls (a hole or a lag), a granule that failed read again, the per-granule guard, the
-nearest flash over finite coordinates, the caps, the temp-file prefix, the GLM settings.
+"""What one GLM poll reads: the cursor that carries each poll on from where the previous one
+stopped, partial polls (a hole or a lag), a granule that failed read again, the
+per-granule guard, the nearest flash over finite coordinates, the caps, the temp-file
+prefix, the GLM settings. (A poll cut short, late-listed granules and time no poll read:
+test_glm_catch_up.py.)
 
 The listing and the download are stubbed (no network). numpy and netCDF4 are optional:
 the cursor and completeness tests use granules without flashes, which never reach numpy
-(CI installs neither); the flash tests need the real numpy and skip without it."""
+(CI installs them on its 3.13 leg only); the flash tests need the real numpy and skip
+without it."""
 import io
 import json
 import os
@@ -178,9 +181,12 @@ def test_granules_read_per_poll_are_capped(monkeypatch):
     r = gl.poll_flashes(cfg(), now=NOW)
     assert len(b.got) == 300 // gl.GRANULE_S + gl.GRANULE_MARGIN
     assert r["granules_unread"] == 289 - len(b.got)
-    # the newest were read; the cursor cannot pass the unread older ones
+    # the newest were read; the older ones are given up, and the poll says so — but the
+    # cursor moves on past them (held before them, the next window would be as long and
+    # be cut short the same way, poll after poll)
     assert b.read_starts()[-1] == NOW - timedelta(seconds=1)
-    assert r["cursor"] == (NOW - timedelta(seconds=300)).timestamp()
+    assert r["partial"] is True and "5 min of the window not read" in r["coverage"]
+    assert r["cursor"] == (NOW - timedelta(seconds=1)).timestamp()
 
 
 def test_the_poll_has_a_deadline(monkeypatch):

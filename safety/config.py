@@ -530,10 +530,12 @@ RADAR_ATTRIBUTION = "Radar: NOAA/NSSL MRMS"
 #  * NWS ACTIVE ALERTS. Every active warning / watch / advisory / statement touching the
 #    radar map is listed on the status page and drawn on the map. ONLY the events named in
 #    HAZARD_VETO_EVENTS make the monitor UNSAFE, and only while one is in effect OVER THE
-#    SITE (NWS's own point query, or the warning's polygon / the site's zones) — for the
-#    whole life of the warning, persisted across restarts like the other latches. It is
-#    released early only when FRESH point AND area queries both say the warning is gone;
-#    a feed outage holds it to the warning's own end time, never longer.
+#    SITE (NWS's own point query, or the warning's polygon / the site's zones) — until the
+#    warning ends, or until 24 h after NWS last listed it at the site
+#    (nws_alerts.UNSEEN_RELEASE_SEC), whichever comes first, persisted across restarts like
+#    the other latches. It is released early only when FRESH point AND area queries both
+#    say the warning is gone; a feed outage holds it to the warning's own end time or 24 h
+#    after its last sighting, whichever is sooner, never longer.
 #  * HAZARD INFORMATION (NOAA HMS smoke, NIFC fires, SPC outlook and mesoscale
 #    discussions, local storm reports) is INFORMATION ONLY: shown on the page and the
 #    map, never part of IsSafe.
@@ -634,16 +636,20 @@ HAZARD_POINT_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_POINT_POLL_SEC",
 HAZARD_AREA_POLL_SEC = _clamp("TTU_SAFETY_HAZARD_AREA_POLL_SEC",
                               _env_int("TTU_SAFETY_HAZARD_AREA_POLL_SEC", 120), 60)
 # A query result older than this is no longer "current": with no veto held the layer
-# reports unavailable (no veto on its own), and a held veto can only run out at the
-# warning's end time. At least two intervals of the SLOWER query, so one slow poll never
+# reports unavailable (no veto on its own), and a held veto is never released early (that
+# needs fresh point and area queries): it runs until the warning's end, or until 24 h after
+# NWS last listed it at the site (nws_alerts.UNSEEN_RELEASE_SEC), whichever comes first.
+# At least two intervals of the SLOWER query, so one slow poll never
 # flaps it — a stale time shorter than the area cadence would blank the map and the
 # nearby list (and forbid every early release) for part of each area-poll cycle.
 HAZARD_STALE_AFTER_SEC = _clamp("TTU_SAFETY_HAZARD_STALE_SEC",
                                 _env_int("TTU_SAFETY_HAZARD_STALE_SEC", 600),
                                 2 * max(HAZARD_POINT_POLL_SEC, HAZARD_AREA_POLL_SEC))
 # The veto is PERSISTED — a daemon restart mid-warning must not reopen the dome. A small
-# JSON file on the SD card, rewritten only when the set of vetoing warnings changes (a
-# few writes per warning, never per poll).
+# JSON file on the SD card, rewritten only when the set of vetoing warnings (or an end
+# time) changes: a few writes per warning, never per poll — at most hourly while a long
+# warning keeps being listed (its 24 h release bound is renewed in one-hour steps), and
+# every 10 min while a warning without an end time is (its last sighting).
 HAZARD_LATCH_FILE = _env_str("TTU_SAFETY_HAZARD_LATCH_FILE",
                              os.path.expanduser("~/safety_hazard_latch.json"))
 # Outlines of forecast/county/fire zones, for the zone-based alerts that carry no polygon
@@ -905,9 +911,10 @@ if DEW_GLM_MAX_AGE_MIN * 60.0 < GLM_POLL_INTERVAL + 120.0:
     DEW_GLM_MAX_AGE_MIN = _needed
 # What a GLM poll must have read of its look-back window to count as lightning data. GLM
 # writes a granule every 20 s; a granule the GLM layer cannot download is read again by
-# the next poll, but this poll still reports "no flash", and "no flash" out of a fraction
-# of the window is not "no lightning". Default: two thirds of the window (a healthy poll reads all of it but the
-# newest two or three granules, which have not reached S3 yet).
+# the next poll (or given up and reported as time no poll read, see glm_lightning), but
+# this poll still reports "no flash", and "no flash" out of a fraction of the window is
+# not "no lightning". Default: two thirds of the window (a healthy poll reads all of it
+# but the newest two or three granules, which have not reached S3 yet).
 DEW_GLM_MIN_GRANULES = _clamp(
     "TTU_SAFETY_DEW_GLM_MIN_GRANULES",
     _env_int("TTU_SAFETY_DEW_GLM_MIN_GRANULES", max(1, 2 * GLM_WINDOW_MIN)), 1, 100000)

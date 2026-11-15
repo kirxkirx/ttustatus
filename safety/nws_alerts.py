@@ -42,7 +42,12 @@ listed at the site for 24 h (UNSEEN_RELEASE_SEC; a feed outage, a wrong clock, a
 days away) is released whatever its end time, with a log line and a HAZARD-VETO event; a
 warning that keeps being listed keeps vetoing to its end (a long-fuse High Wind Warning
 runs about 2 days). Feed outage => held until its end or 24 h after its last sighting,
-whichever is sooner. A warning issued for a LATER period (a High Wind
+whichever is sooner. What is shown says so: "until <the warning's end>", and when the 24 h
+come first, "held until <then> unless NWS lists it again" as well (the component's veto
+entries carry both: alert_end_ts / alert_end_local and the hold, end_ts / end_local). A
+wall-clock step moves each veto with it, once, the moment the poller sees it (see
+_follow_clock): the 24 h keep the time they had left.
+A warning issued for a LATER period (a High Wind
 Warning "from 10 AM Friday") vetoes from its onset (minus a short lead), not from issuance:
 "for the duration of the warning", and the observatory must not close the night before.
 
@@ -127,6 +132,11 @@ AREA_DESC_MAX = 300
 DESCRIPTION_MAX = 2000
 INSTRUCTION_MAX = 1000
 CLOCK_TOLERANCE_SEC = 60              # a result/stamp further "in the future" = clock stepped
+# A change of (wall clock - monotonic clock) larger than this between two looks is a clock
+# step: the same threshold as the daemon's own step detector (server.py's evaluator), which
+# then calls clock_stepped — within EVAL_INTERVAL, so the poller handles a step itself the
+# moment it sees one (_follow_clock), and clock_stepped finds nothing left to move.
+CLOCK_JUMP_SEC = 30.0
 # Every response body is capped (compressed and inflated): a zone outline is <= ~1.2 MB and
 # the TX/NM/OK area answer 0.05-1.5 MB, so 16 MiB never cuts a real answer — and a runaway
 # one cannot take the daemon that serves IsSafe out of memory.
@@ -209,6 +219,26 @@ def _enabled(cfg) -> bool:
 
 
 # ---- small helpers ----------------------------------------------------------------------
+def _clock_offset() -> float:
+    """The system's wall clock minus its monotonic clock. Constant while the wall clock
+    runs normally (NTP slews both alike); it changes by the size of a step when the wall
+    clock is stepped. Read from the system itself, not from the ``now`` a caller passes:
+    a caller's ``now`` is a wall-clock reading, and that is exactly what jumps."""
+    return time.time() - time.monotonic()
+
+
+def _in_frame(now: float, frame: Optional[float]) -> float:
+    """``now``, a wall-clock reading taken while the clock frame was ``frame``
+    (_clock_offset), read in the clock's current frame: moved by a step that came in
+    between. A fetch takes up to tens of seconds, and chrony's step at boot comes when the
+    network does — with the first answers; applied with the time read before the step, a
+    veto they armed was stamped in the old frame, and moved by nothing."""
+    if frame is None:
+        return now
+    moved = _clock_offset() - frame
+    return now + moved if abs(moved) > CLOCK_JUMP_SEC else now
+
+
 def _finite(x) -> Optional[float]:
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         return None
@@ -223,15 +253,22 @@ def _parse_ts(s) -> Optional[float]:
     return _finite(iso_ts(s))
 
 
-def _text(v) -> str:
+def _text(v, sep: str = " ") -> str:
     """A string from the feed, scrubbed (safety.textclean): a JSON escape such as \\ud83d
     becomes a lone surrogate in Python, which no UTF-8 writer accepts — one such headline
-    would stop every status-page write and fail /setup. Non-strings read as ""."""
-    return clean_text(v) if isinstance(v, str) else ""
+    would stop every status-page write and fail /setup. Non-strings read as "". ``sep``:
+    what a word-separating control character becomes (clean_text) — "" for a single token
+    (a time, a status, a VTEC string), which a blank inside would break."""
+    return clean_text(v, sep) if isinstance(v, str) else ""
 
 
-def _text_or_none(v) -> Optional[str]:
-    t = _text(v)
+def _token(v) -> str:
+    """A single-token field of the feed (status, messageType, a time): see _text."""
+    return _text(v, "")
+
+
+def _text_or_none(v, sep: str = " ") -> Optional[str]:
+    t = _text(v, sep)
     return t if t.strip() else None
 
 
@@ -788,13 +825,13 @@ def alert_rank(kind: str, severity) -> int:
             + SEVERITY_RANK.get(_norm_event(severity), SEVERITY_RANK["unknown"]))
 
 
-def _param_values(params, key: str) -> List[str]:
+def _param_values(params, key: str, sep: str = " ") -> List[str]:
     v = params.get(key) if isinstance(params, dict) else None
     if isinstance(v, str):
         v = [v]
     if not isinstance(v, list):
         return []
-    return [t for t in (_text(x).strip() for x in v) if t]
+    return [t for t in (_text(x, sep).strip() for x in v) if t]
 
 
 # Impact-based-warning damage tags -> chip text, most serious first (the tag, not the event
@@ -899,7 +936,7 @@ def _zone_entry_ok(d, zid: str) -> bool:
 
 def _vtec(params) -> List[dict]:
     out = []
-    for s in _param_values(params, "VTEC"):
+    for s in _param_values(params, "VTEC", ""):         # one token: see _token
         m = _VTEC_RE.search(s)
         if m:
             cls, action, office, phen, sig, etn = m.groups()
@@ -947,13 +984,33 @@ def _zone_refs(props) -> List[Tuple[str, str, str]]:
     return out
 
 
-def normalize(feature) -> dict:
+def _event_name(v, veto_set) -> str:
+    """The event name, its words split by blanks. A word-separating control character
+    (see textclean) between two words is a blank, but one INSIDE a word must vanish:
+    "High<VT>Wind Warning" and "Hi<VT>gh Wind Warning" are both a High Wind Warning, and
+    which of the two a feed meant cannot be told. So the name is read both ways, and the
+    reading with the separators dropped is taken when only it is one of the veto events
+    (``veto_set``) — a veto if either reading matches."""
+    event = " ".join(_text(v).split())
+    if veto_set and event.lower() not in veto_set:
+        joined = " ".join(_token(v).split())
+        if joined.lower() in veto_set:
+            return joined
+    return event
+
+
+def normalize(feature, veto_set=None) -> dict:
     """One GeoJSON alert feature -> an internal alert record. Pure; never raises on missing
-    keys (the feed omits ends, instruction, geometry ... now and then)."""
+    keys (the feed omits ends, instruction, geometry ... now and then). ``veto_set``: the
+    configured veto events (lower case), against which the event name is matched in both
+    of its readings (see _event_name). The single-token fields — status, messageType, the
+    VTEC strings, the times — are read with word-separating control characters dropped
+    (_token): a blank inside one would break it, and a status "Act ual" made a warning
+    "not live" and dropped it, an end time "...:00 -05:00" fell back to an earlier one."""
     feature = feature if isinstance(feature, dict) else {}
     props = feature.get("properties")
     props = props if isinstance(props, dict) else {}
-    event = " ".join(_text(props.get("event")).split())
+    event = _event_name(props.get("event"), veto_set)
     kind = event_kind(event)
     severity = _text(props.get("severity")) or "Unknown"
     params = props.get("parameters")
@@ -968,7 +1025,10 @@ def normalize(feature) -> dict:
         _warn_once(("geometry", cap_id, event), "NWS %s (%s): its polygon cannot be read; "
                    "placed by its zone(s) instead", event or "alert", cap_id or "no id")
     headlines = _param_values(params, "NWSheadline")
-    ends, expires = _text_or_none(props.get("ends")), _text_or_none(props.get("expires"))
+    ends = _text_or_none(props.get("ends"), "")
+    expires = _text_or_none(props.get("expires"), "")
+    sent = _text_or_none(props.get("sent"), "")
+    onset = _text_or_none(props.get("onset"), "") or _text_or_none(props.get("effective"), "")
     ec = props.get("eventCode") if isinstance(props.get("eventCode"), dict) else {}
     zones = _zone_refs(props)
     return {
@@ -984,14 +1044,14 @@ def normalize(feature) -> dict:
         "instruction": _text_or_none(props.get("instruction")),
         "area_desc": _text(props.get("areaDesc")),
         "sender": _text(props.get("senderName")) or _text(props.get("sender")),
-        "status": _text(props.get("status")), "message_type": _text(props.get("messageType")),
+        "status": _token(props.get("status")),
+        "message_type": _token(props.get("messageType")),
         "vtec_class": primary["class"] if primary else None,
         "vtec_action": primary["action"] if primary else None,
-        "sent": _text_or_none(props.get("sent")),
-        "onset": _text_or_none(props.get("onset")) or _text_or_none(props.get("effective")),
-        "ends": ends, "expires": expires,
-        "sent_ts": _parse_ts(props.get("sent")),
-        "onset_ts": _parse_ts(props.get("onset")) or _parse_ts(props.get("effective")),
+        "sent": sent, "onset": onset, "ends": ends, "expires": expires,
+        "sent_ts": _parse_ts(sent),
+        "onset_ts": (_parse_ts(_text_or_none(props.get("onset"), ""))
+                     or _parse_ts(_text_or_none(props.get("effective"), ""))),
         "end_ts": _parse_ts(ends) or _parse_ts(expires),
         "zones": zones,
         "zone_keys": frozenset((t, z) for t, z, _u in zones),
@@ -1005,20 +1065,48 @@ def normalize(feature) -> dict:
 UNREAD_EVENT = "NWS alert (could not be read)"
 
 
-def _unread_stub(feature) -> dict:
-    """What is kept of a feature that normalize could not read: whatever plain strings it
-    has (event, id, ends/expires, sent/onset, status/messageType, VTEC), flagged "unread".
+def _has_text(v) -> bool:
+    """Whether a feed value is a string with something left once scrubbed (textclean)."""
+    return bool(_text(v).strip())
+
+
+def _unreadable(feature) -> Optional[str]:
+    """Why a feature cannot be read for what the veto needs, or None when it can.
+
+    normalize reads anything without raising, but a feature with no readable event,
+    status or messageType becomes a record that matches no veto event (event "") or is not
+    live (status or type ""): dropped as if NWS had not listed it, so the answer looked
+    complete and its silence could release a held veto. Such a feature is kept as an
+    unread stub instead (_parse_feed, _unread_stub), exactly like one normalize cannot read
+    at all: the point answer cannot confirm a release, the area answer is blind to it."""
+    if not isinstance(feature, dict):
+        return "the feature is not an object"
+    props = feature.get("properties")
+    if not isinstance(props, dict):
+        return "its properties are not an object"
+    for k in ("event", "status", "messageType"):
+        if not _has_text(props.get(k)):
+            return "its %s is missing or not text" % k
+    return None
+
+
+def _unread_stub(feature, veto_set=None) -> dict:
+    """What is kept of a feature that could not be read (normalize raised, or _unreadable):
+    whatever non-blank strings it has (event, id, ends/expires, sent/onset,
+    status/messageType, VTEC), flagged "unread".
     It must not vanish: the query would still look complete, and its silence could then
     release a held veto. A stub has no shape and no zones; poll_point treats it as at the
     site (NWS listed it there) and poll_area as an answer blind to its event (see
-    _blindness). With no readable event name its event_lc is "" (matches nothing)."""
+    _blindness). With no readable event name its event_lc is "" (matches nothing). A
+    missing or blank status / messageType reads as Actual / Alert: one left blank would
+    make the stub itself "not live", and it would be dropped like the feature was."""
     feature = feature if isinstance(feature, dict) else {}
     props = feature.get("properties")
     props = props if isinstance(props, dict) else {}
     keep = {k: props.get(k) for k in ("event", "id", "ends", "expires", "sent", "onset",
                                       "effective", "status", "messageType")
-            if isinstance(props.get(k), str)}
-    if "id" not in keep and isinstance(feature.get("id"), str):
+            if _has_text(props.get(k))}
+    if "id" not in keep and _has_text(feature.get("id")):
         keep["id"] = feature["id"]
     keep.setdefault("status", "Actual")
     keep.setdefault("messageType", "Alert")
@@ -1026,7 +1114,7 @@ def _unread_stub(feature) -> dict:
     vtec = params.get("VTEC") if isinstance(params, dict) else None
     vtec = [v for v in vtec if isinstance(v, str)] if isinstance(vtec, list) else []
     keep["parameters"] = {"VTEC": vtec}
-    rec = normalize({"properties": keep})       # plain strings only: cannot fail
+    rec = normalize({"properties": keep}, veto_set)   # plain strings only: cannot fail
     rec["unread"] = True
     if not rec["key"]:
         rec["key"] = "unread:%s" % (rec["event_lc"] or "unnamed")
@@ -1078,24 +1166,61 @@ def excluded_reason(rec: dict, veto_set) -> Optional[str]:
     return None
 
 
-def _sighting(recs: List[dict]) -> dict:
+def _readable_first(recs: List[dict]) -> List[dict]:
+    """The messages that could be read, or — when none of them could — all of them (the
+    unread stubs, see _unread_stub)."""
+    return [r for r in recs if not r.get("unread")] or recs
+
+
+def _latest_end(recs: List[dict], now: float) -> Optional[float]:
+    """The latest end among a key's live messages, a stub's readable end included, so the
+    veto is held at least as long as any one of them alone would hold it. None (no end
+    time: held NO_END_HOLD_SEC after each sighting) when no message gives an end, or when
+    a readable one gives none (NWS: no end) and every end given lies within
+    NO_END_HOLD_SEC — then the open end is the later. A stub without an end says nothing
+    about it (its end could not be read), so it counts only when no message gives one."""
+    ends = [r["end_ts"] for r in recs if r.get("end_ts") is not None]
+    if not ends:
+        return None
+    latest = max(ends)
+    open_end = any(r.get("end_ts") is None and not r.get("unread") for r in recs)
+    if open_end and latest <= now + NO_END_HOLD_SEC:
+        return None
+    return latest
+
+
+def _sighting(recs: List[dict], now: float) -> dict:
     """The site's version of one key from one feed: the newest message wins (an Update
-    replaces earlier versions); among equally new ones the latest end."""
+    replaces earlier versions); among equally new ones the latest end.
+
+    A message that could be read always wins over an unread stub of the same key for what
+    it says of the warning (event, headline, sender, onset, sent), whatever their times or
+    their order in the answer: a stub knows too little to stand for a key that a readable
+    message speaks for. When a stub won (it has no end, so it ranked as the latest), the
+    readable EXT update next to it was ignored — a stub never replaces what an earlier
+    message said (_apply_sightings) — and the veto ran out at the old end until a later
+    poll re-armed it. A stub stands for a key only when no message of that key could be
+    read.
+
+    The END is the latest of all the key's messages (_latest_end), not the winner's: an
+    OLDER readable message next to a newer one that could not be read (an extension whose
+    'ends' was readable) armed the veto with the older, earlier end, and it was released
+    there although NWS still listed the key — until the next poll re-armed it."""
     def order(r):
         return (r.get("sent_ts") or 0.0,
                 r["end_ts"] if r.get("end_ts") is not None else float("inf"))
-    r = max(recs, key=order)
+    r = max(_readable_first(recs), key=order)
     return {"event": r["event"], "headline": r.get("nws_headline") or r.get("headline", ""),
-            "sender": r.get("sender", ""), "end_ts": r.get("end_ts"),
+            "sender": r.get("sender", ""), "end_ts": _latest_end(recs, now),
             "onset_ts": r.get("onset_ts"), "sent_ts": r.get("sent_ts"),
             "geometry": r.get("geometry"), "unread": bool(r.get("unread"))}
 
 
-def _group_sightings(recs: List[dict]) -> Dict[str, dict]:
+def _group_sightings(recs: List[dict], now: float) -> Dict[str, dict]:
     by_key: Dict[str, List[dict]] = {}
     for r in recs:
         by_key.setdefault(r["key"], []).append(r)
-    return {k: _sighting(v) for k, v in by_key.items()}
+    return {k: _sighting(v, now) for k, v in by_key.items()}
 
 
 def _feed_skew(data, recs: List[dict], fetch_ts: float) -> float:
@@ -1180,6 +1305,9 @@ class NwsAlertsPoller:
         self._points_next_mono = 0.0
         self._coverage_warned = False
         self._noveto_warned = False
+        # The clock frame (wall minus monotonic, _clock_offset) at the last look: a change
+        # of it is a wall-clock step, handled the moment it is seen (_follow_clock).
+        self._clock_off = _clock_offset()
         self._load_latch()
         if not self._latch_dirty:
             self._saved_sig = self._sig()   # the file already says this: no write at start
@@ -1234,7 +1362,12 @@ class NwsAlertsPoller:
                 "end_ts": end_ts, "onset_ts": onset_ts, "sent_ts": None,
                 "cap_ts": now + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC,
                 "shift": 0.0, "active": False,
-                "first_seen_ts": first_seen, "last_seen_ts": now, "geometry": None}
+                "first_seen_ts": first_seen, "last_seen_ts": now, "geometry": None,
+                # the clock frame of the stamps (wall minus monotonic when they were taken
+                # or last moved; not saved): a step moves each veto by its own frame's
+                # change (_follow_clock) — one first seen after the step is in the new
+                # frame already and is not moved
+                "frame_off": self._clock_off}
 
     def _load_latch(self):
         path = self._latch_path()
@@ -1249,21 +1382,18 @@ class NwsAlertsPoller:
         items = data if isinstance(data, list) else (
             data.get("vetoes") if isinstance(data, dict) else None)
         if not isinstance(items, list):
-            # Unreadable latch: we cannot prove no warning was in effect, so fail safe with
-            # a placeholder veto. It holds at most NO_END_HOLD_SEC and is released within
-            # ~2 min by the first fresh point+area queries that list nothing at the site.
             log.warning("hazard latch file %s unreadable; arming a placeholder veto "
                         "(fail-safe) until fresh NWS queries confirm the site is clear", path)
-            rec = self._new_rec("latch-file-unreadable", "Unknown hazard (latch file "
-                                "unreadable)", "", "", None, None, now, now)
-            self._veto[rec["key"]] = rec
-            self._latch_dirty = True
-            self._emit([{"reason": "hazard latch file unreadable", "source": "latch",
-                         "result": "unsafe until fresh NWS queries confirm"}])
+            self._emit([self._placeholder(now, "hazard latch file unreadable")])
             return
-        events = []
+        events, unreadable = [], 0
         for it in items:
             if not isinstance(it, dict) or not isinstance(it.get("key"), str) or not it["key"]:
+                # An entry that cannot be read (not an object, no key: a damaged or foreign
+                # file) stood for a veto, and which one cannot be told. Skipping it in
+                # silence could reopen the dome mid-warning, so it counts like an unreadable
+                # file: logged, recorded, and the placeholder veto armed (below).
+                unreadable += 1
                 continue
             first = _finite(it.get("first_seen_ts"))
             first = now if first is None else first
@@ -1278,8 +1408,8 @@ class NwsAlertsPoller:
             rec = self._new_rec(it["key"], _text(it.get("event")) or "NWS alert",
                                 _text(it.get("headline")), _text(it.get("sender")),
                                 end, onset, first, now)
-            # the file's cap (None in an older file; a 72 h span from the first sighting in
-            # one written before UNSEEN_RELEASE_SEC) is bounded below by the last sighting
+            # the file's cap (None in an older file; a 72 h span in one written before
+            # UNSEEN_RELEASE_SEC) is bounded below, after the clock checks
             rec["cap_ts"] = _finite(it.get("cap_ts"))
             rec["shift"] = min(0.0, _finite(it.get("shift")) or 0.0)
             rec["active"] = it.get("active") is True
@@ -1298,20 +1428,55 @@ class NwsAlertsPoller:
             # never "seen" in the future: a last sighting beyond now (a wrong clock at the
             # time) counts as now — the hold then runs its full length from here
             rec["last_seen_ts"] = now if last is None else min(last, now)
-            # never held beyond UNSEEN_RELEASE_SEC (+ the renewal step) after its last
-            # sighting, wherever the cap in the file says: a reboot loop during an NWS
-            # outage must not keep a veto alive past the bound
-            self._bound_unseen(rec, rec["last_seen_ts"])
+            # The unseen bound: the cap saved with the veto, which a restart never moves
+            # later (a reboot loop during an NWS outage must not keep a veto alive past
+            # it), and never more than UNSEEN_RELEASE_SEC (+ the renewal step) from now.
+            # This version saves a cap at most that far after a sighting, so the second
+            # rule changes nothing for its files. It is what a file of the version before
+            # the bound gets: no cap_ts (or its 72 h stale-information cap). It must NOT be
+            # bounded from that file's last_seen_ts: that version rewrote the file only
+            # when the veto set changed, so for a warning with an end time last_seen_ts
+            # is the time of that write — often the FIRST sighting of a warning NWS has
+            # listed every minute since — and bounded from there, a long warning still in
+            # force was dropped at the upgrade restart. From now it is one more day at
+            # most, and the file carries this version's cap from the next write on.
+            self._bound_unseen(rec, now)
             if self._hold_until(rec) <= now:
-                self._latch_dirty = True          # expired while we were down
+                # It ran out while the daemon was not running. Released here — and said
+                # so, like every other release: a veto must never vanish without a trace.
+                self._latch_dirty = True
+                why = self._release_why(rec, now)
+                events.append({"reason": "NWS %s" % rec["event"], "source": "latch",
+                               "result": "released at start-up: " + why, "key": rec["key"]})
+                log.warning("HAZARD VETO released at start-up: NWS %s (%s): %s",
+                            rec["event"], rec["key"], why)
                 continue
             self._veto[rec["key"]] = rec
+            until = self._until(rec, now)
             events.append({"reason": "NWS %s over the site" % rec["event"], "source": "latch",
-                           "result": "restored: unsafe until %s" % self._fmt(
-                               self._hold_until(rec), now), "key": rec["key"]})
-            log.info("restored hazard veto %s (%s) until %s", rec["key"], rec["event"],
-                     self._fmt(self._hold_until(rec), now))
+                           "result": "restored: unsafe %s" % until, "key": rec["key"]})
+            log.info("restored hazard veto %s (%s) %s", rec["key"], rec["event"], until)
+        if unreadable:
+            log.warning("hazard latch file %s: %d entr%s unreadable; arming a placeholder "
+                        "veto (fail-safe) until fresh NWS queries confirm the site is clear",
+                        path, unreadable, "y" if unreadable == 1 else "ies")
+            events.append(self._placeholder(now, "%d hazard latch entr%s unreadable" % (
+                unreadable, "y" if unreadable == 1 else "ies")))
         self._emit(events)
+
+    def _placeholder(self, now, reason) -> dict:
+        """Arm the fail-safe veto for a latch that cannot be read — the whole file, or an
+        entry of it — and return its event. We cannot prove no warning was in effect. It
+        holds at most NO_END_HOLD_SEC and is released within ~2 min by the first fresh
+        point+area queries that list nothing at the site. One restored from the file (a
+        restart within its hour) is kept as it is: re-arming it would restart its hour."""
+        if "latch-file-unreadable" not in self._veto:
+            rec = self._new_rec("latch-file-unreadable", "Unknown hazard (latch file "
+                                "unreadable)", "", "", None, None, now, now)
+            self._veto[rec["key"]] = rec
+        self._latch_dirty = True
+        return {"reason": reason, "source": "latch",
+                "result": "unsafe until fresh NWS queries confirm"}
 
     def _reframe(self, rec, delta, now):
         """Our clock moved by ``delta`` relative to the stamps in ``rec`` (callers set
@@ -1432,6 +1597,38 @@ class NwsAlertsPoller:
     def _fmt(self, ts, now=None):
         return fmt_local(ts, self._tz(), now) or "?"
 
+    def _until(self, rec, now, was=None) -> str:
+        """How long a veto lasts, for its events, log lines and reasons — the same words
+        the IsSafe reason, /setup and the status page use (they build them from the
+        component's alert_end_ts and end_ts):
+
+          'until <the warning's own end>', and when the veto is held to an earlier time —
+          the 24 h unseen bound (UNSEEN_RELEASE_SEC), or the time it had left kept across
+          a clock step — '; held until <then> unless NWS lists it again' as well;
+          without an end time: 'with no end time given; held until <then> unless NWS lists
+          it again' (NO_END_HOLD_SEC after its last sighting).
+
+        Never the hold alone: for every warning with more than a day to run that read as
+        the warning's end, while NWS was listing it every minute. ``was`` (an update's
+        previous end) goes right after the end."""
+        hold = self._hold_until(rec)
+        end = rec["end_ts"]
+        text = "with no end time given" if end is None else "until %s" % self._fmt(end, now)
+        if was is not None:
+            text += " (was %s)" % was
+        if end is None or end > hold + 1.0:
+            text += "; held until %s unless NWS lists it again" % self._fmt(hold, now)
+        return text
+
+    def _release_why(self, rec, now) -> str:
+        """Why a veto whose hold has run out is released (see _hold_until)."""
+        if self._capped(rec):
+            return ("not sighted for %d h, could not be confirmed gone"
+                    % (UNSEEN_RELEASE_SEC // 3600))
+        if rec["end_ts"] is not None:
+            return "ended %s" % self._fmt(self._hold_until(rec), now)
+        return "no end time given; %d min after the last sighting" % (NO_END_HOLD_SEC // 60)
+
     def _in_effect(self, rec, now, skew) -> bool:
         """In effect from (onset - lead). STICKY: once a veto has been in effect it stays so
         until released — a clock step or the server-clock estimate going stale must never
@@ -1444,7 +1641,11 @@ class NwsAlertsPoller:
             return True
         return False
 
-    def _apply_sightings(self, source, sightings, now, skew=0.0) -> List[dict]:
+    def _apply_sightings(self, source, sightings, now, skew=0.0, blind=frozenset(),
+                         blind_all=False) -> List[dict]:
+        """Arm, update and renew the vetoes the answer of one query lists at the site.
+        ``blind`` / ``blind_all``: the veto events this answer could not read every message
+        of (see _blindness) — for those its sighting may move an end later, not earlier."""
         events = []
         for key, s in sightings.items():
             rec = self._veto.get(key)
@@ -1454,41 +1655,68 @@ class NwsAlertsPoller:
                 rec["sent_ts"] = s["sent_ts"]
                 rec["geometry"] = s["geometry"]
                 self._veto[key] = rec
-                hold = self._hold_until(rec)
+                # both times when they differ: the warning's end, and the 24 h bound that
+                # comes first for a warning with more than a day to run (see _until)
                 if self._in_effect(rec, now, skew):
-                    result = "unsafe until %s" % self._fmt(hold, now)
+                    result = "unsafe %s" % self._until(rec, now)
                 else:
-                    result = "pending: unsafe from %s until %s" % (
+                    result = "pending: unsafe from %s %s" % (
                         self._fmt(rec["onset_ts"] - self._onset_lead(), now),
-                        self._fmt(hold, now))
+                        self._until(rec, now))
                 events.append({"reason": "NWS %s over the site" % s["event"], "source": source,
                                "result": result, "key": key, "sender": s["sender"]})
                 log.warning("HAZARD VETO: NWS %s over the site (%s, %s) — %s", s["event"],
                             key, source, result)
                 continue
             # an unread stub (see _unread_stub) is a sighting, but knows too little to
-            # replace what an earlier, readable message said (its end time above all)
+            # replace what an earlier, readable message said (its end time above all: a
+            # stub may only move it later, below)
             newer = not s.get("unread") and (s["sent_ts"] is None or rec.get("sent_ts") is None
                                              or s["sent_ts"] >= rec["sent_ts"])
             if newer:
-                old_hold = self._hold_until(rec)
+                # the end the last event gave (see _until): the warning's own end
+                old_end = self._fmt(rec["end_ts"] if rec["end_ts"] is not None
+                                    else self._hold_until(rec), now)
                 rec.update(event=s["event"], headline=s["headline"] or rec["headline"],
                            sender=s["sender"] or rec["sender"], onset_ts=s["onset_ts"],
                            sent_ts=s["sent_ts"])
                 if s["geometry"] is not None:
                     rec["geometry"] = s["geometry"]
                 changed = s["end_ts"] != rec["end_ts"]
-                if changed or rec["shift"]:
+                if changed and (blind_all or _norm_event(s["event"]) in blind) \
+                        and self._ends_earlier(rec, s, now):
+                    # This answer has a message of the event it could not read — the area
+                    # query drops such stubs, and one whose key could not be read stands
+                    # apart — which may be a later message of this very key: an older
+                    # readable message must not cut the end that one gave (the point query
+                    # armed the veto with the stub's later end, the area query's older
+                    # message cut it, and the veto was released at that earlier end).
+                    changed = False
+                elif changed or rec["shift"]:
                     # fresh NWS times, read against the current clock, replace any clamp
                     # (the cap is a stamp of OUR clock: the renewal below handles it)
                     rec["end_ts"] = s["end_ts"]
                     rec["shift"] = 0.0
                     self._renew_cap(rec, now)
                 if changed:
+                    # the warning's new end against its old one — an extension of a warning
+                    # held to its 24 h bound read "until <bound> (was <bound>)" before
                     events.append({"reason": "NWS %s updated" % s["event"], "source": source,
-                                   "result": "unsafe until %s (was %s)" % (
-                                       self._fmt(self._hold_until(rec), now),
-                                       self._fmt(old_hold, now)), "key": key})
+                                   "result": "unsafe %s" % self._until(rec, now, old_end),
+                                   "key": key})
+            elif s.get("unread") and self._stub_extends(rec, s):
+                # ... but a later end it can read still counts, as it does when a stub
+                # arms a veto (_sighting takes the latest end): NWS lists the key at the
+                # site beyond the end the readable message gave, and releasing the veto
+                # there left the dome free to open until the next poll re-armed it. It
+                # only ever extends; the rest of what the veto says stays.
+                old_end = self._fmt(rec["end_ts"] if rec["end_ts"] is not None
+                                    else self._hold_until(rec), now)
+                rec["end_ts"] = s["end_ts"]
+                rec["shift"] = 0.0
+                events.append({"reason": "NWS %s updated" % rec["event"], "source": source,
+                               "result": "unsafe %s" % self._until(rec, now, old_end),
+                               "key": key})
             # A sighting is fresh news, so it renews the unseen bound: the cap bounds how
             # long a veto is held WITHOUT news (UNSEEN_RELEASE_SEC), not how long a warning
             # may last (a High Wind Warning runs about 2 days, and letting the cap run out
@@ -1496,6 +1724,18 @@ class NwsAlertsPoller:
             self._renew_cap(rec, now)
             rec["last_seen_ts"] = max(rec["last_seen_ts"], now)
         return events
+
+    def _ends_earlier(self, rec, s, now) -> bool:
+        """Whether a sighting would hold the veto less long than its own end does now (a
+        sighting without an end holds it NO_END_HOLD_SEC from now)."""
+        new = s["end_ts"] if s["end_ts"] is not None else now + NO_END_HOLD_SEC
+        return new < self._own_end(rec) - 1.0
+
+    def _stub_extends(self, rec, s) -> bool:
+        """Whether unread stubs of a key give a later end than the veto's own: an end they
+        could read (an absolute NWS time). A stub without one says nothing of the end
+        (see _latest_end)."""
+        return s["end_ts"] is not None and s["end_ts"] > self._own_end(rec) + 1.0
 
     def _fresh(self, res, now) -> bool:
         if not res or not res.get("ok") or res.get("ts") is None:
@@ -1521,18 +1761,75 @@ class NwsAlertsPoller:
         return (p["ts"] > last and a["ts"] > last
                 and rec["key"] not in p["site_keys"] and rec["key"] not in a["site_keys"])
 
+    def _follow_clock(self, now):
+        """Move every veto into the clock's current frame as soon as a step is seen (caller
+        holds the lock). Called before anything reads or writes a veto's stamps: on every
+        release check, every IsSafe evaluation and every answer applied.
+
+        A veto's own stamps — its first and last sighting and its 24 h unseen bound
+        (cap_ts) — are readings of the wall clock, and each veto remembers the clock frame
+        they were taken in (frame_off: wall minus monotonic, _clock_offset). A change of
+        that frame by more than CLOCK_JUMP_SEC since the last look is a step: each veto is
+        moved by the change of its OWN frame (_step_move), as clock_stepped moves it — the
+        24 h keep the time they had left, a forward step never holds a veto past its NWS
+        end — its last sighting with it; the answers fetched before the step are dropped
+        (an early release needs queries made after it) and both queries re-poll.
+
+        This used to wait for the step detector's clock_stepped (server.py, within
+        EVAL_INTERVAL), and an IsSafe call or a poll could come first: after a forward step
+        of a day or more (a Pi booted with fake-hwclock that far behind, then chrony's step)
+        the bound of a warning NWS had listed minutes before looked a day old, and the veto
+        was released. Waiting instead for the report, with the bound held back meanwhile,
+        left a step the detector never reported (one during start-up, before it took its
+        baseline) suspending the release at a warning's end until the next restart, and
+        bookkeeping of who had moved what was wrong in corners (a veto moved twice, or not
+        at all). Moved by the change of its own frame, a veto is moved exactly once
+        whoever sees the step first, and one first listed after the step — in the new
+        frame already — not at all."""
+        off = _clock_offset()
+        jump = off - self._clock_off
+        self._clock_off = off
+        if abs(jump) <= CLOCK_JUMP_SEC:
+            return
+        moved = 0
+        for rec in self._veto.values():
+            move = self._step_move(rec)
+            rec["frame_off"] = off
+            if abs(move) <= CLOCK_JUMP_SEC:
+                continue
+            self._reframe(rec, move, now)
+            # the last sighting moves with the step too (the move is exact): a veto with
+            # no end time is held an hour after it was really last listed, and answers
+            # fetched after the step — the ones before it are dropped below — can confirm
+            # a veto gone
+            rec["last_seen_ts"] = min(rec["last_seen_ts"] + move, now)
+            self._bound_unseen(rec, now)
+            moved += 1
+        self._drop_answers()
+        log.warning("NWS alerts: the wall clock stepped %+.0f s — %d veto(es) moved with it, "
+                    "keeping the time each had left; both queries re-poll", jump, moved)
+
+    def _step_move(self, rec) -> float:
+        """How far a step moves ``rec``: the change of the clock frame since its stamps were
+        taken or last moved (0 for a veto already in the current frame)."""
+        return self._clock_off - rec.get("frame_off", self._clock_off)
+
+    def _drop_answers(self):
+        """After a clock step: the answers fetched before it are no longer fresh, and both
+        queries re-poll now (caller holds the lock)."""
+        self._point_attempt_ts = None
+        self._area_attempt_ts = None
+        self._point = None
+        self._area = None
+
     def _release_due(self, now) -> List[dict]:
         events = []
+        self._follow_clock(now)
         for key in sorted(self._veto):
             rec = self._veto[key]
             hold = self._hold_until(rec)
-            if now >= hold and self._capped(rec):
-                why = ("not sighted for %d h, could not be confirmed gone"
-                       % (UNSEEN_RELEASE_SEC // 3600))
-            elif now >= hold:
-                why = ("ended %s" % self._fmt(hold, now) if rec["end_ts"] is not None
-                       else "no end time given; %d min after the last sighting"
-                       % (NO_END_HOLD_SEC // 60))
+            if now >= hold:
+                why = self._release_why(rec, now)
             elif self._confirmed_gone(rec, now):
                 why = ("no longer in effect at the site per fresh NWS point and area queries "
                        "(cancelled, expired or moved)")
@@ -1545,18 +1842,30 @@ class NwsAlertsPoller:
         return events
 
     def _self_heal(self, now):
-        """A backward clock step while running (not yet signalled): a first sighting in the
-        future is impossible under a sane clock — bound the veto by its own duration."""
+        """A backward clock step this poller could not see (one before it took its
+        baseline: vetoes restored from a latch file written under a clock that was ahead;
+        a step it sees is handled by _follow_clock, which runs first). Two stamps prove
+        such a step: a first sighting in the future, impossible under a sane clock, and an
+        unseen bound further ahead than any sighting puts one (UNSEEN_RELEASE_SEC +
+        CAP_RENEW_SEC). The veto is moved back by what they prove — never by more than the
+        step — so it runs for its own duration and its bound, not for the size of the step
+        on top. (The tolerance: a poll renewing the bound a moment after this call's
+        ``now`` was taken is no step.) What it moves is no change of the clock frame, so a
+        later step does not count it (subtracted from the next step, as it was, it made a
+        step seen later move such a veto by too much)."""
+        tol = now + CLOCK_TOLERANCE_SEC
         for rec in self._veto.values():
-            if rec["first_seen_ts"] > now + CLOCK_TOLERANCE_SEC:
-                log.warning("hazard veto %s first seen in the future (clock step?) — "
-                            "clamping", rec["key"])
+            delta = 0.0
+            if rec["first_seen_ts"] > tol:
                 delta = now - rec["first_seen_ts"]
+            cap = rec.get("cap_ts")
+            if cap is not None and cap > tol + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC:
+                delta = min(delta, tol + UNSEEN_RELEASE_SEC + CAP_RENEW_SEC - cap)
+            if delta < 0.0:
+                log.warning("hazard veto %s stamped %.0f s in the future (clock step?) — "
+                            "moving it into this clock's frame", rec["key"], -delta)
                 self._reframe(rec, delta, now)
                 rec["last_seen_ts"] = min(rec["last_seen_ts"] + delta, now)
-            # (with the tolerance: a poll renewing the cap a moment after this call's
-            # ``now`` was taken must not be trimmed, and the latch rewritten, for it)
-            self._bound_unseen(rec, now + CLOCK_TOLERANCE_SEC)
 
     def _emit(self, events):
         if self.log is None:
@@ -1751,13 +2060,18 @@ class NwsAlertsPoller:
     def _parse_feed(self, data, now):
         if not isinstance(data, dict) or not isinstance(data.get("features"), list):
             raise ValueError("not an alert FeatureCollection")
-        recs = []
+        recs, veto_set = [], _veto_set(self.cfg)
         for f in data["features"]:
             try:
-                recs.append(normalize(f))
+                # a feature normalize would read without raising, but whose event, status
+                # or type cannot be read, counts as unreadable too (see _unreadable)
+                why = _unreadable(f)
+                if why is not None:
+                    raise ValueError(why)
+                recs.append(normalize(f, veto_set))
             except Exception as e:  # noqa: BLE001 — one odd feature must not drop the rest
                 # ... nor vanish itself: kept as a stub (see _unread_stub)
-                stub = _unread_stub(f)
+                stub = _unread_stub(f, veto_set)
                 _warn_once(("unread", stub["key"], stub["id"]),
                            "NWS alert feature could not be read (%s: %s): kept as %r (%s), "
                            "which cannot be placed", type(e).__name__, e, stub["event"],
@@ -1797,16 +2111,21 @@ class NwsAlertsPoller:
         if self._fail_logged.pop(which, None) is not None:
             log.info("NWS alerts %s query recovered", which)
 
-    def poll_point(self, now=None):
-        """NWS's own determination of what is in effect AT the site (the veto's fast path)."""
+    def poll_point(self, now=None, frame=None):
+        """NWS's own determination of what is in effect AT the site (the veto's fast path).
+        ``frame``: the clock frame ``now`` was read in (_clock_offset; default: the
+        current one) — a step during the fetch is read out of ``now`` (_in_frame)."""
         now = time.time() if now is None else now
+        frame = _clock_offset() if frame is None else frame
         with self._lock:
             self._point_attempt_ts = now
         lat, lon = self.cfg.GEOCODE
         url = "%s/alerts/active?point=%s,%s&%s" % (BASE, _coord(lat), _coord(lon),
                                                    _QUERY_FILTER)
         try:
-            recs, skew = self._parse_feed(_get(url, self._ua()), now)
+            data = _get(url, self._ua())
+            now = _in_frame(now, frame)
+            recs, skew = self._parse_feed(data, now)
         except Exception as e:  # noqa: BLE001 — any failure = this query unavailable
             return self._fail("point", now, e)
         veto_set = _veto_set(self.cfg)
@@ -1824,14 +2143,19 @@ class NwsAlertsPoller:
         # vetoes as usual (by its key: the VTEC key when that can be read); one whose event
         # cannot be read creates no veto, but this answer then cannot confirm that any
         # veto is gone.
-        _blind, blind_all = _blindness(recs, veto_set)
-        sightings = _group_sightings([r for r in recs if r["event_lc"] in veto_set])
+        blind, blind_all = _blindness(recs, veto_set)
+        sightings = _group_sightings([r for r in recs if r["event_lc"] in veto_set], now)
         result = {"ok": True, "ts": now, "recs": recs, "site_keys": frozenset(sightings),
                   "skew": skew, "site_capable": True, "blind_all": blind_all, "unread": sum(1 for r in recs if r.get("unread"))}
         with self._lock:
+            # a step since the last look moves the vetoes into the clock's frame before the
+            # answer (read in that frame, above) touches them
+            self._follow_clock(now)
             self._point = result
             self._point_error = None
-            events = self._apply_sightings("point", sightings, now, skew)
+            if self._point_attempt_ts is None:      # (dropped by the step: this answer is new)
+                self._point_attempt_ts = now
+            events = self._apply_sightings("point", sightings, now, skew, blind, blind_all)
             events += self._release_due(now)
             self._persist()
         self._succeeded("point")
@@ -1883,9 +2207,12 @@ class NwsAlertsPoller:
                 self._unplaceable(r, e)
         return out, True, frozenset(blind)
 
-    def poll_area(self, now=None):
-        """Every alert of the states on the map: text list, overlay, and the local site test."""
-        now = time.time() if now is None else now
+    def poll_area(self, now=None, frame=None):
+        """Every alert of the states on the map: text list, overlay, and the local site test.
+        ``frame``: as for poll_point (the answer, the civil query and the zone outlines may
+        take a while: a step in between is read out of ``now`` before each use)."""
+        now0 = now = time.time() if now is None else now
+        frame = _clock_offset() if frame is None else frame
         with self._lock:
             self._area_attempt_ts = now
         codes = area_codes(self.cfg)
@@ -1894,7 +2221,9 @@ class NwsAlertsPoller:
         site_zones = self._ensure_site_zones()
         url = "%s/alerts/active?area=%s&%s" % (BASE, ",".join(codes), _QUERY_FILTER)
         try:
-            recs, skew = self._parse_feed(_get(url, self._ua()), now)
+            data = _get(url, self._ua())
+            now = _in_frame(now0, frame)
+            recs, skew = self._parse_feed(data, now)
         except Exception as e:  # noqa: BLE001
             return self._fail("area", now, e)
         veto_set = _veto_set(self.cfg)
@@ -1930,8 +2259,9 @@ class NwsAlertsPoller:
         if deferred:
             log.info("NWS alerts: %d zone-based alert(s) not yet placed (zone outlines "
                      "still being fetched; later polls continue)", deferred)
+        now = _in_frame(now0, frame)
         sightings = _group_sightings([r for r in kept
-                                      if r["at_site"] and r["event_lc"] in veto_set])
+                                      if r["at_site"] and r["event_lc"] in veto_set], now)
         result = {"ok": True, "ts": now, "recs": kept, "site_keys": frozenset(sightings),
                   "skew": skew, "site_capable": bool(site_zones), "areas": codes,
                   "count_raw": count_raw, "count_live": len(recs), "deferred": deferred,
@@ -1941,9 +2271,13 @@ class NwsAlertsPoller:
                   | civil_blind,
                   "blind_all": blind_all, "unread": unread}
         with self._lock:
+            self._follow_clock(now)                 # (as in poll_point)
             self._area = result
             self._area_error = None
-            events = self._apply_sightings("local", sightings, now, skew)
+            if self._area_attempt_ts is None:
+                self._area_attempt_ts = now
+            events = self._apply_sightings("local", sightings, now, skew,
+                                           result["blind_events"], blind_all)
             events += self._release_due(now)
             self._persist()
         self._succeeded("area")
@@ -1964,6 +2298,7 @@ class NwsAlertsPoller:
         """Point query every HAZARD_POINT_POLL_SEC, area query every HAZARD_AREA_POLL_SEC."""
         explicit = now is not None
         now = time.time() if now is None else now
+        frame = _clock_offset()                 # the clock frame ``now`` belongs to
         if not self._is_enabled():
             return None
         if not _veto_set(self.cfg) and not self._noveto_warned:
@@ -1980,43 +2315,48 @@ class NwsAlertsPoller:
         # round (the area query is the veto's second, independent source)
         if due_p:
             try:
-                out["point"] = self.poll_point(now)
+                out["point"] = self.poll_point(now, frame)
             except Exception as e:  # noqa: BLE001
                 log.exception("NWS alerts point poll crashed")
                 out["point"] = self._fail("point", now, e)
         if due_a:
-            t = now if explicit else time.time()
+            t, f = (now, frame) if explicit else (time.time(), _clock_offset())
             try:
-                out["area"] = self.poll_area(t)
+                out["area"] = self.poll_area(t, f)
             except Exception as e:  # noqa: BLE001
                 log.exception("NWS alerts area poll crashed")
                 out["area"] = self._fail("area", t, e)
         return out or None
 
     def clock_stepped(self, pre_now: float, post_now: float) -> None:
-        """The wall clock stepped by delta. Our own stamps (first/last seen, caps) move with
-        it; the alerts' ABSOLUTE NWS times do not. So each veto's shift absorbs a backward
-        step (the veto keeps exactly the time it had left, however far away its NWS end now
-        looks) and a forward step returns the shift towards 0, never above it: a forward
-        step never holds a veto beyond its NWS end (an end the step carries into the past
-        is over in real time, and the contract bounds every veto by its end). last_seen =
-        the step, so an early release needs queries made AFTER it; results fetched before
-        it are no longer fresh; both queries re-poll now."""
-        delta = post_now - pre_now
+        """The step detector's report of a wall-clock step (server.py). Our own stamps
+        (first/last seen, caps) move with the clock; the alerts' ABSOLUTE NWS times do not.
+        So each veto's shift absorbs a backward step (the veto keeps exactly the time it
+        had left, however far away its NWS end now looks) and a forward step returns the
+        shift towards 0, never above it: a forward step never holds a veto beyond its NWS
+        end (an end the step carries into the past is over in real time, and the contract
+        bounds every veto by its end). last_seen = the step, so an early release needs
+        queries made AFTER it; results fetched before it are no longer fresh; both
+        queries re-poll now.
+
+        Each veto is moved by the change of its own clock frame, measured on the system's
+        clocks (_step_move), not by the reported delta: the poller has usually moved it
+        already, the moment an IsSafe call or a poll saw the step (_follow_clock), and a
+        veto first listed after the step is in the new frame. Moved by the delta as well,
+        such a veto lost (or gained) the step a second time."""
         with self._lock:
+            self._clock_off = _clock_offset()
             for rec in self._veto.values():
                 # (the cap moves with the step in _reframe: the time left of the unseen
                 # bound is kept; it is not renewed, a clock step is no sighting)
-                self._reframe(rec, delta, post_now)
+                self._reframe(rec, self._step_move(rec), post_now)
+                rec["frame_off"] = self._clock_off
                 rec["last_seen_ts"] = post_now
                 self._bound_unseen(rec, post_now)
-            self._point_attempt_ts = None
-            self._area_attempt_ts = None
-            self._point = None
-            self._area = None
+            self._drop_answers()
             self._persist()
         log.warning("NWS alerts: clock step handled (%+.0f s) — re-polling both queries",
-                    delta)
+                    post_now - pre_now)
 
     # -- output ---------------------------------------------------------------------------
     def _groups(self, p, a, now):
@@ -2047,9 +2387,10 @@ class NwsAlertsPoller:
         return groups
 
     def _view(self, recs, all_recs, now, active_keys, veto_set):
-        prim = max(recs, key=lambda r: (r.get("sent_ts") or 0.0,
-                                        r["end_ts"] if r.get("end_ts") is not None
-                                        else float("inf")))
+        # shown: the newest message, a readable one over an unread stub (as _sighting)
+        prim = max(_readable_first(recs), key=lambda r: (r.get("sent_ts") or 0.0,
+                                                         r["end_ts"] if r.get("end_ts")
+                                                         is not None else float("inf")))
         areas = []
         for r in recs + all_recs:
             if r.get("area_desc") and r["area_desc"] not in areas:
@@ -2086,7 +2427,10 @@ class NwsAlertsPoller:
         veto_set = _veto_set(self.cfg)
         with self._lock:
             # (no disk I/O here: this runs on every IsSafe evaluation; what changes here —
-            # a veto that ran out, a clock self-heal — is written by the poll thread)
+            # a veto that ran out, a clock step, a clock self-heal — is written by the poll
+            # thread). A step the clock shows is followed first: what _self_heal is left
+            # with is a step from before this poller's start.
+            self._follow_clock(now)
             self._self_heal(now)
             events = self._release_due(now)
             p = self._point if self._fresh(self._point, now) else None
@@ -2100,9 +2444,15 @@ class NwsAlertsPoller:
                 hold = self._hold_until(rec)
                 entry = {
                     "key": key, "event": rec["event"], "headline": rec["headline"],
+                    # end_ts: until when the veto is held at the latest — the warning's own
+                    # end, or an earlier time (the 24 h unseen bound) when that comes first
                     "sender": rec["sender"], "end_ts": hold,
                     "end_local": self._fmt(hold, now),
+                    # the warning's own (NWS) end, None without one. The IsSafe reason,
+                    # /setup and the status page show THIS as "until", and end_ts as "held
+                    # until ... unless NWS lists it again" when it is earlier (see _until)
                     "alert_end_ts": rec["end_ts"],
+                    "alert_end_local": fmt_local(rec["end_ts"], self._tz(), now),
                     "first_seen_ts": rec["first_seen_ts"],
                     "onset_ts": rec["onset_ts"],
                     "onset_local": fmt_local(rec["onset_ts"], self._tz(), now),
@@ -2111,22 +2461,10 @@ class NwsAlertsPoller:
                 }
                 if key in active_keys:
                     veto.append(entry)
+                    # the same words as monitor.hazard_veto_reason (see _until)
                     who = " (%s)" % rec["sender"] if rec["sender"] else ""
-                    if rec["end_ts"] is None:
-                        reasons.append("NWS %s in effect for the site (no end time given; "
-                                       "held until %s)%s" % (rec["event"], entry["end_local"],
-                                                             who))
-                    elif self._capped(rec):
-                        # held to the unseen bound, which comes before the alert's end
-                        reasons.append("NWS %s in effect for the site until %s%s; held to %s "
-                                       "unless NWS lists it again (released %d h after its "
-                                       "last sighting)" % (
-                                           rec["event"], self._fmt(self._own_end(rec), now),
-                                           who, entry["end_local"],
-                                           UNSEEN_RELEASE_SEC // 3600))
-                    else:
-                        reasons.append("NWS %s in effect for the site until %s%s"
-                                       % (rec["event"], entry["end_local"], who))
+                    reasons.append("NWS %s in effect for the site %s%s"
+                                   % (rec["event"], self._until(rec, now), who))
                 else:
                     pending.append(entry)
             groups = self._groups(p, a, now)
@@ -2194,7 +2532,7 @@ class NwsAlertsPoller:
                 if not geoms:
                     continue
                 recs = g["site"] or g["all"]
-                prim = max(recs, key=lambda r: r.get("sent_ts") or 0.0)
+                prim = max(_readable_first(recs), key=lambda r: r.get("sent_ts") or 0.0)
                 out.append({"kind": "alert", "key": key, "event": prim["event"],
                             "color": prim["color"],
                             "geometry": geoms[0] if len(geoms) == 1 else merge_geometries(geoms),

@@ -56,6 +56,9 @@ WANTED = {
     "wind_gust_kmh": "windGust",
 }
 _SAFETY_VIEW = ("cloud_cover_pct", "precip_prob_pct", "thunder_prob_pct", "qpf_mm")
+# The series evaluate() checks against a threshold. In these a value that reads as +infinity
+# is kept (see _num): it is above every threshold and vetoes, as it always did.
+_THRESHOLDED = frozenset(("cloud_cover_pct", "precip_prob_pct", "thunder_prob_pct"))
 # The series added for the weather log. The main monitor never reads them, so a malformed
 # one must not be able to make the whole download "malformed" (which would take the
 # forecast the main monitor DOES read away with it): on any error it is simply absent.
@@ -76,17 +79,32 @@ def _iso(t):
     return dt
 
 
-def _num(x):
-    """A grid value as a finite float, or None (no value). The grid's values are numbers;
-    one sent as a string, a bool, NaN or anything else must not reach a comparison with a
-    threshold — a string there raised TypeError on every evaluation (IsSafe HTTP 500)."""
+def _num(x, keep_inf=False):
+    """A grid value as a float, or None (no value). The grid's values are numbers; one
+    sent as a string is read as one, and a bool, NaN or anything else is no value: it must
+    not reach a comparison with a threshold — a string there raised TypeError on every
+    evaluation (IsSafe HTTP 500), and NaN compares False with every threshold.
+
+    +infinity ("Infinity" or 1e999 in the JSON, or an integer too large for a float) is
+    kept when ``keep_inf`` — for a series checked against a threshold (_THRESHOLDED) — as
+    100: every such series is a percentage, 100 % is above every threshold, so it vetoes as
+    it did before values were checked here (the rule wu_poll._rate keeps for a rain rate),
+    and the forecast, the state file and /status stay standard JSON (json writes an
+    infinity as the non-standard token Infinity, which a browser's JSON.parse rejects).
+    Elsewhere (temperature, wind: formatted and converted for the page and the log) it is
+    no value. -infinity is never kept: as a cloud cover or a precipitation chance it would
+    read as "clear" to the dew monitor."""
     if x is None or isinstance(x, bool) or not isinstance(x, (int, float, str)):
         return None
     try:
         v = float(x)
-    except (ValueError, OverflowError):
+    except OverflowError:               # an integer too large for a float
+        v = math.inf if isinstance(x, int) and x > 0 else -math.inf
+    except ValueError:
         return None
-    return v if math.isfinite(v) else None
+    if math.isfinite(v):
+        return v
+    return 100.0 if keep_inf and v > 0 else None
 
 
 def _dur_hours(dur):
@@ -97,7 +115,7 @@ def _dur_hours(dur):
     return max(d * 24 + h + (1 if mm else 0), 1)
 
 
-def _expand(series):
+def _expand(series, keep_inf=False):
     out = {}
     if not series:
         return out
@@ -105,7 +123,7 @@ def _expand(series):
         s, dur = it["validTime"].split("/")
         start = _iso(s).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         for k in range(_dur_hours(dur)):
-            out[start + timedelta(hours=k)] = _num(it["value"])
+            out[start + timedelta(hours=k)] = _num(it["value"], keep_inf)
     return out
 
 
@@ -166,7 +184,8 @@ def fetch(cfg):
     try:
         now = datetime.now(timezone.utc)
         hour0 = now.replace(minute=0, second=0, microsecond=0)
-        maps = {k: (_expand_log_only if k in LOG_ONLY else _expand)(p.get(prop))
+        maps = {k: (_expand_log_only(p.get(prop)) if k in LOG_ONLY
+                    else _expand(p.get(prop), k in _THRESHOLDED))
                 for k, prop in WANTED.items()}
 
         def at(h):
@@ -223,7 +242,7 @@ def evaluate(result, cfg, now_ts=None):
     reasons = []
     for label, hour in (("this hour", result["now_hour"]), ("next hour", result["next_hour"])):
         for key, limit, name in checks:
-            v = _num(hour.get(key))
+            v = _num(hour.get(key), keep_inf=True)      # +inf reads 100 %: above every one
             if v is not None and v > limit:
                 reasons.append(f"NWS {name} {v:g}% > {limit:g}% ({label})")
     return {"available": True, "safe": not reasons, "reasons": reasons, "stale": False}

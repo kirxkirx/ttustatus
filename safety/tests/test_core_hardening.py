@@ -436,7 +436,7 @@ def test_a_dead_station_is_still_backed_off(env, monkeypatch):
     assert set(p._backoff_until) == {"A", "B"}          # offline and bad reply: as before
 
 
-def test_429_stops_the_poll_and_retry_after_is_honoured(env, monkeypatch):
+def test_429_stops_the_poll_but_its_retry_after_never_holds_the_next_one(env, monkeypatch):
     p = _real_poller(env, monkeypatch, ["A", "B", "C"], _urlopen_by_station({
         "A": _wu_reply(), "B": _http_error(429, retry_after=1200), "C": _wu_reply()}))
     t = time.time()
@@ -444,9 +444,10 @@ def test_429_stops_the_poll_and_retry_after_is_honoured(env, monkeypatch):
     assert [r["state"] for r in res["results"]] == ["live", "error", "not-asked"]
     assert res["throttle"] == {"status": 429, "retry_after_s": 1200.0}
     assert p._backoff_until == {} and p._offline_streak == {}
-    # the normal interval (600 s) has passed, but WU said 20 min
-    assert p.maybe_poll(-10.0, t + 700) is None
-    assert p.maybe_poll(-10.0, t + 1201) is not None
+    # WU said 20 min, but rain detection is never paused beyond the normal interval
+    # (600 s): the next poll comes then (it used to wait for the Retry-After, up to 1 h)
+    assert p.maybe_poll(-10.0, t + 599) is None
+    assert p.maybe_poll(-10.0, t + 600) is not None
 
 
 def test_retry_after_is_bounded_and_read_as_a_date():
@@ -462,7 +463,9 @@ def test_retry_after_is_bounded_and_read_as_a_date():
     assert wu_poll._retry_after(Message()) is None
     assert wu_poll._get_json.__module__ == "safety.wu_poll"
     assert isinstance(wu_poll.WuApiError("x", status=503), wu_poll.WuError)
-    assert wu_poll.WuApiError("x", status=503).throttled
+    assert wu_poll.WuApiError("x", status=429).throttled
+    # a 503 is one station's server error, not WU's rate limit: the poll goes on
+    assert not wu_poll.WuApiError("x", status=503).throttled
     assert not wu_poll.WuApiError("x", status=500).throttled
 
 

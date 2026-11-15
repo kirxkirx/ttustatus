@@ -12,12 +12,16 @@ forces unsafe on its own; an active latch keeps IsSafe false regardless. A windo
 no granule could be read (GLM writes one every 20 s, flashes or not) is no data, never "no
 lightning". GLM flashes are already geodetic lat/lon, so no projection is needed.
 
-No time is left unread between polls: each poll returns a cursor (the start of the newest
-granule up to which every granule was read) and the next one reads from a minute before
-it, so a granule that failed, or was published late, is read by the next poll. A poll
-whose granules leave a hole or a lag in its window is flagged partial (_coverage). Ideas
-ported from vlbaweather's vlba/glm.py; replies, granules and the whole poll are capped in
-size and time.
+Each poll carries on where the previous one stopped: it returns a cursor (the start of the
+newest granule up to which every granule was read) and the next one reads from a minute
+before it, so a granule that failed, that the poll's deadline did not get to, or that is
+missing from the listing while it may still be published, is read by the next poll.
+Time no poll read is never passed off as read: a poll whose granules leave a hole or a
+lag in its window is flagged partial (_coverage); what a poll gives up for good — the
+oldest granules of a full-length catch-up its time ran out on, the minutes before a
+catch-up limit — it reports (skipped_s), and the dew monitor's watch over lightning data
+starts again after it. Ideas ported from vlbaweather's vlba/glm.py; replies, granules and
+the whole poll are capped in size and time.
 
 Wrong-clock guard: the bucket keeps years of granules and the listing names the hour from
 THIS host's clock, so a Pi booted with a wrong clock would read another day's lightning as
@@ -78,7 +82,9 @@ def site_in_fov(lat, lon, max_arc_deg=70.0):
 # GLM writes a granule every GRANULE_S seconds, flashes or not. Measured 2026-11-12 (in
 # vlbaweather, on the same buckets): a single granule is missing two or three times in a
 # thousand, and a granule is published 5-75 s after its end, so the newest one listed
-# ends 10-95 s before the listing.
+# ends 10-95 s before the listing. Measured again 2026-11-14 (12 h of noaa-goes19: 2160
+# granules, starts exactly 20 s apart, none missing): published 5-77 s after their end
+# (half within 10 s), and 14 granules after a newer one — by 60 s at most.
 GRANULE_S = 20
 # A poll reaches back WINDOW_OVERLAP_S before the cursor (the start of the newest granule
 # up to which the previous polls read everything): a granule published late, after a
@@ -86,14 +92,21 @@ GRANULE_S = 20
 WINDOW_OVERLAP_S = 60
 # ...but never further back than MAX_CATCHUP_S (or the configured window, if longer): after
 # a long pause (daytime, an outage) the next poll reads that much, not the whole pause.
+# The time before it was never read: the poll reports it (skipped_s, see poll_flashes).
 MAX_CATCHUP_S = 900
 # Completeness of a poll, from the granules it READ: more than MAX_GAP_S of unread time
-# between two of them (or between the window's start and the first) is a hole, and a
-# newest granule that ends more than MAX_LAG_S before the poll is a lag. Either makes the
-# poll partial: a flash in what was read still counts, but "no flash" does not vouch for
-# the whole window.
+# between two of them (or between where the poll had to carry on from and the first) is
+# a hole, and a newest granule that ends more than MAX_LAG_S before the poll is a lag.
+# Either makes the poll partial: a flash in what was read still counts, but "no flash"
+# does not vouch for the whole window.
 MAX_GAP_S = 120
 MAX_LAG_S = 180
+# A granule missing from a listing that already holds newer ones may still be published
+# (they reach S3 out of order, see above). While it ended at most MAX_LAG_S before the
+# poll — the lateness a poll accepts of the feed as a whole, more than twice the slowest
+# publication measured — the cursor stays close enough before it that the next poll
+# reads it (_cursor_after). One that ended longer ago is taken to be missing for good:
+# waiting for it would only make every later poll read the same granules again.
 # Caps on what a reply or a granule can cost. Real granules are 0.17-0.6 MB and hold a
 # few hundred flashes; a listing of one hour (180 keys) is about 70 kB.
 MAX_LIST_BYTES = 2 * 1024 * 1024
@@ -103,7 +116,10 @@ MAX_FLASHES_PER_GRANULE = 100000
 # listing may hold up to 1000 keys an hour; duplicates of one start are read once).
 GRANULE_MARGIN = 10
 # One request's socket timeout and whole-body deadline, and the whole poll's deadline
-# (listings included): what is not read by then counts as unread, like a failed granule.
+# (listings included). Granules are read newest first. The oldest ones a poll did not get
+# to by its deadline are read by the next poll (the cursor stays before them), unless its
+# window already reached back MAX_CATCHUP_S, or the cap above left them out: reading
+# again cannot catch up then, and they are given up (poll_flashes).
 REQUEST_TIMEOUT_S = 15.0
 POLL_DEADLINE_S = 75.0
 MIN_REQUEST_S = 1.0                 # s left below which no request is started
@@ -222,8 +238,8 @@ def _flashes_from_buffer(buf):
     (trixie: 1.14, built thread-safe) keeps its "print errors" switch per thread. Opened
     from memory, libnetcdf first probes the dataset's NAME as a file; that probe fails,
     and in any thread but the main one HDF5 prints the failure as a ~20-line error stack
-    on stderr — although the open itself then works. That was every granule, ~15 per poll,
-    some 3600 journal lines an hour at night (seen in the Raspberry Pi OS test, CI's
+    on stderr — although the open itself then works. That was every granule (15 a poll
+    then), some 3600 journal lines an hour at night (seen in the Raspberry Pi OS test, CI's
     raspios.yml). A real file has nothing to probe in vain. Its name starts "ttu-glm-": the
     daemon's start-up sweep removes a file that a killed poll left behind.
 
@@ -315,10 +331,12 @@ def _span_words(seconds):
 
 
 def _coverage(read_starts, lo, end):
-    """What the granules READ (their start times, epoch s) leave out of the window
-    [lo, end], in plain words: [] when the window is complete. A hole is more than
-    MAX_GAP_S of unread time between two granules or before the first; a lag is a newest
-    granule that ends more than MAX_LAG_S before ``end``."""
+    """What the granules READ (their start times, epoch s) leave out of [lo, end], in
+    plain words: [] when it is complete. ``lo`` is where the poll had to carry on from:
+    the end of the granule the cursor marks (the minute of overlap before it was read by
+    an earlier poll), else the window's start. A hole is more than MAX_GAP_S of unread
+    time between two granules or before the first; a lag is a newest granule that ends
+    more than MAX_LAG_S before ``end``."""
     ts = sorted(set(read_starts))
     if not ts:
         return ["no granule read"]
@@ -339,21 +357,81 @@ def _coverage(read_starts, lo, end):
     return problems
 
 
-def _cursor_after(selected, read, lo, since):
-    """The new cursor: the start of the newest granule up to which every selected granule
-    (ascending start times) was read, from ``lo`` on, without a hole. A granule that
-    failed (or was not reached) stops it, so the next poll reads that granule again; so
-    does a hole, so a granule published late is read then. The cursor never moves back
-    (``since``, the previous one); with neither, ``lo``: the next poll starts there."""
+def _near(x, starts):
+    """Whether one of ``starts`` (epoch s) is the granule that starts at ``x``: start times
+    are compared to within half a granule (they are rounded to 0.1 s, and a slot of a gap
+    is computed from its neighbours)."""
+    return any(abs(x - s) < GRANULE_S / 2.0 for s in starts)
+
+
+def _cursor_after(selected, read, lo, since, end=None, given_up_to=None, pending=()):
+    """``(cursor, pending)`` for the next poll.
+
+    The cursor: the start of the newest granule up to which every listed granule
+    (``selected``: ascending start times) was read, without a hole. A granule that failed,
+    or that the deadline did not get to, stops it, so the next poll reads that granule
+    again; so does a hole, so a granule published late is read then. Only what this poll
+    had to read counts: a granule up to the previous cursor (``since``; the minute of
+    overlap) was read by an earlier poll, and failing to read it again holds nothing up
+    — unless it is one the previous poll left ``pending`` (below).
+
+    ``given_up_to``: the oldest granule this poll read, when it gave up the older ones it
+    did not get to (only when reading them again could not catch up, see poll_flashes).
+    The cursor walks on from there.
+
+    A gap in the listing whose youngest missing granule ended at most MAX_LAG_S before
+    ``end`` (the poll's time) may still be filled: the cursor stays at most
+    WINDOW_OVERLAP_S past the gap, so the next poll's window reaches it, and the gap's
+    slots that the cursor went past are returned as ``pending``. A granule listed there
+    by the next poll has never been read: that poll reads it first and has to read it
+    — failing that, the cursor stays — although it lies in its minute of overlap, which
+    otherwise was read before. (Before, a gap of up to MAX_GAP_S was passed: a granule
+    published more than WINDOW_OVERLAP_S after a newer one was read by no poll; and one
+    published within the minute was lost when its one download in the overlap failed,
+    with nothing said either time.) A slot stays pending while it is within
+    WINDOW_OVERLAP_S of the cursor; a granule not listed by the time the cursor moves on
+    is taken to be missing for good, as GLM drops one now and then.
+
+    The cursor never moves back (``since``, the previous one). With neither, the next
+    poll has to carry on from ``lo``: the cursor is then the start of the 20 s before it
+    (the next poll's coverage starts at the end of the cursor's granule, so a granule at
+    ``lo`` that failed is read again then, and not taken as read)."""
+    # from here on every granule has to have been read (failures, holes stop the cursor)
+    must_from = lo if since is None else max(lo, since + GRANULE_S)
+    scan_from = lo
+    if given_up_to is not None and given_up_to > must_from:
+        must_from = scan_from = given_up_to
+    pending = [p for p in pending if p >= scan_from - 1e-6]     # (the rest is lost)
     newest = None
-    covered_to = lo
+    covered_to = scan_from
+    wait_from = None
+    gaps = []
     for s in selected:
-        if s not in read or s - covered_to > MAX_GAP_S:
+        if s < scan_from:
+            continue                        # given up (this poll's deadline)
+        if (wait_from is None and end is not None and s - covered_to >= GRANULE_S - 0.05
+                and end - s <= MAX_LAG_S):
+            wait_from = covered_to          # a granule missing before s may still come
+        must = s >= must_from - GRANULE_S / 2.0 or _near(s, pending)
+        if must and (s not in read or s - covered_to > MAX_GAP_S):
             break
+        if wait_from is not None and s > wait_from + WINDOW_OVERLAP_S:
+            break
+        if wait_from is not None:
+            t = covered_to                  # the slots of a gap the cursor goes past
+            while s - t >= GRANULE_S / 2.0:
+                gaps.append(t)
+                t += GRANULE_S
         newest = s
         covered_to = max(covered_to, s + GRANULE_S)
     marks = [x for x in (newest, since) if x is not None]
-    return max(marks) if marks else lo
+    cursor = max(marks) if marks else lo - GRANULE_S
+    left = []
+    for p in sorted(pending + gaps):
+        if (p >= cursor - WINDOW_OVERLAP_S - GRANULE_S / 2.0 and not _near(p, read)
+                and not _near(p, left)):
+            left.append(round(p, 1))
+    return cursor, left
 
 
 def _hour_prefixes(lo, end):
@@ -377,21 +455,28 @@ def _finite_ts(v):
     return v if math.isfinite(v) else None
 
 
-def poll_flashes(cfg, since=None, now=None):
+def poll_flashes(cfg, since=None, now=None, pending=()):
     """Read the granules not read yet and summarise them (SLOW; call outside locks).
 
     ``since``: the cursor the previous poll returned (epoch s; None for the first poll
     after a start or a clock step, which reads the last GLM_WINDOW_MIN). The poll reads
     from WINDOW_OVERLAP_S before the cursor — or the configured window, if that reaches
-    further — but at most MAX_CATCHUP_S (or the window) back. ``now``: an aware datetime
-    for the tests (default: this host's clock).
+    further — but at most MAX_CATCHUP_S (or the window) back. ``pending``: the slots of a
+    gap the previous poll's cursor went past (it returned them as ``pending``): a granule
+    listed there now was never read, and is read first (_cursor_after). ``now``: an aware
+    datetime for the tests (default: this host's clock).
 
     The result is ``ok`` once one granule was read. ``partial`` (with ``coverage``, the
     reason in words) when what was read leaves a hole or a lag in the window (_coverage):
     a flash in what was read counts all the same, but "no flash" is then not a clear
-    window. ``cursor`` is for the next poll (_cursor_after). ``granules_in_window`` counts
-    the granules read that start within the last GLM_WINDOW_MIN (the dew monitor's
-    measure of a poll; ``granules_scanned`` counts all read)."""
+    window. ``cursor`` and ``pending`` are for the next poll (_cursor_after).
+    ``granules_in_window`` counts the granules read that start within the last
+    GLM_WINDOW_MIN (the dew monitor's measure of a poll; ``granules_scanned`` counts all
+    read). ``skipped_s``: the time no poll read that this one passes for good, in whole
+    granules (0 when there is none) — the minutes before a window the catch-up limit cut
+    short, the oldest granules given up, a pending granule that was never read.
+    ``first_error``: the first granule that could not be read, and why (for the log;
+    None when every granule tried was read)."""
     if not deps_available():
         return {"ok": False, "error": "numpy/netCDF4 not installed"}
     deadline_at = _mono() + POLL_DEADLINE_S
@@ -404,7 +489,21 @@ def poll_flashes(cfg, since=None, now=None):
         since = None                        # a cursor from the future: the clock went back
     if since is not None:
         lo = min(lo, since - WINDOW_OVERLAP_S)
-    lo = max(lo, end - max(float(MAX_CATCHUP_S), window_s))
+    # (a poll whose window reaches back this far cannot catch up by reading again: see
+    # given_up_to below)
+    limit_lo = end - max(float(MAX_CATCHUP_S), window_s)
+    lo = max(lo, limit_lo)
+    # (pending slots belong to the cursor they came with)
+    pending = ([] if since is None else
+               [p for p in (_finite_ts(x) for x in (pending or ())) if p is not None])
+    # Where this poll has to carry on from: the end of the granule the cursor marks
+    # (earlier polls read everything before it; the minute of overlap is read again only
+    # for a granule published late) — or the window's start, without a cursor or when
+    # the catch-up limit cut the window short of it. Completeness is judged from here:
+    # judged from the window's start, the overlap counted as unread whenever a slow link
+    # did not get to it again, although an earlier poll had read it.
+    prev_end = None if since is None else since + GRANULE_S
+    base = lo if prev_end is None else max(lo, prev_end)
     minutes = int(round((end - lo) / 60.0))
     tol = _clock_tolerance(cfg)
     keys = []
@@ -439,8 +538,13 @@ def poll_flashes(cfg, since=None, now=None):
         if lo <= x <= end and (x not in by_start or k > by_start[x]):
             by_start[x] = k
     starts = sorted(by_start)
+    # What to read, in order: first a granule listed in a slot the previous poll left
+    # pending (published late, behind newer ones: no poll has read it, and as the oldest
+    # granule of the window a slow link would get to it last), then the newest first —
+    # they matter most — at most `cap` of them; the cap leaves the oldest out.
     cap = int((end - lo) / GRANULE_S) + GRANULE_MARGIN
-    selected = starts[-cap:]                # the newest; the older ones count as unread
+    late = [x for x in starts if _near(x, pending)]
+    order = late + [x for x in reversed(starts[-cap:]) if x not in late]
 
     lat0, lon0 = cfg.GEOCODE
     nearest_km = None
@@ -448,14 +552,20 @@ def poll_flashes(cfg, since=None, now=None):
     within = 0
     dropped = 0
     read = set()
+    tried = set()
     failed = 0
-    unreached = len(starts) - len(selected)
+    # A request the deadline cut off (its time budget was what was left) is as unreached
+    # as one never started: counted only as failed, it left a full-length catch-up that
+    # read all but its oldest granule with nothing to give up, and the cursor at the
+    # morning's — the same catch-up again on every poll.
+    cut_off = []
     first_error = None
-    for x in reversed(selected):            # newest first: they matter most
+    for x in order:
         left = deadline_at - _mono()
         if left < MIN_REQUEST_S:
-            unreached += 1
-            continue
+            first_error = first_error or "poll deadline reached"
+            break                           # the rest is not reached
+        tried.add(x)
         key = by_start[x]
         try:
             lats, lons = _flashes_from_buffer(
@@ -463,8 +573,11 @@ def poll_flashes(cfg, since=None, now=None):
                      min(REQUEST_TIMEOUT_S, left)))
             n, near, ll, bad = _granule_summary(lat0, lon0, lats, lons, cfg.GLM_TRIGGER_KM)
         except Exception as e:  # noqa: BLE001 - one bad granule never costs the poll
-            # unread: the cursor stops before it, so the next poll reads it again
+            # unread: the cursor stops before it, so the next poll reads it again (unless
+            # this poll gives up what is older than the oldest granule it read, see below)
             failed += 1
+            if deadline_at - _mono() < MIN_REQUEST_S:
+                cut_off.append(x)
             first_error = first_error or "%s: %s" % (key.rsplit("/", 1)[-1], e)
             log.debug("GLM granule %s unreadable: %s", key, e)
             continue
@@ -476,35 +589,108 @@ def poll_flashes(cfg, since=None, now=None):
                         key.rsplit("/", 1)[-1], bad)
         if near is not None and (nearest_km is None or near < nearest_km):
             nearest_km, nearest_ll = near, ll
-    if unreached:
-        first_error = first_error or "poll deadline reached"
+    unreached = [x for x in starts if x not in tried]
+    if len(order) < len(starts):
+        first_error = first_error or "more granules listed than a poll reads (%d)" % cap
     # GLM writes a granule every 20 s, flashes or not: a window without one read is a
-    # feed outage (or a clock off by most of the window), never "no lightning"
+    # feed outage (or a clock off by most of the window), never "no lightning". The
+    # cause goes with the result: the poller logs it once, when polls start failing (a
+    # warning on every poll was a dozen lines an hour all night).
     if not read:
         error = ("no GLM granule in the last %d min" % minutes if not starts else
                  "none of the %d GLM granules of the last %d min could be read"
                  % (len(starts), minutes))
-        out = {"ok": False, "granules_scanned": 0, "granules_in_window": 0,
-               "server_skew_s": agreed, "error": error}
-        if starts and first_error:
-            log.warning("GLM poll: no granule read (%s)", first_error)
-        return out
-    problems = _coverage(read, lo, end)
-    if failed or unreached:
-        log.info("GLM poll: %d of %d granules unread (%s); read again next poll",
-                 failed + unreached, len(starts), first_error)
-    if problems:
-        log.info("GLM poll partial: %s", "; ".join(problems))
+        log.debug("GLM poll: no granule read (%s)", first_error)
+        return {"ok": False, "granules_scanned": 0, "granules_in_window": 0,
+                "server_skew_s": agreed, "error": error, "first_error": first_error}
+    # Cut short, a poll leaves its oldest new granules unread (it reads the newest first).
+    # Normally the cursor stays before them, and the next poll reads them: one stalled
+    # poll costs nothing then (before, it gave them up for good, and a flash in them never
+    # reached the latch). But when what is left to read already reaches back as far as a
+    # poll may (MAX_CATCHUP_S: the cursor's minute of overlap, or without a cursor the
+    # window, lies at or before that limit), or the cap on granules per poll left some
+    # out, reading again cannot catch up — the next window would be as long, and cut
+    # short the same way: on a slow link no poll was complete again all night. Then the
+    # poll gives up what is older than the oldest new granule it read (the ones it did not
+    # get to, and a request the deadline cut off), and the cursor walks on from there, so
+    # the next window is back to its normal size (_cursor_after). (Judged by the window
+    # alone, a configured GLM_WINDOW_MIN of 15 or more reached the limit on every poll,
+    # and one stalled download gave granules up that the next window would have read.)
+    new_read = [x for x in read if x >= base - GRANULE_S / 2.0]
+    cut_new = [x for x in unreached + cut_off if x >= base - GRANULE_S / 2.0]
+    backlog_from = lo if since is None else since - WINDOW_OVERLAP_S
+    cannot_catch_up = (backlog_from <= limit_lo + 0.001
+                       or any(x not in order for x in cut_new))
+    given_up_to = (min(new_read) if cut_new and new_read and cannot_catch_up
+                   and min(new_read) > base else None)
+    problems = _coverage(read, base, end)
+    if cut_new and not problems:
+        # A poll cut short is partial even when what it left is less than a hole: the
+        # granules were published, and its "no flash" does not cover them (counted as a
+        # good poll, it let the dew monitor vouch for them until a later poll read them
+        # or gave them up). A hole or a lag is reported instead when there is one.
+        problems.append("%d new granule(s) %s: the poll's %.0f s ran out" % (
+            len(cut_new), "given up" if given_up_to is not None
+            else "left for the next poll", POLL_DEADLINE_S))
+    # Time no poll read that the cursor now leaves behind for good: the minutes before a
+    # window the catch-up limit cut short of the cursor, what this poll gave up, and a
+    # pending granule (listed late) that was never read before it was given up or fell
+    # out of the window. ALL of it is reported, in whole granules (a fraction of one
+    # rounded to 0 hid a granule the catch-up limit had just cut off; exactly 0 in a poll
+    # that gave nothing up), so that a watch over the lightning data — the dew monitor's
+    # 30 minutes — starts again instead of running on across it. Unlike a hole in the
+    # listing (a granule GLM never published, tolerated up to MAX_GAP_S by _coverage),
+    # this is data that exists and was not read: on a link too slow to read every
+    # granule, the dew monitor stays false rather than vouch for lightning data nobody
+    # looked at. (After the daytime pause this is the whole day: harmless, that watch
+    # restarts anyway.)
+    # (the slots from prev_end that start before the cut: within a microsecond is float
+    # noise, anything more is a granule the window or the give-up left out)
+    cut = given_up_to if given_up_to is not None else base
+    skipped = 0
+    if prev_end is not None and cut - 1e-6 > prev_end:
+        skipped = GRANULE_S * int(math.ceil((cut - 1e-6 - prev_end) / GRANULE_S))
+    # (a pending slot lies before the cursor: given up with the rest, or out of the
+    # window — any amount before its start, as the window's own filter has it)
+    lost = [p for p in pending if not _near(p, read)
+            and (given_up_to is not None or p < lo - 1e-6)]
+    skipped += GRANULE_S * len(lost)
+    if failed or unreached or skipped:
+        log.debug("GLM poll: %d of %d listed granules not read (%s); %s; %d s left "
+                  "behind unread", failed + len(unreached), len(starts), first_error,
+                  "the oldest given up" if given_up_to is not None else
+                  "read again next poll", skipped)
+    cursor, still_pending = _cursor_after(starts, read, lo, since, end, given_up_to, pending)
     brng = _cardinal(_bearing(lat0, lon0, *nearest_ll)) if nearest_ll else None
     return {"ok": True, "error": None, "granules_scanned": len(read),
             "granules_in_window": sum(1 for x in read if x >= end - window_s),
-            "granules_listed": len(starts), "granules_unread": failed + unreached,
+            "granules_listed": len(starts), "granules_unread": failed + len(unreached),
             "in_ring": within > 0, "flashes_in_ring": within, "flashes_dropped": dropped,
             "nearest_km": round(nearest_km, 1) if nearest_km is not None else None,
             "nearest_bearing": brng, "server_skew_s": agreed,
             "partial": bool(problems), "coverage": "; ".join(problems) or None,
+            "skipped_s": skipped, "first_error": first_error,
             "window_start": lo, "window_end": end,
-            "cursor": _cursor_after(starts, read, lo, since)}
+            "cursor": cursor, "pending": still_pending}
+
+
+def _failure_kind(res):
+    """None for a poll that worked; else what failed, for the log: "clock" (the
+    wrong-clock guard refused the listing), "list" (the listing itself), "none listed"
+    (no granule in the window), "unreadable" (granules listed, none could be read) or
+    "other"."""
+    if res.get("ok"):
+        return None
+    if res.get("clock_skew_s") is not None:
+        return "clock"
+    error = str(res.get("error") or "")
+    if error.startswith("list:"):
+        return "list"
+    if error.startswith("no GLM granule"):
+        return "none listed"
+    if error.startswith("none of the"):
+        return "unreadable"
+    return "other"
 
 
 # ----- latching poller (mirrors RainPoller) --------------------------------
@@ -524,16 +710,25 @@ class GlmLightningPoller:
         # the start (epoch s) of the newest granule up to which every granule was read;
         # None after a start or a clock step: the next poll reads the configured window
         self._cursor = None
+        # the slots of a gap the cursor went past that may still be filled (granules
+        # published late): the next poll has to read what is listed there (poll_flashes)
+        self._pending = ()
         # The wrong-clock guard's verdict from the bucket's Date headers: None (nothing
         # known yet), True (the last listing agreed), False (the last listing was
         # refused). It sets the next poll's limit (servertime.limit: hysteresis) and its
         # changes go to the log and the event log, as the radar's do.
         self._clock_ok = None
-        # How the last poll failed: None (it did not), "clock" (the wrong-clock guard
-        # refused it) or "poll" (anything else). A failed poll used to leave no trace in
-        # the log at all; now each change between these is logged once — kept apart so a
-        # feed outage right after a clock refusal is still reported.
+        # How the last poll failed (_failure_kind): None (it did not), "clock" (the
+        # wrong-clock guard refused it), or the kind of any other failure. A failed poll
+        # used to leave no trace in the log at all; now each change between these is
+        # logged once — kept apart so a feed outage right after a clock refusal is still
+        # reported, and so is the cause that lasts when a run of failures starts with
+        # another one (a listing that failed after a boot, then granules that cannot be
+        # read all night).
         self._failing = None
+        # Whether the last poll that worked was partial: logged when that starts and
+        # ends, not on every poll (a slow link made it two lines a poll all night)
+        self._partial = False
         self._load_latch()
 
     def _load_latch(self):
@@ -589,28 +784,40 @@ class GlmLightningPoller:
         if now is None:
             now = time.time()
         with self._lock:
-            since = self._cursor
+            since, pending = self._cursor, self._pending
             clock_ok = self._clock_ok
         cfg = _WithLimit(self.cfg, servertime.limit(_clock_tolerance(self.cfg), clock_ok))
-        # SLOW, outside the lock. (The first poll is called without a cursor at all.)
-        res = poll_flashes(cfg) if since is None else poll_flashes(cfg, since=since)
+        # SLOW, outside the lock. (The first poll is called without a cursor at all, and
+        # a poll without pending slots without those.)
+        if since is None:
+            res = poll_flashes(cfg)
+        elif pending:
+            res = poll_flashes(cfg, since=since, pending=pending)
+        else:
+            res = poll_flashes(cfg, since=since)
         if not isinstance(res, dict):
             res = {"ok": False, "error": "poll returned %s" % type(res).__name__}
         with self._lock:
             self._last_poll_ts = now
             self._last_result = res
             was_clock, was_failing = self._clock_ok, self._failing
+            was_partial = self._partial
             if not res.get("ok") and res.get("clock_skew_s") is not None:
                 self._clock_ok = False
             elif res.get("server_skew_s") is not None:
                 self._clock_ok = True
-            self._failing = (None if res.get("ok") else
-                             "clock" if res.get("clock_skew_s") is not None else "poll")
+            self._failing = _failure_kind(res)
             clock_now = self._clock_ok
             if res.get("ok"):
+                self._partial = bool(res.get("partial"))
                 cursor = _finite_ts(res.get("cursor"))
                 if cursor is not None:
                     self._cursor = cursor
+                    left = res.get("pending")
+                    self._pending = tuple(
+                        p for p in (_finite_ts(x) for x in
+                                    (left if isinstance(left, (list, tuple)) else ()))
+                        if p is not None)
                 self._nearest_km = res.get("nearest_km")
                 self._nearest_bearing = res.get("nearest_bearing")
                 if res.get("in_ring"):
@@ -621,14 +828,17 @@ class GlmLightningPoller:
                         "LIGHTNING", reason=f"GLM flash within {self.cfg.GLM_TRIGGER_KM:g} km",
                         source="glm", result=f"latch {self.cfg.GLM_COOLOFF_HOURS:g}h",
                         nearest=f"{res.get('nearest_km')}km {res.get('nearest_bearing')}")
-        self._log_changes(res, was_clock, clock_now, was_failing)
+        self._log_changes(res, was_clock, clock_now, was_failing, was_partial)
         return res
 
-    def _log_changes(self, res, was_clock, clock_now, was_failing):
-        """Changes only, never every poll (the event log is on the SD card): the clock
-        found wrong by the bucket's Date and right again (log + CLOCK event, as the radar
-        does — before, a GLM refusal left no trace in either log), and polls starting to
-        fail or working again (log only)."""
+    def _log_changes(self, res, was_clock, clock_now, was_failing, was_partial=False):
+        """Changes only, never every poll (the event log is on the SD card; the journal
+        should not fill with one line per poll either): the clock found wrong by the
+        bucket's Date and right again (log + CLOCK event, as the radar does — before, a
+        GLM refusal left no trace in either log), polls starting to fail — with the first
+        granule's error, if that was it — failing for another reason from then on, or
+        working again, and polls starting to leave part of their window unread or reading
+        all of it again (log only)."""
         if clock_now is False and was_clock is not False:
             skew = res.get("clock_skew_s")
             log.error("WRONG SYSTEM CLOCK? %s", res.get("error"))
@@ -641,11 +851,20 @@ class GlmLightningPoller:
         if res.get("ok"):
             if was_failing is not None:
                 log.info("GLM polls work again (%s granules read)", res.get("granules_scanned"))
-        elif res.get("clock_skew_s") is None and was_failing != "poll":
+            if res.get("partial") and not was_partial:
+                log.info("GLM poll partial: %s — a flash in what was read counts, but no "
+                         "flash there is no proof of none (logged again when a poll reads "
+                         "its whole window)", res.get("coverage") or "incomplete")
+            elif was_partial and not res.get("partial"):
+                log.info("GLM polls read their whole window again")
+        elif res.get("clock_skew_s") is None and was_failing != _failure_kind(res):
             # (a clock refusal is logged above, as an error; this is any other failure,
-            # including a feed outage that follows a refusal)
-            log.warning("GLM poll failed: %s — lightning data unavailable until a poll "
-                        "succeeds (an active latch stays)", res.get("error"))
+            # including a feed outage that follows a refusal, and a failure whose kind
+            # changed: its cause would never reach the log otherwise)
+            first = res.get("first_error")
+            log.warning("GLM poll failed: %s%s — lightning data unavailable until a poll "
+                        "succeeds (an active latch stays)", res.get("error"),
+                        " (first error: %s)" % first if first else "")
 
     def maybe_poll(self, sun_alt, now=None):
         if now is None:
@@ -683,6 +902,7 @@ class GlmLightningPoller:
                 log.warning("GLM latch re-armed across a clock step")
             self._last_poll_ts = None
             self._cursor = None             # the granules it marks were the wrong day's
+            self._pending = ()
 
     def component(self, sun_alt, now=None):
         if now is None:
@@ -728,6 +948,9 @@ class GlmLightningPoller:
                 "error": None if res.get("ok") else res.get("error"),
                 "warnings": warnings, "partial": partial,
                 "coverage": res.get("coverage") if partial else None,
+                # time the last poll left behind unread for good (poll_flashes): the dew
+                # monitor's lightning watch does not run on across it
+                "skipped_s": (_finite_ts(res.get("skipped_s")) or 0) if current else 0,
                 "available": deps_available() and bool(res.get("ok")) and fresh,
                 "latched": latched, "latched_until": self._latch_until,
                 "seconds_remaining": remaining, "last_flash_ts": self._last_flash_ts,
@@ -753,7 +976,7 @@ def unavailable_component(cfg):
         "latched_until": None, "seconds_remaining": 0, "last_flash_ts": None,
         "in_ring": False, "nearest_km": None, "nearest_bearing": None,
         "polling_active": False, "last_poll_ts": None, "granules_scanned": 0,
-        "granules_in_window": 0, "partial": False, "coverage": None,
+        "granules_in_window": 0, "partial": False, "coverage": None, "skipped_s": 0,
         "trigger_km": cfg.GLM_TRIGGER_KM, "cooloff_hours": cfg.GLM_COOLOFF_HOURS,
         "source": "GOES-19 GLM total lightning (disabled)",
     }

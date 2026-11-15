@@ -175,9 +175,10 @@ def test_clean_text_joins_a_true_surrogate_pair():
 
 
 def test_clean_text_drops_controls_and_keeps_tab_and_newline():
-    assert clean_text("a\x00b\x07c\x1b[31md\x7fe\x85f\x9fg") == "abc[31mdefg"
+    # (NEL, U+0085, separates words like a blank: it becomes one, see the next test)
+    assert clean_text("a\x00b\x07c\x1b[31md\x7fe\x85f\x9fg") == "abc[31mde fg"
     assert clean_text("col1\tcol2\nline2") == "col1\tcol2\nline2"
-    assert clean_text("\x0b\x0c") == ""
+    assert clean_text("\x0b\x0c") == " "
 
 
 def test_clean_text_turns_a_carriage_return_into_a_newline():

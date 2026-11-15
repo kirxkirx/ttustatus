@@ -517,12 +517,30 @@ def test_unreadable_latch_fails_safe_until_fresh_queries_clear_it(env):
     assert p.component(t + 10)["safe"] is True
 
 
-def test_backward_clock_step_keeps_the_veto_for_the_time_it_had_left(env):
+def system_clock(monkeypatch):
+    """The system's clock frame as the poller reads it (wall minus monotonic): a real
+    step changes it, and the poller moves its vetoes by that change, whatever
+    clock_stepped is told (NwsAlertsPoller._follow_clock). Patch before the poller is
+    made: it takes its baseline then."""
+    system = {"offset": 1000.0}
+    monkeypatch.setattr(na, "_clock_offset", lambda: system["offset"])
+    return system
+
+
+def step(p, system, pre, post):
+    """A wall-clock step from ``pre`` to ``post``, as the system shows it, and the step
+    detector's report of it."""
+    system["offset"] += post - pre
+    p.clock_stepped(pre, post)
+
+
+def test_backward_clock_step_keeps_the_veto_for_the_time_it_had_left(env, monkeypatch):
+    system = system_clock(monkeypatch)
     env.nws.point = [tor(SV_1611)]
     p = env.new()
     p.poll_point(NOW)
     pre, post = NOW + 60, NOW + 60 - 158 * DAY
-    p.clock_stepped(pre, post)
+    step(p, system, pre, post)
     # its NWS onset/end look 158 days away: still IN EFFECT, but not for 158 days
     c = p.component(post + 10)
     assert c["safe"] is False and c["veto_pending"] == []
@@ -531,7 +549,7 @@ def test_backward_clock_step_keeps_the_veto_for_the_time_it_had_left(env):
     calls = env.nws.n("point")
     p.maybe_poll(post + 20)                            # re-poll at once under the new clock
     assert env.nws.n("point") == calls + 1 and env.nws.n("area") == 1
-    p.clock_stepped(post + 30, NOW + 90)               # back to the truth: NWS end rules
+    step(p, system, post + 30, NOW + 90)               # back to the truth: NWS end rules
     assert p.component(NOW + 90)["veto"][0]["end_ts"] == END
 
 

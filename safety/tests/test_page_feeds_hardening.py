@@ -236,7 +236,8 @@ def test_read_safety_state_scrubs_every_text(tmp_path, monkeypatch):
     sf.write_text(json.dumps({"a‎": ["x\ud83d", {"k": "y\x85\r\nz"}], "n": 1.5,
                               "b": True, "c": None}), encoding="utf-8")
     monkeypatch.setattr(msp, "SAFETY_STATE_FILE", str(sf))
-    assert msp.read_safety_state() == {"a": ["x�", {"k": "y\nz"}], "n": 1.5,
+    # (NEL, U+0085, separates words: it becomes a blank, not nothing)
+    assert msp.read_safety_state() == {"a": ["x�", {"k": "y \nz"}], "n": 1.5,
                                        "b": True, "c": None}
 
 
@@ -348,7 +349,8 @@ var page = {getAttribute: function (k) { return k in attrs ? attrs[k] : null; },
 var box = {hidden: true, textContent: '', className: 'pageage'};
 var btn = {textContent: '', setAttribute: function () {}, addEventListener: function () {}};
 var document = {getElementById: function (id) {
-  return id === 'page' ? page : id === 'pageage' ? box : id === 'modebtn' ? btn : null; }};
+  return id === 'page' ? page : id === 'pageage' ? box : id === 'modebtn' ? btn : null; },
+  addEventListener: function (e) { events.push(e); }};
 var events = [];
 var window = {addEventListener: function (e) { events.push(e); }};
 var sessionStorage = {getItem: function () { return null; }, setItem: function () {}};
@@ -378,6 +380,7 @@ def test_page_script_judges_its_age_by_the_viewers_clock(tmp_path, monkeypatch):
     fresh = _js_age(page, t0 + 60)
     assert fresh["hidden"] and not fresh["outdated"]
     assert 30000 in fresh["intervals"] and "pageshow" in fresh["events"]
+    assert "visibilitychange" in fresh["events"]        # a tab shown again: judged at once
     assert _js_age(page, t0 + 900 - 5)["hidden"]
     old = _js_age(page, t0 + 16 * 60 + 10)
     assert not old["hidden"] and old["outdated"] and old["cls"] == "pageage"

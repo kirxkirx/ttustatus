@@ -31,6 +31,12 @@ No lower limit on the spread (fog is not treated as dangerous), no waiting perio
 every line holds, no memory of earlier dew. Missing or stale data for any line is "false":
 every failure hands control back to the rain sensor.
 
+Line 1 leans on device 0's checks being alive, so SafetyMonitor (_dew_blockers) also makes
+the answer false, outside this rule, while a gating layer of device 0 is broken (its code
+raised: device 0 then treats it as unavailable, which never vetoes there) and while the
+WU rain check has stopped (a poll cut short by WU's rate limit with none through since,
+two failed polls in a row, or no poll through for two poll intervals plus 5 min).
+
 Line 6 is the main monitor's lightning check with a wider ring. Device 0 already goes
 UNSAFE for a flash within GLM_TRIGGER_KM (and line 1 then makes this monitor false); with
 the rain sensor ignored there is one protection fewer against a storm's rain, hence the
@@ -39,13 +45,16 @@ every five minutes, and one quiet poll must not hand the roof back to "it is onl
 "Missing data is false" here means three things, all read off the GLM layer's component:
     * the latest GOOD poll is at most DEW_GLM_MAX_AGE_MIN old (one failed poll is
       tolerated), a good poll being one that read at least DEW_GLM_MIN_GRANULES of its
-      look-back window and is not flagged partial (a hole or a lag in what it read) — a
-      granule the GLM layer cannot download is read by a later poll, but "no flash" out
-      of a fraction of the data is not "no lightning";
-    * good polls have been arriving, never further apart than that, for a whole hold:
-      after a daemon start, a clock correction or an outage nobody knows what happened
-      in the minutes not watched, so the answer stays false until a hold has been
-      watched again (nothing is persisted: no file, no SD write);
+      look-back window and is not flagged partial (a hole or a lag in what it read, or
+      new granules its time ran out before) — a granule the GLM layer cannot download is
+      read by a later poll (or given up and reported, below), but "no flash" out of a
+      fraction of the data is not "no lightning";
+    * good polls have been arriving, never further apart than that, for a whole hold,
+      and the GLM layer has left no time between them unread for good (a poll that had
+      to give up part of a catch-up says so): after a daemon start, a clock correction,
+      an outage or such a gap nobody knows what happened in the minutes not watched, so
+      the answer stays false until a hold has been watched again (nothing is persisted:
+      no file, no SD write);
     * evidence of a flash is never thrown away, whatever else is wrong with the poll
       that showed it.
 Every age in line 6 is measured on the MONOTONIC clock: a wall clock that is stepped
@@ -243,7 +252,8 @@ class DewMonitor:
         A GOOD poll is one that can vouch for "no lightning": the layer is on, the poll
         succeeded and is current, it read enough of its look-back window
         (DEW_GLM_MIN_GRANULES, counted in granules_in_window), it is not partial (no hole
-        or lag in what it read), its nearest flash has a readable distance and its time
+        or lag in what it read, no new granule its time ran out before), its nearest
+        flash has a readable distance and its time
         stamp can be used. Anything less is not lightning data: the last good poll then
         simply ages out (DEW_GLM_MAX_AGE_MIN), which is what makes one failed poll
         harmless.
@@ -252,6 +262,16 @@ class DewMonitor:
         showed it (too few granules, a time stamp that cannot be used): evidence of
         lightning is never thrown away.
 
+        A poll that left time behind unread for good (skipped_s: the oldest granules of a
+        full-length catch-up its deadline gave up, the minutes before a window the
+        catch-up limit cut short, a late granule given up before anyone read it) ends the
+        watch, good poll or not: the next good poll starts a new one. Good polls close
+        together in time do not make what was never read between them watched.
+
+        A component marked failed (the GLM layer's code raised; SafetyMonitor stands in an
+        'unavailable' one) is no data either, and the last good poll is forgotten: the
+        minutes the layer was broken were not watched, so the watch starts again.
+
         `now` is the wall clock: the poll's own time stamp is compared with it, once, to
         date the poll. `mono` is the monotonic clock all ages are measured on from then
         on (default: time.monotonic())."""
@@ -259,9 +279,16 @@ class DewMonitor:
         mono = time.monotonic() if mono is None else mono
         cfg = self.cfg
         ts = nearest = flash_km = None
-        good = flash = idle = False
+        good = flash = idle = skipped = broken = False
         if not isinstance(glm, dict) or not glm.get("enabled"):
             why, idle = "the GLM lightning layer is off", True
+        elif glm.get("failed"):
+            # the layer's code raised and SafetyMonitor stood in an "unavailable" component
+            # (failed=True): no data, and not "daytime" either, which that component's
+            # polling_active=False would otherwise make it read as
+            why = "the GLM lightning layer has failed (%s)" % (
+                str(glm.get("error") or "see the daemon log")[:160])
+            broken = True
         elif glm.get("available") is not True:
             if not glm.get("polling_active"):
                 why, idle = ("GLM is not polled now (daytime, or the sun's altitude is "
@@ -274,6 +301,7 @@ class DewMonitor:
             ts = _finite(glm.get("last_poll_ts"))
             raw = glm.get("nearest_km")
             nearest = _finite(raw)
+            skipped = (_finite(glm.get("skipped_s")) or 0.0) > 0
             # the granules read of the look-back window (a poll also reads back to where
             # the previous one stopped; older components have only granules_scanned)
             in_window = glm.get("granules_in_window")
@@ -298,6 +326,18 @@ class DewMonitor:
                     why, good = None, True
         with self._lock:
             self._glm_why, self._glm_idle = why, idle
+            if broken:
+                # Nothing was watched while the layer was broken (the polls it may have
+                # made never reached this monitor), so the last good poll is forgotten,
+                # as after a clock step: once the layer works again a whole hold must be
+                # watched before the answer can be true. A flash already counted counts on.
+                self._glm_poll_mono = self._glm_nearest = self._glm_watch_mono = None
+                return
+            if skipped and not good:
+                # time nobody read lies behind this poll: what was watched before it does
+                # not run on (the next good poll starts a new watch; doing this again at
+                # every evaluation of the same poll changes nothing)
+                self._glm_watch_mono = None
             if not (good or flash):
                 return                          # nothing this component can tell
             # The same poll is passed at every evaluation until the next one: it is
@@ -321,8 +361,9 @@ class DewMonitor:
                 return                          # (dated before the poll already known)
             # The watch — how long good polls have been coming without a gap — must err
             # the other way, so it trusts no time stamp: the gap is measured up to NOW
-            # (it cannot have been longer), and a new record starts NOW.
-            if (self._glm_poll_mono is None
+            # (it cannot have been longer), and a new record starts NOW. A poll that left
+            # time behind unread (skipped), or one after such a poll, starts it too.
+            if (self._glm_poll_mono is None or self._glm_watch_mono is None or skipped
                     or mono - self._glm_poll_mono > cfg.DEW_GLM_MAX_AGE_MIN * 60.0):
                 self._glm_watch_mono = mono     # the first good poll after a gap
             self._glm_poll_mono, self._glm_nearest = made, nearest

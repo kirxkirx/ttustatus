@@ -204,9 +204,10 @@ def _clip(s, n):
     state file small and a hostile feed from injecting control characters).
 
     clean_text first: a lone surrogate becomes U+FFFD (else the state file and the page
-    cannot be written as UTF-8), the C0/C1 controls and the bidirectional controls are
-    dropped (a bidi override can make a shown text read other than it is); then every
-    run of whitespace, line breaks included, becomes one blank."""
+    cannot be written as UTF-8), the control characters that separate words (vertical
+    tab, form feed, U+001C-U+001F, NEL) become blanks, the other C0/C1 controls and the
+    bidirectional controls are dropped (a bidi override can make a shown text read other
+    than it is); then every run of whitespace, line breaks included, becomes one blank."""
     if s is None:
         return ""
     s = " ".join(clean_text(str(s)).split())

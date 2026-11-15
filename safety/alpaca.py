@@ -187,7 +187,8 @@ def create_app(monitor, cfg) -> Flask:
 
 def setup_page(monitor, cfg) -> str:
     """The /setup page, made safe to encode: lone surrogates become U+FFFD, control and
-    bidirectional-control characters are dropped (textclean.clean_text)."""
+    bidirectional-control characters are dropped — a control character that separates
+    words becomes a blank (textclean.clean_text)."""
     return clean_text(_setup_html(monitor, cfg))
 
 
@@ -383,10 +384,7 @@ def _setup_html(monitor, cfg) -> str:
         hz_unknown = False
         if veto:
             # checked first: a held veto is in force whether or not the feed is fresh
-            hv = "; ".join("VETO — %s over the site until %s%s" % (
-                _txt(v.get("event"), 60), _txt(v.get("end_local"), 40) or "?",
-                " (held: not re-confirmed by a fresh query)"
-                if v.get("source") == "latched" else "") for v in veto)
+            hv = "; ".join(_veto_text(v) for v in veto)
         elif not hz.get("enabled"):
             hv, hz_unknown = "disabled", True
         elif not hz.get("available"):
@@ -397,6 +395,14 @@ def _setup_html(monitor, cfg) -> str:
                 counts.get("at_site", 0), counts.get("nearby", 0))
         if hz.get("error") and not veto:
             hv += " — %s" % _txt(hz["error"], 90)
+        # a veto warning issued for a later period (a High Wind Warning "from 10 AM
+        # Friday"): no veto yet, but the status page's tile names it, and so does this row
+        pending = [p for p in hz.get("veto_pending") or [] if isinstance(p, dict)]
+        if pending:
+            hv += " · scheduled: " + "; ".join("%s%s (not a veto yet)" % (
+                _txt(p.get("event"), 60) or "NWS warning",
+                (" from " + _txt(p.get("onset_local"), 40)) if p.get("onset_local") else "")
+                for p in pending)
         rows.append(row("NWS warnings (veto: %s)" % names, hv,
                         bool(hz.get("safe", True)) and not veto, unknown=hz_unknown))
     hazards_html = _hazards_html(hz, comp.get("hazard_info"))
@@ -572,7 +578,8 @@ _MAX_ALERTS = 25
 
 def _txt(x, limit=300) -> str:
     """One line of plain text, bounded (callers html.escape it), scrubbed of what cannot
-    or must not be shown: a lone surrogate, control and bidirectional-control characters."""
+    or must not be shown: a lone surrogate, control and bidirectional-control characters
+    (a control character that separates words becomes a blank, see textclean)."""
     return "" if x is None else " ".join(clean_text(str(x)).split())[:limit]
 
 
@@ -595,6 +602,34 @@ def _swatch(color) -> str:
         return ""
     return ('<span style="display:inline-block;width:.8em;height:.8em;margin-right:.35em;'
             'border:1px solid #888;background:%s"></span>' % color)
+
+
+def _veto_text(v) -> str:
+    """One vetoing warning for the /setup row: 'VETO — <event> over the site until <the
+    warning's own end>'. When the veto is held to an earlier time than that (end_ts: 24 h
+    after NWS last listed it, or the time left kept across a clock step) the row says so —
+    '(held until <then> unless NWS lists it again)' — instead of giving that time as the
+    warning's end; a warning without an end time is 'held until' its 60-min hold. The
+    same rule as the IsSafe reason (monitor.hazard_veto_reason) and the status page."""
+    event = _txt(v.get("event"), 60) or "NWS warning"
+    hold, end = v.get("end_ts"), v.get("alert_end_ts")
+    latched = v.get("source") == "latched"
+    held = "held until %s unless NWS lists it again" % (_txt(v.get("end_local"), 40) or "?")
+    if (_is_num(hold) and _is_num(end) and end > hold + 1.0
+            and _txt(v.get("alert_end_local"), 40)):
+        text = "VETO — %s over the site until %s (%s" % (
+            event, _txt(v.get("alert_end_local"), 40), held)
+    elif "alert_end_ts" in v and end is None:
+        text = "VETO — %s over the site, no end time given (%s" % (event, held)
+    else:
+        return "VETO — %s over the site until %s%s" % (
+            event, _txt(v.get("end_local"), 40) or "?",
+            " (held: not re-confirmed by a fresh query)" if latched else "")
+    return text + ("; not re-confirmed by a fresh query)" if latched else ")")
+
+
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def _veto_names(hz) -> str:

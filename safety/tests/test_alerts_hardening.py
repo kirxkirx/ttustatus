@@ -27,7 +27,7 @@ from safety import nws_alerts as na
 from safety.monitor import HAZARD_UNSEEN_RELEASE_SEC, SafetyMonitor
 from safety.tests.test_nws_alerts import (
     DAY, END, FFA, HWW, NOW, SITE, SV_1611, FakeNWS, Log, Z, _rect, both, derive, latch,
-    make_cfg, tor, write_latch)
+    make_cfg, step, system_clock, tor, write_latch)
 
 BOUND = na.UNSEEN_RELEASE_SEC + na.CAP_RENEW_SEC     # the cap: 24-25 h after a sighting
 
@@ -94,20 +94,28 @@ def test_resightings_keep_a_long_warning_vetoing(aenv):
     assert aenv.log.vetoes()[-1]["result"].startswith("released: ended")
 
 
-def test_restart_bounds_the_restored_veto_by_its_last_sighting(aenv):
+def test_restart_bounds_the_restored_veto_by_its_last_sighting(aenv, caplog):
     t = time.time()
-    # written before UNSEEN_RELEASE_SEC: a 72 h cap from the first sighting
+    # written by this version: the bound is saved with each veto, at most 25 h after the
+    # sighting that renewed it (a restart must not start a fresh 24 h). (A file of the
+    # version before the bound is read differently: see test_upgrade_* below.)
     write_latch(aenv, [{"key": "KLUB.HW.W.0003", "event": "High Wind Warning",
                         "end_ts": t + 3 * DAY, "first_seen_ts": t - 30 * 3600,
-                        "last_seen_ts": t - 26 * 3600, "cap_ts": t + 42 * 3600},
+                        "last_seen_ts": t - 26 * 3600, "cap_ts": t - 26 * 3600 + BOUND},
                        {"key": "KLUB.HW.W.0004", "event": "High Wind Warning",
                         "end_ts": t + 3 * DAY, "first_seen_ts": t - 30 * 3600,
-                        "last_seen_ts": t - 20 * 3600, "cap_ts": t + 42 * 3600}])
-    c = aenv.new().component(t)
+                        "last_seen_ts": t - 20 * 3600, "cap_ts": t - 20 * 3600 + BOUND}])
+    with caplog.at_level("WARNING", logger="ttu.safety.hazards"):
+        c = aenv.new().component(t)
     (v,) = c["veto"]                                    # 0003: not seen for 26 h -> gone
     assert v["key"] == "KLUB.HW.W.0004"
     assert abs(v["end_ts"] - (t - 20 * 3600 + BOUND)) < 1
     assert {it["key"] for it in latch(aenv)} == {"KLUB.HW.W.0004"}
+    # ... and dropping it is said, like every other release: log and HAZARD-VETO event
+    (gone,) = [e for e in aenv.log.vetoes() if e["key"] == "KLUB.HW.W.0003"]
+    assert gone["result"] == ("released at start-up: not sighted for 24 h, could not be "
+                              "confirmed gone")
+    assert "HAZARD VETO released at start-up" in caplog.text and "0003" in caplog.text
 
 
 def test_restart_of_an_old_latch_without_a_last_sighting_holds_at_most_25_h(aenv):
@@ -118,15 +126,16 @@ def test_restart_of_an_old_latch_without_a_last_sighting_holds_at_most_25_h(aenv
     assert t + BOUND - 5 < v["end_ts"] <= t + BOUND + 1
 
 
-def test_a_clock_step_keeps_the_time_left_of_the_unseen_bound(aenv):
+def test_a_clock_step_keeps_the_time_left_of_the_unseen_bound(aenv, monkeypatch):
+    system = system_clock(monkeypatch)
     ends = NOW + 3 * DAY
     aenv.nws.point = [derive(HWW, ends=ends, expires=ends)]
     p = aenv.new()
     p.poll_point(NOW)
     pre, post = NOW + 600, NOW + 600 - 158 * DAY
-    p.clock_stepped(pre, post)                          # backward: not renewed, kept
+    step(p, system, pre, post)                          # backward: not renewed, kept
     assert p.component(post + 10)["veto"][0]["end_ts"] == post + (NOW + BOUND - pre)
-    p.clock_stepped(post + 10, NOW + 610)               # forward again
+    step(p, system, post + 10, NOW + 610)               # forward again
     assert p.component(NOW + 620)["veto"][0]["end_ts"] == NOW + BOUND
     assert p.component(NOW + BOUND + 1)["safe"] is True
 

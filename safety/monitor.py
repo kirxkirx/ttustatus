@@ -1,5 +1,6 @@
-"""Safety aggregation: the rain poller (with the 3-hour latch) and the SafetyMonitor
-that combines sun altitude, humidity, and rain into a single IsSafe boolean.
+"""Safety aggregation: the rain poller (with the persisted rain latch, RAIN_LATCH_HOURS)
+and the SafetyMonitor that combines sun altitude, humidity, and rain into a single IsSafe
+boolean.
 
 Design rules:
   * FAIL SAFE — any missing/stale input, or any unmet condition, means UNSAFE.
@@ -8,10 +9,10 @@ Design rules:
   * Rain trips on the FIRST detection by ANY station (no confirmation), and stays unsafe
     for RAIN_LATCH_HOURS after the last rain seen (the latch is persisted to disk).
   * WU is only polled when the sun is below RAIN_POLL_SUN_BELOW_DEG (saves API calls).
-  * NWS alerts: ONLY the configured HAZARD_VETO_EVENTS in effect OVER THE SITE veto (for
-    the life of the warning); every other alert, and all the non-NWS hazard information
-    (smoke, fires, SPC, storm reports), is display-only and is never read by the IsSafe
-    decision.
+  * NWS alerts: ONLY the configured HAZARD_VETO_EVENTS in effect OVER THE SITE veto (until
+    the warning ends, or 24 h after NWS last listed it, whichever comes first); every
+    other alert, and all the non-NWS hazard information (smoke, fires, SPC, storm
+    reports), is display-only and is never read by the IsSafe decision.
 """
 from __future__ import annotations
 
@@ -69,6 +70,18 @@ RAIN_STALE_POLLS = 3
 RAIN_BLIND_POLLS = 3
 # A gap this long between two WU polls starts a new blind count (the next night).
 RAIN_BLIND_RESET_SEC = 7200
+# Device 1 (the dew monitor) lets the dome IGNORE its rain sensor, so it must not lean on
+# a WU rain check that has stopped. A successful WU poll is one not cut short by HTTP 429
+# (WU's rate limit) with at least one station reporting; every other completed poll has
+# failed. Device 1 reads false from a poll cut short by a 429 until a successful poll;
+# once this many polls in a row have failed (one failed poll is tolerated unless a 429 cut
+# it short, a second is not); and, for a poll loop that has stopped, once the last
+# successful poll began more than this many poll intervals plus DEW_WU_MARGIN_SEC (the
+# rain loop's 30-s tick and a poll's own run time) ago. Device 0 is unaffected: there, no
+# station reporting is "no rain" with a warning (the owner's choice; see
+# _rain_blind_warning).
+DEW_WU_MAX_POLLS = 2
+DEW_WU_MARGIN_SEC = 300
 
 
 def _finite(x):
@@ -149,8 +162,10 @@ def _rain_unavailable(cfg, error=None):
             "available": False, "latched": False, "latched_until": None,
             "seconds_remaining": 0, "last_rain_ts": None, "polling_active": False,
             "last_poll_ts": None, "last_poll_age_s": None, "stale": True, "note": None,
+            "last_good_poll_ts": None, "last_good_poll_age_s": None,
+            "last_throttle_ts": None, "failed_polls": 0,
             "stations_live": 0, "stations_total": 0, "stations_error": 0,
-            "throttle": None, "hold_until": None, "blind_polls": 0, "blind_since": None,
+            "throttle": None, "blind_polls": 0, "blind_since": None,
             "raining": [], "results": [], "error": error}
 
 
@@ -184,36 +199,66 @@ def _hazard_info_unavailable(cfg, error=None, enabled=False):
     return comp
 
 
-def _until_text(v, cfg, now):
-    """' until 18:45 CDT' (weekday added when the end is not today, local time)."""
-    end_ts = _finite(v.get("end_ts"))
-    if end_ts is not None:
+def _local_when(ts, text, cfg, now):
+    """'18:45 CDT' (weekday added when not today, local time) for an epoch ``ts``; the
+    poller's own ``text`` for it when the epoch is absent or absurd; None without either."""
+    ts = _finite(ts)
+    if ts is not None:
         try:
-            end = nws_forecast._local(datetime.fromtimestamp(end_ts, timezone.utc),
-                                      cfg.LOCAL_TZ)
+            when = nws_forecast._local(datetime.fromtimestamp(ts, timezone.utc), cfg.LOCAL_TZ)
             today = nws_forecast._local(datetime.fromtimestamp(now, timezone.utc),
                                         cfg.LOCAL_TZ).date()
-            return " until " + end.strftime("%H:%M %Z" if end.date() == today
-                                            else "%a %H:%M %Z")
+            return when.strftime("%H:%M %Z" if when.date() == today else "%a %H:%M %Z")
         except (OverflowError, OSError, ValueError):
             pass                    # absurd timestamp: fall back to the poller's text
-    if v.get("end_local"):
-        return " until %s" % " ".join(str(v["end_local"]).split())
-    return " (no end time given)"
+    if text:
+        return " ".join(str(text).split())
+    return None
+
+
+def _until_text(v, cfg, now):
+    """' until 18:45 CDT' (weekday added when the end is not today, local time)."""
+    when = _local_when(v.get("end_ts"), v.get("end_local"), cfg, now)
+    return " until %s" % when if when else " (no end time given)"
 
 
 def hazard_veto_reason(v, cfg, now) -> str:
     """One IsSafe reason per vetoing warning, e.g.
-    'NWS Tornado Warning in effect for the site until 18:45 CDT (NWS Lubbock TX)'."""
+    'NWS Tornado Warning in effect for the site until 18:45 CDT (NWS Lubbock TX)'.
+
+    "until" is the WARNING's own end (the poller's alert_end_ts). A veto can be held to an
+    earlier time, its end_ts: 24 h after NWS last listed the warning
+    (nws_alerts.UNSEEN_RELEASE_SEC), or the time it had left kept across a clock step. Then
+    both are given — 'until Wed 08:12 CDT; held until Tue 17:12 CDT unless NWS lists it
+    again' — never the hold alone: for every warning with more than a day to run, that
+    read as the warning's end even while NWS listed it every minute. A warning without an
+    end time is held 60 min after its last listing, and says so instead of an end. An
+    entry without alert_end_ts (an older poller) reads as before: until its end_ts."""
     if not isinstance(v, dict):
         return "NWS warning in effect for the site (unreadable veto entry — failing safe)"
     event = " ".join(str(v.get("event") or "").split()) or "warning"
-    text = "NWS %s in effect for the site%s" % (event, _until_text(v, cfg, now))
     notes = []
     if v.get("sender"):
         notes.append(" ".join(str(v["sender"]).split()))
-    if v.get("source") == "latched":
-        notes.append("held to its end time — not re-confirmed by a fresh NWS query")
+    latched = v.get("source") == "latched"
+    hold, alert_end = _finite(v.get("end_ts")), _finite(v.get("alert_end_ts"))
+    held = _local_when(hold, v.get("end_local"), cfg, now)
+    end = (_local_when(alert_end, v.get("alert_end_local"), cfg, now)
+           if alert_end is not None and hold is not None and alert_end > hold + 1.0 else None)
+    if end and held:
+        text = ("NWS %s in effect for the site until %s; held until %s unless NWS lists "
+                "it again" % (event, end, held))
+    elif "alert_end_ts" in v and v["alert_end_ts"] is None and held:
+        text = ("NWS %s in effect for the site with no end time given; held until %s "
+                "unless NWS lists it again" % (event, held))
+    else:
+        text = "NWS %s in effect for the site%s" % (event, _until_text(v, cfg, now))
+        if latched:
+            # here the hold IS the warning's own end (or the poller gave no other)
+            notes.append("held to its end time — not re-confirmed by a fresh NWS query")
+            latched = False
+    if latched:
+        notes.append("not re-confirmed by a fresh NWS query")
     if notes:
         text += " (%s)" % "; ".join(notes)
     return text
@@ -269,7 +314,8 @@ def alpaca_address(cfg, now=None):
 
 
 class RainPoller:
-    """Polls Weather Underground and owns the persistent 3-hour rain latch."""
+    """Polls Weather Underground and owns the persistent rain latch (RAIN_LATCH_HOURS,
+    1 h by default)."""
 
     def __init__(self, cfg, eventlog):
         self.cfg = cfg
@@ -285,8 +331,15 @@ class RainPoller:
         self._last_poll_ts = None
         self._last_result: dict | None = None
         self._latch_dirty = False       # a latch we failed to persist; retry later
-        # WU asked us to wait (HTTP 429/503 with Retry-After): no poll before this epoch
-        self._hold_until = None
+        # When the last SUCCESSFUL poll started: not cut short by WU's rate limit (HTTP
+        # 429), at least one station reporting. Device 1 needs a recent one (see
+        # DEW_WU_MAX_POLLS); device 0 does not read it.
+        self._last_good_poll_ts = None
+        # Also for device 1 only: when a poll was last cut short by a 429 (cleared by the
+        # next successful poll, so device 1 waits for one rather than for any poll that
+        # is not cut short), and how many polls have failed since the last successful one.
+        self._last_throttle_ts = None
+        self._failed_polls = 0
         # consecutive polls with no station reporting, and when that run began
         self._blind_polls = 0
         self._blind_since = None
@@ -413,17 +466,38 @@ class RainPoller:
                       if self._backoff_until.get(s, 0) <= mono]
             skipped = [(s, d) for s, d in stations
                        if self._backoff_until.get(s, 0) > mono]
-        result = wu_poll.poll_stations(active)
-        self._update_backoff(result, mono)
-        for sid, _d in skipped:             # keep live/total honest on the page
-            result["results"].append({"station": sid, "state": "backed-off"})
-        result["total"] += len(skipped)
+        try:
+            result = wu_poll.poll_stations(active)
+            self._update_backoff(result, mono)
+            for sid, _d in skipped:         # keep live/total honest on the page
+                result["results"].append({"station": sid, "state": "backed-off"})
+            result["total"] += len(skipped)
+        except Exception:
+            # A poll that raises (a bug: poll_stations catches each station's own errors)
+            # is a failed poll for device 1 too, not one that never happened: the rain
+            # loop tries again every 30 s, and device 1 leaned on the last good poll
+            # until the age rule caught up (see DEW_WU_MAX_POLLS). Device 0 is unchanged.
+            with self._lock:
+                self._failed_polls += 1
+            raise
         throttle = result.get("throttle")
         with self._lock:
-            # HTTP 429/503: honour Retry-After (wu_poll bounds it to an hour) before the
-            # next poll; without one the next poll comes at the normal interval
-            wait = _finite((throttle or {}).get("retry_after_s"))
-            self._hold_until = now + wait if wait and wait > 0 else None
+            # HTTP 429 (WU's rate limit) ended this poll early. Its Retry-After is NOT
+            # waited for: the next poll comes at the normal interval, as after any other
+            # poll. A hold capped at one interval would change nothing, and an uncapped
+            # one paused all WU rain detection for up to an hour. Until a poll gets
+            # through whole (not cut short, a station reporting), device 1 reads false
+            # (SafetyMonitor._dew_blockers).
+            if result.get("live", 0) > 0 and not throttle:
+                self._last_good_poll_ts = now
+                self._last_throttle_ts = None
+                self._failed_polls = 0
+            else:
+                # (a poll that is not cut short but that no station answers does not end
+                # the 429 pause: it brought no reading either)
+                if throttle:
+                    self._last_throttle_ts = now
+                self._failed_polls += 1
             # blind count: consecutive polls in which no station reported
             prev = self._last_poll_ts
             if result.get("live", 0) > 0:
@@ -506,12 +580,6 @@ class RainPoller:
             # due, or polling would stall for the entire size of the step
             elapsed = None if self._last_poll_ts is None else now - self._last_poll_ts
             due = elapsed is None or elapsed < 0 or elapsed >= self.cfg.WU_POLL_INTERVAL
-            hold = self._hold_until
-            if hold is not None and (now >= hold
-                                     or hold - now > wu_poll.RETRY_AFTER_MAX_S + 60):
-                self._hold_until = hold = None      # over, or a clock step: forget it
-            if hold is not None:
-                due = False                         # WU's Retry-After is still running
         if not due:
             return None
         return self.poll_now(now)
@@ -530,7 +598,11 @@ class RainPoller:
                 log.warning("rain latch re-armed across a clock step (it would have "
                             "silently evaporated)")
             self._last_poll_ts = None
-            self._hold_until = None
+            # its age under the new clock means nothing: device 1 waits for the re-poll
+            # this step forces (the dew monitor drops the stations' readings too)
+            self._last_good_poll_ts = None
+            self._last_throttle_ts = None
+            self._failed_polls = 0
             self._inactive_ts = None
 
     def component(self, sun_alt, now=None) -> dict:
@@ -557,9 +629,9 @@ class RainPoller:
             polling_active = (enabled and sun_alt is not None
                               and sun_alt < self.cfg.RAIN_POLL_SUN_BELOW_DEG)
             # STALE: polling should be running but the last completed poll is old (a hung
-            # or crashing poll loop, a long Retry-After). Its "N/M live, no rain" is no
-            # longer a reading: report no live station, so the page and the Alpaca text
-            # say "no data" instead of "no rain". No veto change. Timed from the last poll,
+            # or crashing poll loop). Its "N/M live, no rain" is no longer a reading:
+            # report no live station, so the page and the Alpaca text say "no data"
+            # instead of "no rain". No veto change. Timed from the last poll,
             # or from when polling was last seen off if that is later: at dusk the last
             # poll is the morning's, and a day of sun-up silence is no stuck poll loop
             # (the first poll of the night follows within the rain loop's 30 s tick).
@@ -574,6 +646,8 @@ class RainPoller:
                          and quiet > RAIN_STALE_POLLS * self.cfg.WU_POLL_INTERVAL)
             # (a blind run of polls made before polling was last off is not tonight's)
             blind_polls = self._blind_polls if polling_active and not since_off else 0
+            good_age = (None if self._last_good_poll_ts is None
+                        else now - self._last_good_poll_ts)
             return {
                 "safe": not latched,
                 "enabled": enabled,
@@ -590,11 +664,21 @@ class RainPoller:
                 "note": (None if not stale else
                          "stale, no WU poll completed for %d min" % round(quiet / 60)
                          if since_off else "stale, last poll %d min ago" % round(quiet / 60)),
+                # the last successful poll (not cut short by HTTP 429, a station
+                # reporting): device 1's "is the WU rain check running" (see
+                # DEW_WU_MAX_POLLS); never part of device 0's verdict
+                "last_good_poll_ts": self._last_good_poll_ts,
+                "last_good_poll_age_s": None if good_age is None else round(good_age),
+                # device 1 too: when a 429 last cut a poll short, if no successful poll
+                # has come since (else None), and the polls failed since the last one
+                "last_throttle_ts": self._last_throttle_ts,
+                "failed_polls": self._failed_polls,
                 "stations_live": 0 if stale else res.get("live", 0),
                 "stations_total": res.get("total", len(self._stations)),
                 "stations_error": res.get("errors", 0),
+                # {"status": 429, "retry_after_s": ...} when WU's rate limit cut the last
+                # poll short (the stations after it are "not-asked"), else None
                 "throttle": res.get("throttle"),
-                "hold_until": self._hold_until,
                 # consecutive polls with no station reporting (see SafetyMonitor's
                 # "rain check blind" warning), and when the run began
                 "blind_polls": blind_polls,
@@ -894,9 +978,16 @@ class SafetyMonitor:
                        and not stale)
 
         # Device 1, the dew monitor. It comes AFTER the decision above and is no part of
-        # it: it reads is_safe, never the other way round (tests pin this).
+        # it: it reads is_safe, never the other way round (tests pin this). It also gets
+        # the gating layers that are broken (failed=True, see _guarded): device 0 treats
+        # such a layer as unavailable, but device 1 must not let the dome ignore its rain
+        # sensor on the word of a check that is not running.
         outlook = self._forecast_outlook(now)
-        dew = self._dew_component(is_safe, rain, outlook, glm, now)
+        broken = [label for label, comp in (
+            ("rain (WU)", rain), ("forecast", nws), ("lightning (GLM)", glm),
+            ("radar", radar), ("connectivity", conn), ("NWS alerts", hazards))
+            if comp.get("failed")]
+        dew = self._dew_component(is_safe, rain, outlook, glm, now, broken)
 
         state = {
             "ts": now,
@@ -972,7 +1063,8 @@ class SafetyMonitor:
         breaks from its first call after a restart), persisted() gives the latch end the
         layer restored from its own latch file, held the same way. A bug in the code that
         REPORTS rain must never be what reopens the dome. Either way a warning names the
-        broken layer."""
+        broken layer, and the component is marked failed=True: device 1 reads false while
+        any gating layer is broken (_dew_blockers)."""
         try:
             comp = call()
             if not isinstance(comp, dict) or not isinstance(comp.get("safe"), bool):
@@ -986,7 +1078,9 @@ class SafetyMonitor:
             self._log_component_error(name, e)
             err = "%s layer error: %s: %s" % (name, type(e).__name__, str(e)[:200])
             comp = fallback(err)
-            comp.update(safe=True, available=False, error=err)
+            # failed: the layer's code broke, as opposed to a feed that is merely down —
+            # device 0 treats both as unavailable (the owner's choice), device 1 does not
+            comp.update(safe=True, available=False, error=err, failed=True)
             with self._lock:
                 until = self._held_latch.get(name) if hold_sec is not None else None
             if until is None and hold_sec is not None and persisted is not None:
@@ -1031,7 +1125,8 @@ class SafetyMonitor:
             broken = max(0.0, mono - ok_mono)
             unsafe = last_safe is False or broken > self.cfg.CONN_OFFLINE_UNSAFE_SEC
             comp = dict(conn_mod.unavailable_component(self.cfg))
-            comp.update(safe=not unsafe, enabled=True, available=False,
+            # (failed: device 1 reads false while the watchdog is broken, _dew_blockers)
+            comp.update(safe=not unsafe, enabled=True, available=False, failed=True,
                         error="connectivity layer error: %s: %s"
                               % (type(e).__name__, str(e)[:200]),
                         offline_sec=round(broken), offline_min=round(broken / 60))
@@ -1113,11 +1208,14 @@ class SafetyMonitor:
             return {"available": False, "why": "forecast outlook error: %s" % str(e)[:120],
                     "age_s": None, "this_hour": None, "next_hour": None}
 
-    def _dew_component(self, is_safe, rain, outlook, glm, now) -> dict:
+    def _dew_component(self, is_safe, rain, outlook, glm, now, broken=()) -> dict:
         """The device 1 block of the state. Whatever goes wrong in there, the answer is
         'not safe' = the rain sensor is trusted — and IsSafe (device 0) is unaffected.
         `rain` and `glm` are the components of this same evaluation: the dew monitor
-        reads the stations' observations and the nearest lightning out of them."""
+        reads the stations' observations and the nearest lightning out of them. `broken`
+        names the gating layers of device 0 that failed in this evaluation. While any of
+        them is broken, or the WU rain check is not running (_dew_blockers), the answer is
+        false whatever the dew rule says; 'blocked' lists why (the reasons start with it)."""
         cfg = self.cfg
         if self.dew is None:
             comp = dew_mod.unavailable_component(cfg)
@@ -1134,6 +1232,18 @@ class SafetyMonitor:
                 comp = dew_mod.unavailable_component(
                     cfg, "dew monitor error: %s" % str(e)[:200])
                 comp["enabled"] = True
+        blocked = []
+        if self.dew is not None:
+            try:
+                blocked = self._dew_blockers(rain, broken, now)
+            except Exception as e:      # (it must never cost the evaluation; false then)
+                self._log_component_error("dew blockers", e)
+                blocked = ["dew monitor error: %s" % str(e)[:200]]
+        comp["blocked"] = blocked
+        if blocked:
+            old = comp.get("reasons")
+            old = [r for r in old if r not in blocked] if isinstance(old, (list, tuple)) else []
+            comp.update(is_safe=False, reasons=blocked + old)
         with self._lock:
             read = self._dew_last_read
         comp["connected"] = self.is_connected(cfg.DEW_DEVICE_NUMBER)
@@ -1144,6 +1254,70 @@ class SafetyMonitor:
             "device_number": cfg.DEW_DEVICE_NUMBER, "name": cfg.DEW_SERVER_NAME,
             "issafe_path": f"/api/v1/safetymonitor/{cfg.DEW_DEVICE_NUMBER}/issafe"}
         return comp
+
+    def _dew_blockers(self, rain, broken, now) -> list:
+        """Why device 1 must read false whatever the dew rule says: a check it leans on is
+        not running. Device 1 lets the dome IGNORE its rain sensor, so it must not do so
+        on the word of
+          * a gating layer of device 0 that is broken (`broken`: its code raised, so
+            device 0 treats it as unavailable, which never vetoes there) — a bug in the
+            radar code must not be what lets a dome ignore its rain sensor;
+          * a WU rain check that has stopped (see DEW_WU_MAX_POLLS): a poll cut short by
+            HTTP 429 (WU's rate limit) with no successful poll since, DEW_WU_MAX_POLLS
+            failed polls in a row, or no successful poll for DEW_WU_MAX_POLLS poll
+            intervals plus DEW_WU_MARGIN_SEC (a poll loop that has stopped).
+        Device 0 reads none of this. Returns the reasons, [] when there are none."""
+        out = ["the %s check of device 0 is broken (a software error; see the daemon "
+               "log) — not relied on until it works again" % name for name in broken]
+        if "rain (WU)" in broken:
+            return out                  # (the rain layer's own figures are not current)
+        if not rain.get("enabled"):
+            out.append("WU rain check off: no WU key (TTU_SAFETY_WU_KEY)")
+            return out
+        if not rain.get("polling_active"):
+            out.append("WU rain check not running: WU is not polled now (daytime, or the "
+                       "sun's altitude is unknown)")
+            return out
+        limit = DEW_WU_MAX_POLLS * float(self.cfg.WU_POLL_INTERVAL) + DEW_WU_MARGIN_SEC
+        good = _finite(rain.get("last_good_poll_ts"))
+        age = None if good is None else now - good
+        throttle = rain.get("throttle")
+        thr_ts = _finite(rain.get("last_throttle_ts"))
+        # a count that cannot be read is no proof that the polls got through
+        failed = rain.get("failed_polls")
+        if isinstance(failed, bool) or not isinstance(failed, int):
+            failed = DEW_WU_MAX_POLLS
+        # (one reason is enough: an old last complete poll says the most, so it comes
+        # first, then failed polls in a row, then the rate limit that cut a poll short)
+        if age is None:
+            out.append("WU rain check not current: no complete WU poll with a station "
+                       "reporting yet")
+        elif age < -60.0:
+            # dated ahead of the clock: the clock stepped back (clock_stepped forgets it)
+            out.append("WU rain check not current: the last complete WU poll is dated in "
+                       "the future (a clock step?)")
+        elif age > limit:
+            out.append("WU rain check not current: no complete WU poll with a station "
+                       "reporting for %d min (needed within %d min)"
+                       % (age // 60, limit // 60))
+        elif failed >= DEW_WU_MAX_POLLS:
+            out.append("WU rain check not current: the last %d WU polls failed (cut short "
+                       "by WU's rate limit, or no station reporting) — until a poll gets "
+                       "through" % failed)
+        elif throttle or (thr_ts is not None and thr_ts >= good):
+            # The last 429 came after the last successful poll: still paused, even when a
+            # later poll was not cut short but got no reading either.
+            if isinstance(throttle, dict):
+                skipped = sum(1 for r in rain.get("results") or ()
+                              if isinstance(r, dict) and r.get("state") == "not-asked")
+                out.append("WU rain check paused: WU's rate limit (HTTP %s) cut the last "
+                           "poll short%s — until a poll gets through"
+                           % (throttle.get("status") or 429,
+                              " (%d station(s) not asked)" % skipped if skipped else ""))
+            else:
+                out.append("WU rain check paused: WU's rate limit (HTTP 429) cut a poll "
+                           "short, and none has got through since")
+        return out
 
     def _log_dew_transition(self, dew) -> None:
         """A line in the daemon log when the device 1 verdict changes. Deliberately NOT
@@ -1185,15 +1359,17 @@ class SafetyMonitor:
     # -- hazard layers ---------------------------------------------------------
     def _hazards_component(self, now) -> dict:
         """The NWS-alerts component, validated. A malformed result or an exception is
-        'unavailable' — but never a RELEASE: the vetoes last reported stay in force until
-        their own end time (see _held_vetoes)."""
+        'unavailable' — but no early release: the vetoes last reported stay in force until
+        the time each was held to, and at most HAZARD_UNSEEN_RELEASE_SEC after the layer's
+        last report (see _held_vetoes). A layer that broke, or that is enabled but
+        failed to start, is marked failed=True: device 1 reads false (_dew_blockers)."""
         if self.hazards is None:
             if self.hazards_error:
                 # enabled, but it could not be created: say so (and that nothing can veto)
-                return _hazards_unavailable(
+                return dict(_hazards_unavailable(
                     self.cfg, enabled=True,
                     error="NWS alerts layer failed to start (%s) — no warning veto; see "
-                          "the log" % str(self.hazards_error)[:160])
+                          "the log" % str(self.hazards_error)[:160]), failed=True)
             return _hazards_unavailable(self.cfg, error=_import_note(NWS_ALERTS_IMPORT_ERROR))
         try:
             comp = self.hazards.component(now)
@@ -1206,6 +1382,7 @@ class SafetyMonitor:
             self._log_component_error("hazards", e)
             comp = _hazards_unavailable(self.cfg, enabled=True,
                                         error="hazard layer error: %s" % str(e)[:200])
+            comp["failed"] = True
             held = self._held_vetoes(now)
             if held:
                 comp["veto"], comp["safe"] = held, False

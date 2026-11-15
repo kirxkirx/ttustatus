@@ -321,6 +321,6 @@ def test_setup_with_a_lone_surrogate_is_served_not_500(env, write_inputs, monkey
 def test_txt_scrubs_surrogates_controls_and_bidi():
     pytest.importorskip("flask")
     from safety.alpaca import _txt
-    assert _txt("a\ud83db\x07c‮d\r\ne\x85f") == "a�bcd ef"
+    assert _txt("a\ud83db\x07c‮d\r\ne\x85f") == "a�bcd e f"   # NEL: a blank
     assert _txt("😀 ok") == "\U0001F600 ok"     # a real pair is one character
     _txt(LONE).encode("utf-8")                            # never raises

@@ -16,9 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the development host, 3.11 Raspberry Pi OS Bookworm (the Pi's system
-        # python3), 3.13 Raspberry Pi OS Trixie, 3.14 the current release: they catch what
-        # changed between versions (fromisoformat did by 3.11) and deprecations early.
+        # 3.9 is the development host, 3.11 Raspberry Pi OS bookworm (the previous
+        # release), 3.13 Raspberry Pi OS trixie (the observatory Pi's system python3; see
+        # raspios.yml), 3.14 the current release: they catch what changed between versions
+        # (fromisoformat did by 3.11) and deprecations early.
         python-version: ["3.9", "3.11", "3.13", "3.14"]
     steps:
       # Node 24 releases (checkout v4 and setup-python v5 run on the retired Node 20), pinned
@@ -32,12 +33,24 @@ jobs:
 
       # The daemon's core deps, plus Pillow: the radar layer's only dependency (apt
       # python3-pil on the Pi), so its frame decoding (IEM's PNG, the AWS bucket's GRIB2)
-      # and map rendering are tested here, not skipped. Heavy/optional libs — Pi hardware
-      # (board, adafruit_dht, gps, astropy, numpy) and the lightning stack (netCDF4 for GLM,
-      # websocket for Blitzortung) — are intentionally NOT installed; the tests mock/guard
+      # and map rendering are tested here, not skipped. The Pi hardware libraries (board,
+      # adafruit_dht, gps, astropy) are intentionally NOT installed; the tests mock/guard
       # them, so this step is the real CI environment the suite must pass in.
       - name: Install dependencies
         run: pip install flask waitress pytest flake8 pillow
+
+      # The GLM lightning layer's numpy and netCDF4, on the Pi's Python (3.13) only, so
+      # the netCDF read and the flash arithmetic (test_glm_window.py,
+      # test_radar_glm_review_fixes.py) run here too: they skip without them. These are
+      # the newest pip versions; raspios.yml tests the Pi's own apt versions. The other
+      # legs run without them, like a Pi without python3-numpy / python3-netcdf4 (GLM
+      # off). The check after the install fails the job if the GLM layer cannot import
+      # them: the tests would otherwise just skip.
+      - name: Install the GLM layer's numpy and netCDF4 (3.13 only)
+        if: matrix.python-version == '3.13'
+        run: |
+          pip install numpy netCDF4
+          python -c "from safety import glm_lightning as g; assert g.deps_available()"
 
       - name: Lint (flake8)
         run: flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety make_status_page.py

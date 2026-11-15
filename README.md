@@ -13,7 +13,8 @@ Software running on the observatory Raspberry Pi. Two cooperating pieces:
    that aggregates **sun altitude**, **humidity**, **Weather Underground rain**, the
    **NWS forecast**, **GOES GLM lightning**, **MRMS radar** (from NOAA's AWS bucket or the
    Iowa Environmental Mesonet, whichever has the newer frame), **NWS warnings** (a Tornado,
-   Dust Storm or High Wind Warning over the site, for the warning's duration), an
+   Dust Storm or High Wind Warning over the site, until the warning ends or until 24 h
+   after NWS last listed it, whichever comes first), an
    **internet-loss watchdog** and a **clock check** (unsafe until chrony is synchronised
    to the GPS or an NTP server) into a single `IsSafe` boolean, served as an ASCOM **Alpaca
    SafetyMonitor** (device 0) so NINA can react (park/close on unsafe). The status page
@@ -34,7 +35,7 @@ port (11111). They answer different questions, and only device 0 is a safety ver
 | | Device 0: `TTU Safety Monitor` | Device 1: `TTU Dew Monitor` |
 |---|---|---|
 | What it is | the normal safety monitor | a special-purpose monitor |
-| `IsSafe` is `true` | while it is safe to observe: the sun is down, the Pi's own readings are current and none of the checks (humidity, rain, forecast, lightning, radar, NWS warnings, internet link) reports a hazard | only while dew is expected to form: device 0 is SAFE **and** the night is clear, calm and humid, with no rain in the forecast and no lightning within 60 km |
+| `IsSafe` is `true` | while it is safe to observe: the sun is down, the Pi's own readings are current and none of the checks (humidity, rain, forecast, lightning, radar, NWS warnings, internet link) reports a hazard | only while dew is expected to form: device 0 is SAFE **and** the night is clear, calm and humid, with no rain in the forecast and no lightning within 60 km, and every check it relies on is running (a stopped WU rain check or a broken layer of device 0 reads `false`) |
 | Who uses it | **NINA and any other observatory or dome control software** | **only this observatory's own custom dome-control code** (the status page calls it "the dome driver") |
 | What for | parking the telescope and closing the roof when conditions turn unsafe | temporarily disabling the dome's rain sensor, which is susceptible to dew |
 
@@ -114,8 +115,9 @@ degrades cleanly to JPEG-only stacking. The remaining regular SD writes are the 
 itself, the final snapshot, and the radar thumbnails (two ~80 KB PNGs per 5 min, plus a
 redraw when the hazard overlays change; like the page, they go to `/dev/shm` behind a
 symlink by default — see README_SAFETY.md). The NWS-warning latch
-(`~/safety_hazard_latch.json`) is written only when a vetoing warning starts, changes or
-ends; NWS zone outlines are cached once per zone in `~/.cache/ttu-hazards/`; the hazard
+(`~/safety_hazard_latch.json`) is written when a vetoing warning starts, changes or ends,
+and while NWS keeps listing one at most hourly (its 24 h release bound is renewed) — every
+10 min for a warning without an end time (its last sighting); NWS zone outlines are cached once per zone in `~/.cache/ttu-hazards/`; the hazard
 information feeds keep everything in RAM. The weather log collects its rows in
 `/dev/shm` and appends them to monthly CSV files in `/var/www/html/weather_log/` once a
 day, in daytime, and when the daemon is stopped (README_SAFETY.md, "Weather log").
@@ -226,10 +228,12 @@ venv/bin/flake8 --max-line-length=100 --extend-ignore=E203,E501,W503,E402 safety
 ```
 
 CI (GitHub Actions) runs the same on every push, on Python 3.9 (the development host), 3.11
-(Raspberry Pi OS Bookworm), 3.13 (Trixie) and 3.14 (the current release), and checks the
-syntax of the shell scripts with `bash -n`. `make_status_page.py` is smoke-tested with
-its Raspberry Pi hardware libraries (`board`, `adafruit_dht`, `gps`, `astropy`) mocked, so it
-lints and its page-rendering functions run without a Pi.
+(Raspberry Pi OS bookworm), 3.13 (trixie, which the observatory Pi runs; this leg also
+installs numpy and netCDF4, so the GLM lightning tests that need them run) and 3.14 (the
+current release), and checks the syntax of the shell scripts with `bash -n`.
+`make_status_page.py` is smoke-tested with its Raspberry Pi hardware libraries (`board`,
+`adafruit_dht`, `gps`, `astropy`) mocked, so it lints and its page-rendering functions run
+without a Pi.
 
 ## License
 

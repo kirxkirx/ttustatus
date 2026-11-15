@@ -113,8 +113,13 @@ REFRESH_SECONDS_ENV_VAR = "STATUS_PAGE_INTERVAL"
 PAGE_STALE_MIN_SEC = 15 * 60
 PAGE_STALE_CAMERA_SEC = 30 * 60
 PAGE_STALE_ENV_VAR = "TTU_STATUS_PAGE_STALE_MIN"
-# A viewer's clock this far BEHIND the generation time cannot tell the page's age (the Pi
-# itself boots with fake-hwclock); the script then says so instead of judging.
+# A viewer's clock this far BEHIND the generation time cannot tell the page's age (this
+# device's clock is slow, or the Pi's runs ahead); the script then says so instead of
+# judging (the -300 in PAGE_JS). The Pi's own clock can be wrong the other way: after a
+# power cut it boots with fake-hwclock's stale time, BEHIND, and a fresh page looks old.
+# While the daemon reports that clock not confirmed by chrony (data-clock="unconfirmed",
+# see page_clock_state), the script neither calls the page stale nor blames the viewer's
+# clock: it says that the page's age cannot be judged.
 PAGE_CLOCK_BEHIND_SEC = 300
 
 # The footer links to the source code (a fork points this at its own copy; the /setup
@@ -1934,11 +1939,25 @@ PAGE_JS = """  var page = document.getElementById('page');
   // the texts go in as textContent (no page data is ever part of this script).
   var generated = parseInt(page.getAttribute('data-generated'), 10);
   var staleAfter = parseInt(page.getAttribute('data-stale-after'), 10);
+  // The daemon's clock check when the page was generated (data-clock). data-generated is
+  // read off that same Pi clock: while chrony has not confirmed it (after a boot with a
+  // stale clock, say) an odd age tells nothing about the page, so it is not called stale.
+  var clockUnconfirmed = page.getAttribute('data-clock') === 'unconfirmed';
   var agebox = document.getElementById('pageage');
   function checkAge() {
     if (!agebox || !(generated > 0) || !(staleAfter > 0)) { return; }
     var age = Date.now() / 1000 - generated;
-    if (age > staleAfter) {
+    if (clockUnconfirmed && (age > staleAfter || age < -300)) {
+      var off = Math.floor(Math.abs(age) / 60);
+      off = off > 120 ? Math.floor(off / 60) + ' h' : off + ' min';
+      agebox.textContent = 'The clock of the Pi was not confirmed by chrony when this ' +
+        'page was generated, so how old the page is cannot be judged (by the clock of ' +
+        'this device it was generated ' + off + (age < 0 ? ' in the future' : ' ago') +
+        '). The safety monitor reads UNSAFE until chrony confirms the clock.';
+      agebox.className = 'pageage note';
+      agebox.hidden = false;
+      page.classList.remove('outdated');
+    } else if (age > staleAfter) {
       var min = Math.floor(age / 60);
       agebox.textContent = 'This page was generated ' +
         (min > 120 ? Math.floor(min / 60) + ' h' : min + ' min') +
@@ -1961,8 +1980,12 @@ PAGE_JS = """  var page = document.getElementById('page');
   }
   checkAge();
   setInterval(checkAge, 30000);
-  // a tab restored from the back/forward cache or woken from sleep: judge at once
+  // a tab restored from the back/forward cache or woken from sleep, or shown again after
+  // being hidden (browsers slow down the timers of hidden tabs): judge at once
   window.addEventListener('pageshow', checkAge);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { checkAge(); }
+  });
 
   var btn = document.getElementById('modebtn');
   function setMode(night) {
@@ -2727,7 +2750,8 @@ def _scrub_state(v):
     forecast and hazard texts in it come from upstream feeds, and JSON's "\\ud800" escape
     reads back as a lone surrogate, which no UTF-8 page can hold (the page write failed on
     every run until the alert expired). Control and bidirectional characters are dropped
-    there too, so a shown text reads as it is. Numbers, booleans and None pass unchanged."""
+    there too (a control character that separates words becomes a blank), so a shown text
+    reads as it is. Numbers, booleans and None pass unchanged."""
     if isinstance(v, str):
         return clean_text(v)
     if isinstance(v, dict):
@@ -3305,6 +3329,9 @@ _HZ_VETO_SOURCE = {
     "latched": ("held until the warning ends (not re-confirmed by the latest NWS data "
                 "— released early only when fresh data shows it is over)"),
 }
+# ... for a latched veto that is held to an earlier time than the warning's end (_hz_held)
+_HZ_VETO_LATCHED_HELD = ("not re-confirmed by the latest NWS data (released early only "
+                         "when fresh data shows it is over)")
 
 
 def _hz_dicts(v):
@@ -3412,12 +3439,24 @@ def _hz_local(ts):
         return None
 
 
+def _hz_no_end(v):
+    """A veto entry of a warning that gave no end time (held 60 min after its last
+    listing); an entry from an older daemon, without alert_end_ts, is not one."""
+    return "alert_end_ts" in v and v.get("alert_end_ts") is None
+
+
 def _hz_until(d):
-    """Local end time of an alert / veto entry: the daemon's end_local, else ends, else
-    expires (ISO), else end_ts (epoch). None when none is usable."""
-    s = d.get("end_local")
-    if isinstance(s, str) and s.strip():
-        return s.strip()[:40]
+    """Local end time of an alert / veto entry: for a veto entry the warning's own end
+    (alert_end_local: its end_local is the time the veto is HELD to, which can come
+    earlier — see _hz_held), else the daemon's end_local, else ends, else expires (ISO),
+    else end_ts (epoch). None when none is usable, and for a veto entry of a warning that
+    gave no end time (its end_local is only its 60-min hold)."""
+    if _hz_no_end(d):
+        return None
+    for k in ("alert_end_local", "end_local"):
+        s = d.get(k)
+        if isinstance(s, str) and s.strip():
+            return s.strip()[:40]
     for k in ("ends", "expires"):
         ts = _hz_iso_ts(d.get(k))
         if ts is not None:
@@ -3442,20 +3481,44 @@ def _hz_join(parts, sep=" &middot; "):
     return sep.join(p for p in parts if p)
 
 
+def _hz_held(v):
+    """'held until Tue 17:12 CDT unless NWS lists it again' for a veto entry that is held
+    to an earlier time (end_ts / end_local) than the warning's own end (alert_end_ts): NWS
+    has not listed it for a while and it is released 24 h after the last listing, or the
+    time it had left is kept across a clock step. Also for a warning without an end time
+    (held 60 min after its last listing). None otherwise — then "until" says it all. The
+    same rule as the IsSafe reason (monitor.hazard_veto_reason) and /setup."""
+    hold, end = v.get("end_ts"), v.get("alert_end_ts")
+    if not ((_hz_num(hold) and _hz_num(end) and end > hold + 1.0) or _hz_no_end(v)):
+        return None
+    when = _hz_str(v.get("end_local"), 40) or (_hz_local(hold) if _hz_num(hold) else None)
+    return ("held until %s unless NWS lists it again" % html.escape(when)) if when else None
+
+
 def _hz_veto_html(veto, stale):
-    """The red banner(s): one per configured warning currently vetoing the monitor."""
+    """The red banner(s): one per configured warning currently vetoing the monitor —
+    "until" the warning's own end, with "held until ..." beneath when the veto is held to
+    an earlier time (_hz_held)."""
     out = []
     for v in veto:
+        held = _hz_held(v)
         until = _hz_until(v)
         head = "UNSAFE: %s over the site%s" % (
             _hz_e(v.get("event") or "NWS warning", 80),
-            (" until %s" % html.escape(until)) if until else "")
+            (" until %s" % html.escape(until)) if until else
+            (", no end time given" if _hz_no_end(v) else ""))
         if stale:
             head = "Last known (safety state stale): " + head
         sub = [_hz_e(v.get("sender"), 80)]
         if _hz_num(v.get("first_seen_ts")):
             sub.append("first seen %s" % html.escape(_hz_local(v["first_seen_ts"]) or "?"))
-        sub.append(_HZ_VETO_SOURCE.get(v.get("source"), ""))
+        if held:
+            sub.append(held)
+        if held and v.get("source") == "latched":
+            # not "held until the warning ends": it is held only until the time above
+            sub.append(_HZ_VETO_LATCHED_HELD)
+        else:
+            sub.append(_HZ_VETO_SOURCE.get(v.get("source"), ""))
         hl = _hz_e(v.get("headline"), 300)
         out.append(
             '    <div class="hz-veto">%s<div>\n'
@@ -3478,6 +3541,7 @@ def _hz_pending_html(pending, stale):
         onset = p.get("onset_local") if isinstance(p.get("onset_local"), str) else None
         if not onset and _hz_num(p.get("onset_ts")):
             onset = _hz_local(p["onset_ts"])
+        # the warning's own end; a hold before it is said beneath (_hz_held)
         until = _hz_until(p)
         head = "Scheduled: %s for the site%s%s" % (
             _hz_e(p.get("event") or "NWS warning", 80),
@@ -3485,7 +3549,7 @@ def _hz_pending_html(pending, stale):
             (" until %s" % html.escape(until)) if until else "")
         if stale:
             head = "Last known (safety state stale): " + head
-        sub = [_hz_e(p.get("sender"), 80),
+        sub = [_hz_e(p.get("sender"), 80), _hz_held(p),
                "not a veto yet &mdash; the safety monitor goes UNSAFE shortly before it "
                "takes effect"]
         out.append(
@@ -3584,8 +3648,11 @@ def _hz_policy_html(hz):
     names = ["<b>%s</b>" % _hz_e(e, 60) for e in events]
     listed = (names[0] if len(names) == 1 else
               ", ".join(names[:-1]) + " or " + names[-1])
+    # (the 24 h: nws_alerts.UNSEEN_RELEASE_SEC, a fixed bound — a warning NWS keeps
+    # listing is held to its end, one it stopped listing a day ago is released)
     return ('    <p class="hz-note">Only a %s in effect <b>over the site</b> makes the safety '
-            'monitor UNSAFE, for as long as the warning lasts. Every other alert, and '
+            'monitor UNSAFE, until the warning ends or until 24 h after NWS last listed '
+            'it, whichever comes first. Every other alert, and '
             'everything under &ldquo;Other hazard information&rdquo;, is information only '
             'and never changes IsSafe.</p>\n' % listed)
 
@@ -4465,17 +4532,20 @@ def write_html(
     parts.append('<style>\n')
     parts.append(PAGE_CSS)
     parts.append('</style>\n</head>\n<body>\n')
-    stale_after = page_stale_after_s(refresh_seconds)
-    parts.append(page_root_open_html(page_class, now_unix, stale_after))
-    parts.append(page_age_html(now_str, stale_after))
-
-    parts.append(build_masthead_html(night_default))
-
-    # Section 1: the Alpaca safety monitor (its own card) + the NWS 12-h forecast.
+    # The safety state is read before the page element: that element carries the daemon's
+    # clock check (data-clock), which decides how PAGE_JS may judge the page's age.
     try:
         _safety_state = read_safety_state()
     except Exception:
         _safety_state = None
+    clock_state = page_clock_state(_safety_state)
+    stale_after = page_stale_after_s(refresh_seconds)
+    parts.append(page_root_open_html(page_class, now_unix, stale_after, clock_state))
+    parts.append(page_age_html(now_str, stale_after, clock_state))
+
+    parts.append(build_masthead_html(night_default))
+
+    # Section 1: the Alpaca safety monitor (its own card) + the NWS 12-h forecast.
     try:
         parts.append(build_safety_html(_safety_state))
     except Exception:
@@ -4559,17 +4629,42 @@ def write_html(
         raise
 
 
-def page_root_open_html(page_class, generated_ts, stale_after):
+PAGE_CLOCK_STATES = ("synchronised", "grace", "unconfirmed", "disabled")
+
+
+def page_clock_state(state):
+    """The daemon's clock check as the page is generated: the safety state's
+    components.clock.state, one of PAGE_CLOCK_STATES, or "" when the state does not say
+    (no state file, an older daemon). The page's generation time is read off this same Pi
+    clock, so while the daemon reports it 'unconfirmed' (chrony not synchronised) the
+    page's age cannot be judged from it (PAGE_JS)."""
+    comp = state.get("components") if isinstance(state, dict) else None
+    clock = comp.get("clock") if isinstance(comp, dict) else None
+    value = clock.get("state") if isinstance(clock, dict) else None
+    return value if value in PAGE_CLOCK_STATES else ""
+
+
+def page_root_open_html(page_class, generated_ts, stale_after, clock_state=""):
     """The page element with what PAGE_JS needs to judge the page's age in the viewer's
-    browser: data-generated (epoch seconds) and data-stale-after (seconds)."""
-    return ('<section class="%s" id="page" data-generated="%d" data-stale-after="%d">\n'
+    browser: data-generated (epoch seconds), data-stale-after (seconds) and data-clock
+    (page_clock_state: "unconfirmed" means the generation time may be wrong)."""
+    return ('<section class="%s" id="page" data-generated="%d" data-stale-after="%d" '
+            'data-clock="%s">\n'
             '<div class="wrap">\n'
-            % (html.escape(page_class), int(generated_ts), int(stale_after)))
+            % (html.escape(page_class), int(generated_ts), int(stale_after),
+               html.escape(clock_state or "")))
 
 
-def page_age_html(now_str, stale_after):
+def page_age_html(now_str, stale_after, clock_state=""):
     """The (hidden) banner PAGE_JS fills when the page is no longer being updated, and,
-    without JavaScript, a line saying when to take the page as stopped."""
+    without JavaScript, a line saying when to take the page as stopped — or, while the
+    Pi's clock is not confirmed, that the generation time itself may be wrong."""
+    if clock_state == "unconfirmed":
+        how = ("by a clock chrony had not confirmed: that time may be wrong, so how old "
+               "the page is cannot be judged from it")
+        return ('<div class="pageage" id="pageage" role="alert" hidden></div>\n'
+                '<noscript><p class="pageage note">Generated %s, %s.</p></noscript>\n'
+                % (html.escape(str(now_str or "")), how))
     return ('<div class="pageage" id="pageage" role="alert" hidden></div>\n'
             '<noscript><p class="pageage note">Generated %s. This page cannot check its '
             'own age without JavaScript: when that time is more than %s ago, the page is '

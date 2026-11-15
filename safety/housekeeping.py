@@ -27,7 +27,8 @@ log = logging.getLogger("ttu.safety")
 
 LOCK_MODE = 0o600       # flock needs only an open descriptor: nobody else may open the file
 
-# Where the RAM-disk temp files live: the GLM netCDF fallback (glm_lightning, always
+# Where the RAM-disk temp files live: the GLM granules (glm_lightning writes every granule
+# to a file in /dev/shm and reads it from there; in memory only where there is no
 # /dev/shm) and the page's files (make_status_page.py: _SHM, and status.html in /dev/shm).
 # Computed as config._SHM and make_status_page._SHM are; a module constant the tests point
 # at a private directory.
@@ -133,7 +134,7 @@ def _leftover_patterns(cfg) -> List[tuple]:
     state_dir = os.path.dirname(cfg.STATE_FILE) or "."
     inputs = cfg.INPUTS_FILE
     return [
-        # glm_lightning's netCDF fallback (mkstemp, prefix "ttu-glm-") in the RAM disk
+        # the GLM granule being read (glm_lightning: mkstemp in /dev/shm, prefix "ttu-glm-")
         (SHM_DIR, "ttu-glm-*.nc"),
         # monitor._write_state's unique temp files (mkstemp beside the state file)
         (state_dir, ".safety_state.*.tmp"),

@@ -3,7 +3,7 @@
 Threads:
   * evaluator    — every EVAL_INTERVAL: recompute IsSafe, log transitions, write state.
   * rain-poller  — every ~30 s: if it's night (sun below the gate) and the interval has
-                   elapsed, poll Weather Underground and update the 3-hour latch.
+                   elapsed, poll Weather Underground and update the rain latch.
   * nws-poller   — every ~60 s: if the interval elapsed, pull the NWS gridpoint forecast.
   * hazard-alerts — every ~10 s: if due, the NWS active-alerts point query (the warning
                    veto, every HAZARD_POINT_POLL_SEC) and area query (map + list).
@@ -484,14 +484,17 @@ def _run(cfg):
     else:
         log.warning("connectivity watchdog disabled (TTU_SAFETY_CONN=0)")
     if dew is not None:
+        # (the last clause: SafetyMonitor._dew_blockers — device 1 never leans on a check
+        # of device 0 that has stopped)
         log.info("dew monitor: Alpaca SafetyMonitor device %d — IsSafe while device %d is "
                  "SAFE, spread <= %g degC, wind <= %g mph (until > %g mph), forecast cloud "
                  "< %g%% and precipitation probability < %g%% this hour and next, and no "
-                 "GLM lightning within %g km in the last %g min (watched for that long)",
+                 "GLM lightning within %g km in the last %g min (watched for that long), "
+                 "with the WU rain check running and no gating layer of device %d broken",
                  cfg.DEW_DEVICE_NUMBER, cfg.DEVICE_NUMBER, cfg.DEW_SPREAD_MAX_C,
                  cfg.DEW_WIND_MAX_MPH, cfg.DEW_WIND_UNSAFE_ABOVE_MPH,
                  cfg.DEW_CLOUD_BELOW_PCT, cfg.DEW_PRECIP_BELOW_PCT, cfg.DEW_GLM_KM,
-                 max(0.0, cfg.GLM_COOLOFF_HOURS * 60.0))
+                 max(0.0, cfg.GLM_COOLOFF_HOURS * 60.0), cfg.DEVICE_NUMBER)
         if glm is None:
             no_glm = "TTU_SAFETY_GLM=0"
         elif not glm_lightning.deps_available():
