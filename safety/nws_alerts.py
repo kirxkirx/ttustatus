@@ -1811,8 +1811,13 @@ class NwsAlertsPoller:
 
     def _step_move(self, rec) -> float:
         """How far a step moves ``rec``: the change of the clock frame since its stamps were
-        taken or last moved (0 for a veto already in the current frame)."""
-        return self._clock_off - rec.get("frame_off", self._clock_off)
+        taken or last moved — 0 for a veto already in the current frame, and for any change
+        within CLOCK_JUMP_SEC, which is no step here as anywhere else. Two readings of the
+        frame differ by the microseconds between their two clock reads: applied by
+        clock_stepped to a veto an IsSafe call had moved already, that difference released
+        a 17:00 warning as "ended 16:59"."""
+        move = self._clock_off - rec.get("frame_off", self._clock_off)
+        return move if abs(move) > CLOCK_JUMP_SEC else 0.0
 
     def _drop_answers(self):
         """After a clock step: the answers fetched before it are no longer fresh, and both

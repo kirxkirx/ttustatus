@@ -359,6 +359,8 @@ WATCH = ("GLM lightning watched for only %d of the 30 min needed (after a daemon
          "clock correction or a gap in the data)")
 NO_DATA = "no current lightning data: %s"
 FAILED = "the last GLM poll failed or is too old"
+REFUSED = ("this host's clock is 158 d behind the server's (AWS S3): GLM granules refused "
+           "until the clock is corrected")
 
 
 def test_no_lightning_or_distant_lightning_passes():
@@ -450,6 +452,15 @@ def test_a_far_flash_does_not_restart_or_shorten_the_hold():
      "GLM is not polled now (daytime, or the sun's altitude is unknown)"),
     (glm(available=False), FAILED),
     (glm(available="yes"), FAILED),
+    # the layer's own error, when it gives one: on one line, at most 160 characters
+    (glm(available=False, error="list: timed out"), "the last GLM poll failed: list: timed out"),
+    (glm(available=False, error=REFUSED), "the last GLM poll failed: " + REFUSED),
+    (glm(available=False, error=" no GLM granule\n in the last 5 min "),
+     "the last GLM poll failed: no GLM granule in the last 5 min"),
+    (glm(available=False, error="x" * 300), "the last GLM poll failed: " + "x" * 160),
+    (glm(available=False, error=""), FAILED),
+    (glm(available=False, error=None), FAILED),
+    (glm(available=False, error=["list"]), FAILED),
     (glm(granules_scanned=0), "the last GLM poll read only 0 of the 10 granules needed"),
     (glm(granules_scanned=None), "the last GLM poll read only 0 of the 10 granules needed"),
     (glm(granules_scanned=9), "the last GLM poll read only 9 of the 10 granules needed"),
@@ -1580,12 +1591,30 @@ def test_a_longer_glm_outage_is_a_gap_and_the_watch_starts_again(storm):
     st = storm(905, poll=False)                   # no good poll for more than 15 min
     assert st["is_safe"] is True and st["dew"]["is_safe"] is False
     assert st["dew"]["reasons"] == ["no current lightning data: no good GLM poll for "
-                                    "15 min (the last GLM poll failed or is too old)"]
+                                    "15 min (the last GLM poll failed: list: timed out)"]
     st = storm(930)                               # GLM is back
     assert st["is_safe"] is True and st["dew"]["is_safe"] is False
     assert st["dew"]["reasons"] == [WATCH % 0]
     assert storm.quiet(1230, 2430)["dew"]["is_safe"] is False         # 25 min of it
     assert storm(930 + 1800, poll=False)["dew"]["is_safe"] is True    # 30 min
+
+
+def test_device_1_gives_the_glm_layers_own_reason_for_no_data(tmp_path, monkeypatch):
+    # The REAL layer and poll, the listing dated 158 days ahead of this host's clock: the
+    # wrong-clock guard refuses it, and device 1 says so — not merely "the last GLM poll
+    # failed or is too old", with the cause in the page's warnings alone.
+    monkeypatch.setattr(config, "GLM_LATCH_FILE", str(tmp_path / "glm_latch.json"))
+    monkeypatch.setattr(glm_lightning, "deps_available", lambda: True)
+    monkeypatch.setattr(glm_lightning, "_list_keys",
+                        lambda bucket, prefix, timeout=15: ([], 158 * 86400.0))
+    layer = glm_lightning.GlmLightningPoller(config, EventLog(str(tmp_path / "events.log")))
+    now = time.time()
+    assert layer.poll_now(now)["ok"] is False
+    comp = layer.component(-20.0, now + 1)
+    assert comp["available"] is False and comp["error"] == REFUSED
+    v = verdict(three(now=now + 1), now=now + 1, lightning=comp)
+    assert v["is_safe"] is False and v["checks"]["lightning"] is None
+    assert v["reasons"] == [NO_DATA % ("the last GLM poll failed: " + REFUSED)]
 
 
 def test_a_daemon_that_has_just_started_keeps_device_1_false_for_a_hold(storm):

@@ -296,7 +296,13 @@ class DewMonitor:
             elif _finite(glm.get("last_poll_ts")) is None:
                 why = "no GLM poll yet"
             else:
-                why = "the last GLM poll failed or is too old"
+                # the layer's own account when it gives one (a listing the wrong-clock guard
+                # refused, a window with no granule readable, a timeout): without it the dew
+                # card and /setup said only "failed", the cause being in the warnings alone
+                err = glm.get("error")
+                err = " ".join(err.split())[:160] if isinstance(err, str) else ""
+                why = ("the last GLM poll failed: %s" % err if err
+                       else "the last GLM poll failed or is too old")
         else:
             ts = _finite(glm.get("last_poll_ts"))
             raw = glm.get("nearest_km")

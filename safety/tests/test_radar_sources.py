@@ -559,7 +559,10 @@ def test_monitor_shows_the_radar_and_glm_clock_warnings(env, write_inputs):
     assert st["is_safe"] is True            # an unavailable layer never vetoes on its own
 
 
-def test_glm_refuses_granules_listed_by_a_wrong_clock(monkeypatch):
+def test_glm_refuses_granules_listed_by_a_wrong_clock(monkeypatch, tmp_path):
+    # never the real ~/safety_glm_latch.json: an active latch there (a Pi in a lightning
+    # cool-off) made the poller below read "unsafe"
+    monkeypatch.setattr(config, "GLM_LATCH_FILE", str(tmp_path / "glm_latch.json"))
     listing = b"<ListBucketResult><Key>GLM-L2-LCFA/x_s20260681200000_e1.nc</Key></ListBucketResult>"
     date = email.utils.formatdate(time.time() + 158 * 86400.0, usegmt=True)
     fetched = []

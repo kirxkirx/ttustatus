@@ -553,13 +553,39 @@ def test_backward_clock_step_keeps_the_veto_for_the_time_it_had_left(env, monkey
     assert p.component(NOW + 90)["veto"][0]["end_ts"] == END
 
 
-def test_forward_clock_step_never_holds_beyond_the_alert_end(env):
+def test_forward_clock_step_never_holds_beyond_the_alert_end(env, monkeypatch):
+    # (the frame pinned: read from the real clocks, a step the system never showed moved
+    # the veto by the microseconds between two readings, now and then to "ended 16:59")
+    system = system_clock(monkeypatch)
     env.nws.point = [tor(SV_1611)]
     p = env.new()
     p.poll_point(NOW)
-    p.clock_stepped(NOW + 60, END + 600)
+    step(p, system, NOW + 60, END + 600)
     assert p.component(END + 601)["safe"] is True
     assert env.log.vetoes()[-1]["result"] == "released: ended 17:00 CDT"
+
+
+@pytest.mark.parametrize("jitter", [-1e-6, 0.0, 1e-6])
+@pytest.mark.parametrize("delta,ended", [(1440.0, "17:00"), (-1440.0, "16:36")])
+def test_a_step_followed_already_is_not_moved_by_the_frames_next_reading(env, monkeypatch,
+                                                                         delta, ended, jitter):
+    # An IsSafe call sees a real step first and moves the veto; the step detector reports
+    # the step after that, and its reading of the frame differs from the first by the
+    # microseconds between two clock reads — no step: forward, the warning still ends at
+    # its NWS end; backward, it keeps exactly the time it had left.
+    system = system_clock(monkeypatch)
+    env.nws.point = [tor(SV_1611)]
+    p = env.new()
+    p.poll_point(NOW)
+    pre, post = NOW + 60, NOW + 60 + delta
+    system["offset"] += delta                          # the step
+    assert p.component(post + 1)["safe"] is False      # seen first by an IsSafe call
+    system["offset"] += jitter
+    p.clock_stepped(pre, post)                         # the detector's report
+    end = END + min(0.0, delta)
+    assert p.component(post + 2)["veto"][0]["end_ts"] == end
+    assert p.component(end + 1)["safe"] is True
+    assert env.log.vetoes()[-1]["result"] == "released: ended %s CDT" % ended
 
 
 def test_clock_step_requires_post_step_queries_for_an_early_release(env):
