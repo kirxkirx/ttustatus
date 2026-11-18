@@ -649,8 +649,29 @@ def test_bucket_behind_iem_takes_over_and_the_switch_is_logged(monkeypatch):
     assert p.component(-10.0, NOW + 600)["frame_source"] == "iem"
     kinds = ev.kinds()
     assert kinds == ["RADAR-SOURCE"]
-    assert "NOAA Open Data (AWS)" in ev.records[0][1]["reason"]
-    assert ev.records[0][1]["result"] == "frames from IEM"
+    assert ev.records[0][1]["reason"] == (
+        "NOAA Open Data (AWS) -> IEM: AWS is behind, its newest frame 01:26Z is 12 min old "
+        "while IEM has 01:32Z")
+    assert ev.records[0][1]["result"] == "now using IEM"
+    # the bucket catches up: back to it, and the event says IEM was the one behind
+    fr["aws"] = (_t(1, 36), "http://x/aws/0136")
+    assert p.poll_now(now=NOW + 720)["source"] == "aws"
+    assert ev.kinds() == ["RADAR-SOURCE", "RADAR-SOURCE"]
+    assert ev.records[1][1]["reason"] == (
+        "IEM -> NOAA Open Data (AWS): IEM is behind, its newest frame 01:32Z is 8 min old "
+        "while AWS has 01:36Z")
+    assert ev.records[1][1]["result"] == "now using AWS"
+
+
+def test_source_switch_reason_wording():
+    t = _t(1, 32)
+    assert rd._source_switch_reason("aws", "iem", t, {"error": "no answer (timed out)"},
+                                    t + 300) == ("NOAA Open Data (AWS) -> IEM: AWS failed: "
+                                                 "no answer (timed out)")
+    assert rd._source_switch_reason("iem", "aws", t, {}, t + 60) == (
+        "IEM -> NOAA Open Data (AWS): IEM has no frame")
+    assert rd._source_switch_reason("aws", "iem", t, {"newest_ts": t}, t + 360) == (
+        "NOAA Open Data (AWS) -> IEM: both have frame 01:32Z, IEM's is preferred")
 
 
 def test_a_source_that_fails_leaves_the_other(monkeypatch):

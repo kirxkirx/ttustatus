@@ -325,6 +325,26 @@ def _hhmm(ts):
     return _utc(ts).strftime("%H:%MZ")
 
 
+def _source_switch_reason(old, new, ts, old_state, now):
+    """Why the radar frames now come from ``new`` instead of ``old``: one sentence naming
+    both sources in the order of the switch, e.g. 'NOAA Open Data (AWS) -> IEM: AWS is
+    behind, its newest frame 16:02Z is 7 min old while IEM has 16:04Z'. ``ts`` is the
+    frame now used; frame times are UTC (the event log's own time stamps are local). No
+    parentheses of its own: the page shows the event's result in parentheses after it."""
+    head = "%s -> %s: " % (SOURCE_NAMES[old], SOURCE_NAMES[new])
+    o, n = SOURCE_SHORT[old], SOURCE_SHORT[new]
+    if old_state.get("error"):
+        return head + "%s failed: %s" % (o, old_state["error"])
+    old_ts = old_state.get("newest_ts")
+    if not old_ts:
+        return head + "%s has no frame" % o
+    if old_ts <= ts - SAME_FRAME_S:
+        return head + "%s is behind, its newest frame %s is %d min old while %s has %s" % (
+            o, _hhmm(old_ts), max(0, round((now - old_ts) / 60)), n, _hhmm(ts))
+    # the same frame from both: poll_now prefers IEM's (a smaller download)
+    return head + "both have frame %s, %s's is preferred" % (_hhmm(ts), n)
+
+
 def _even_floor(t):
     """The latest even UTC minute at or before ``t`` (epoch s): MRMS's frame times."""
     m = int(t) - int(t) % 60
@@ -2758,13 +2778,10 @@ class RadarPoller:
                 self._last_rain_ts = now
                 self._save_rain_ts()
         if prev_src is not None and src != prev_src:
-            other = states.get(prev_src) or {}
-            why = other.get("error") or ("its newest frame is %s" % _hhmm(other["newest_ts"])
-                                         if other.get("newest_ts") else "no frame")
-            log.warning("radar frames now from %s (%s: %s)", SOURCE_NAMES[src],
-                        SOURCE_NAMES[prev_src], why)
-            self.log.record("RADAR-SOURCE", reason="%s: %s" % (SOURCE_NAMES[prev_src], why),
-                            result="frames from %s" % SOURCE_NAMES[src],
+            reason = _source_switch_reason(prev_src, src, ts, states.get(prev_src) or {}, now)
+            log.warning("radar source switched: %s", reason)
+            self.log.record("RADAR-SOURCE", reason=reason,
+                            result="now using %s" % SOURCE_SHORT[src],
                             frame=_hhmm(ts))
         if confirmed:
             self.log.record("RADAR-RAIN", reason=f"echo within {self.cfg.RADAR_TRIGGER_KM:g} km",

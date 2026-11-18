@@ -825,8 +825,11 @@ three IEM outages left the radar blind for 34–49 min each.
   again for the new site a minute later.
 - The pages say where the frame came from ("frame 02:10Z from NOAA Open Data (AWS)") and
   list each source's newest frame or its problem, so a dead backup shows up before it is
-  needed; a source switch is a `RADAR-SOURCE` event. A reply whose `Date` disagrees with
-  the Pi's clock is refused (*Clock robustness* above).
+  needed. A source switch is a `RADAR-SOURCE` event that names the old and the new source
+  and why, e.g. `RADAR-SOURCE  NOAA Open Data (AWS) -> IEM: AWS is behind, its newest
+  frame 16:02Z is 7 min old while IEM has 16:04Z  (now using IEM)`; frame times are UTC, the
+  event's own time stamp is the Pi's local time. A reply whose `Date` disagrees with the
+  Pi's clock is refused (*Clock robustness* above).
 
 **Radar basemap: CARTO first, OpenStreetMap as the backup.** The basemap is built once
 per site and map and cached in `~/.cache/ttu-radar/` (`basemap_<hash>.png`), so tiles are
