@@ -118,6 +118,8 @@ cp "$APP/ttustatus.env.example" "/home/$U/ttustatus.env"          # README.md, s
 # there is no real WU key here: an empty one switches rain polling off cleanly (with the
 # example's placeholder, WU answers 401, which the daemon logs with a traceback)
 sed -i 's/^TTU_SAFETY_WU_KEY=.*/TTU_SAFETY_WU_KEY=/' "/home/$U/ttustatus.env"
+# Device 1 is opt-in; enable it so the deployment smoke test exercises both devices.
+printf '%s\n' 'TTU_SAFETY_DEW=1' >> "/home/$U/ttustatus.env"
 chown "$U": "/home/$U/ttustatus.env" && chmod 600 "/home/$U/ttustatus.env"
 
 # deploy/install.sh as `sudo ./deploy/install.sh` run by that user, systemctl stood in for

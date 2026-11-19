@@ -428,6 +428,37 @@ def test_no_weather_log_block_when_off_or_unknown():
         state(weather_log={"enabled": False, "error": "disabled"})) == ""
 
 
+def test_weather_log_names_the_dew_monitor_only_while_it_is_on(monkeypatch):
+    # TTU_SAFETY_DEW is off by default: a site that never switched it on must not read
+    # about it anywhere on the page, the weather-log text included
+    monkeypatch.setattr(msp, "HTML_FILE", "/var/www/html/status.html")
+    on = msp.build_weather_log_html(state(weather_log=wlog()))
+    assert ("at every change of the safety monitor or the dew monitor (station medians, "
+            "forecast, radar, enclosure sensor, both verdicts and their reasons), and one "
+            "<b>stations</b> row") in on
+    for dew_block_ in ({"enabled": False, "is_safe": False}, None, "junk"):
+        st = state(weather_log=wlog())
+        st["dew"] = dew_block_
+        off = msp.build_weather_log_html(st)
+        assert ("at every change of the safety monitor (station medians, forecast, radar, "
+                "enclosure sensor, the verdict and its reasons), and one <b>stations</b> "
+                "row") in off
+        assert "dew monitor" not in off and "both verdicts" not in off
+    st = state(weather_log=wlog())
+    del st["dew"]                                      # an older daemon's state
+    assert "dew monitor" not in msp.build_weather_log_html(st)
+
+
+def test_with_the_dew_monitor_off_only_device_0_is_listed(env):
+    from safety.alpaca import create_app
+    assert env["monitor"].dew is None
+    client = create_app(env["monitor"], config).test_client()
+    devices = client.get("/management/v1/configureddevices").get_json()["Value"]
+    assert [d["DeviceNumber"] for d in devices] == [0]
+    assert "Dew monitor" not in client.get("/setup").get_data(as_text=True)
+    assert env["monitor"].evaluate()["dew"]["enabled"] is False
+
+
 def test_inputs_file_carries_the_enclosure_temperature(tmp_path, monkeypatch):
     monkeypatch.setattr(msp, "SAFETY_INPUTS_FILE", str(tmp_path / "inputs.json"))
     msp.write_safety_inputs({"sun_altitude_deg": -7.5}, 42.0, humidity_age_s=0.0,

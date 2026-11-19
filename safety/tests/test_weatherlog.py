@@ -789,6 +789,7 @@ def test_daemon_archives_on_shutdown_and_runs_the_log_in_its_own_thread(dirs, tm
     for flag in ("NWS_ENABLED", "GLM_ENABLED", "RADAR_ENABLED", "HAZARDS_ENABLED",
                  "HAZARD_FEEDS_ENABLED", "CONN_ENABLED", "PAGE_ENABLED"):
         monkeypatch.setattr(config, flag, False)
+    monkeypatch.setattr(config, "DEW_ENABLED", True)        # TTU_SAFETY_DEW=1 (opt-in)
     monkeypatch.setattr(server.discovery, "start", lambda port: None)
     monkeypatch.setattr(server, "install_sigterm_handler", lambda: True)
     calls = []

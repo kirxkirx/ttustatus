@@ -4330,6 +4330,99 @@ def format_age_short(seconds):
     return "%d h" % round(seconds / 3600.0)
 
 
+# ---- domes (DISPLAY ONLY) ----------------------------------------------------------------
+# The daemon keeps the latest report each dome's own driver posted (safety/domes.py) and
+# publishes them under the state key "domes" only when a dome is configured; without it
+# there is no card and the page is byte for byte what it was before the card existed.
+# Neither a roof state nor a power state is a verdict: no green and no red here. Styles
+# are inline, so the page's shared CSS is unchanged.
+_DOME_ROOF = ("OPEN", "CLOSED", "OPENING", "CLOSING", "MOVING", "ERROR", "UNKNOWN")
+_DOME_WHY = {"no report yet": "no report received yet",
+             "not current": "the dome driver has no current reading",
+             "error": "dome reports unavailable: see the daemon log"}
+_DOME_DOT = ('<span style="display:inline-block;width:8px;height:8px;border-radius:50%%;'
+             'box-sizing:border-box;margin:0 5px 1px 0;vertical-align:middle;%s"></span>')
+_DOME_DOT_ON = _DOME_DOT % "background:var(--ink)"
+_DOME_DOT_OFF = _DOME_DOT % "border:1.5px solid var(--muted)"
+_DOME_DOT_UNKNOWN = _DOME_DOT % "background:var(--faint)"
+_DOME_DOT_WARN = _DOME_DOT % "background:var(--warn)"
+
+
+def _dome_switch_html(s, known):
+    """One switch: 'Mount on' (filled dot), 'CCD off' (hollow), 'Mount ?' (grey), or a
+    switch from the warn list that is on: 'Light ON' in the warning colour."""
+    label = html.escape(str(s.get("label") or "?"))
+    if not known or s.get("known") is not True or not isinstance(s.get("on"), bool):
+        return _DOME_DOT_UNKNOWN + label + " ?"
+    if s["on"] and s.get("warn") is True:
+        return (_DOME_DOT_WARN + '<span style="color:var(--warn);font-weight:600">'
+                + label + " ON</span>")
+    return _DOME_DOT_ON + label + " on" if s["on"] else _DOME_DOT_OFF + label + " off"
+
+
+def _dome_tile_html(d, stale, state_age, stale_after_s):
+    """One dome's tile: its name, the roof state in capitals, how old the report is (or
+    why the roof is unknown), and its switches."""
+    age = d.get("age_s")
+    age = (age + state_age) if _dew_num(age) is not None and age >= 0 else None
+    # A report can expire between the daemon's evaluation and this page's render.
+    report_stale = (age is not None and stale_after_s is not None and age > stale_after_s)
+    known = d.get("known") is True and not stale and not report_stale
+    roof = str(d.get("shutter") or "").upper()
+    if not known or roof not in _DOME_ROOF:
+        roof = "UNKNOWN"
+    if stale:
+        line = "safety daemon state is stale"
+    elif known:
+        line = "reported %s ago" % format_age_short(age) if age is not None else "reported"
+    elif report_stale or d.get("why") == "stale":
+        line = ("no report for %d min" % (age // 60) if age is not None
+                else "no report for a while")
+    else:
+        line = _DOME_WHY.get(d.get("why"), "no current report")
+    value = ('<div class="v" style="color:var(--warn)">%s</div>' if roof in ("UNKNOWN", "ERROR")
+             else '<div class="v">%s</div>') % roof
+    switches = [s for s in d.get("switches") or [] if isinstance(s, dict)]
+    sw = ""
+    if switches:
+        sw = ('\n      <div class="s">%s</div>'
+              % " &middot; ".join(_dome_switch_html(s, known) for s in switches))
+    return ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
+            '      <div class="s">%s</div>%s\n    </div>\n'
+            % (html.escape(str(d.get("name") or "Dome %s" % d.get("n"))), value,
+               html.escape(line), sw))
+
+
+def build_domes_html(state):
+    """The Domes card (state key "domes"): one tile per dome the daemon expects. Nothing
+    when the daemon expects no dome, is down, or is older than this card."""
+    dm = state.get("domes") if isinstance(state, dict) else None
+    if not isinstance(dm, dict) or not dm.get("enabled"):
+        return ""
+    domes = [d for d in dm.get("domes") or [] if isinstance(d, dict)]
+    if not domes:
+        return ""
+    ts = state.get("ts")
+    state_age = (time.time() - ts) if _dew_num(ts) is not None else None
+    # the cards' usual rule; a state dated in the future is not fresh either
+    stale = state_age is None or not (-60 <= state_age <= SAFETY_STATE_STALE_SEC)
+    state_age = max(0.0, state_age or 0.0)
+    stale_after_s = dm.get("stale_after_s")
+    if _dew_num(stale_after_s) is None:
+        stale_after_s = None
+    tiles = ('  <div class="tiles" style="grid-template-columns:'
+             'repeat(auto-fit,minmax(170px,1fr));margin-bottom:0">\n'
+             + "".join(_dome_tile_html(d, stale, state_age, stale_after_s) for d in domes)
+             + '  </div>\n')
+    return ('  <section style="border:1px solid var(--line);border-radius:12px;'
+            'padding:16px 18px;margin:0 0 26px;background:var(--card)">\n'
+            '    <h2 style="margin:0 0 10px">Domes</h2>\n'
+            + tiles
+            + '    <p style="margin:10px 0 0;font-size:12.5px;color:var(--faint)">Reported by '
+            "each dome's own driver. Display only: not an input of the safety monitor.</p>\n"
+            '  </section>\n')
+
+
 # ---- weather log -----------------------------------------------------------------------
 _WLOG_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+\.csv")     # used with fullmatch
 
@@ -4440,17 +4533,25 @@ def build_weather_log_html(state):
     when = ("never yet" if _dew_num(last) is None
             else time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(last)))
     total = wl.get("total_bytes")
+    # The dew monitor is named only while it is on: a site that never switched it on must
+    # not read about it here (it is off unless TTU_SAFETY_DEW=1).
+    dew = state.get("dew")
+    if isinstance(dew, dict) and dew.get("enabled"):
+        changes = ("the safety monitor or the dew monitor (station medians, forecast, radar, "
+                   "enclosure sensor, both verdicts and their reasons)")
+    else:
+        changes = ("the safety monitor (station medians, forecast, radar, enclosure sensor, "
+                   "the verdict and its reasons)")
     blurb = (
         "CSV for a spreadsheet: one <b>weather</b> row every %s min and at every change of "
-        "the safety monitor or the dew monitor (station medians, forecast, radar, enclosure "
-        "sensor, both verdicts and their reasons), and one <b>stations</b> row per Weather "
+        "%s, and one <b>stations</b> row per Weather "
         "Underground station per poll (night only). Units are in the column names. To spare "
         "the SD card the rows are collected in RAM and copied to the card every %s h, in "
         "daytime, and when the daemon is stopped; a power cut loses the rows not copied "
         "yet. Last copied: %s. Archive size: %s; above %s the oldest months are deleted."
         % ("%g" % (wl["interval_s"] / 60.0 if _dew_num(wl.get("interval_s")) is not None
                    else 5),
-           g("flush_hours", 24), html.escape(when), _wlog_size(total), cap))
+           changes, g("flush_hours", 24), html.escape(when), _wlog_size(total), cap))
     return (
         '  <h2>Weather log</h2>\n'
         '  <div class="grid">\n'
@@ -4551,6 +4652,10 @@ def write_html(
     except Exception:
         parts.append('  <h2>Alpaca safety monitor</h2>\n'
                      '  <p class="lede">Safety section unavailable.</p>\n')
+    try:
+        parts.append(build_domes_html(_safety_state))
+    except Exception:
+        pass
     try:
         parts.append(build_dew_html(_safety_state))
     except Exception:

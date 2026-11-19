@@ -154,7 +154,10 @@ def test_the_thresholds_are_the_owners():
     assert config.DEW_DEVICE_NUMBER == 1 and config.DEVICE_NUMBER == 0
     # data freshness: 3 stations, 30 min per observation, 40 min per forecast download
     assert config.DEW_MIN_STATIONS == 3 and config.DEW_OBS_MAX_AGE_MIN == 30.0
-    assert config.DEW_FORECAST_MAX_AGE_MIN == 40.0 and config.DEW_ENABLED is True
+    assert config.DEW_FORECAST_MAX_AGE_MIN == 40.0
+    # opt-in since 18 November 2026 (unless the environment running the tests set it)
+    assert config.DEW_ENABLED is (os.environ.get("TTU_SAFETY_DEW", "").strip().lower()
+                                  in ("1", "true", "yes", "on", "enabled"))
     # lightning: 60 km (the main monitor's ring is 50), held 30 min, one failed poll allowed
     assert config.DEW_GLM_KM == 60.0 and config.GLM_TRIGGER_KM == 50.0
     assert config.GLM_COOLOFF_HOURS == 0.5 and config.DEW_GLM_MAX_AGE_MIN == 15.0
@@ -186,17 +189,20 @@ def _config_with(**env):
 
 def test_settings_from_the_environment():
     plain = _config_with()
-    assert plain["enabled"] is True and plain["log"] is True
+    # the dew monitor is opt-in (off unless TTU_SAFETY_DEW=1); the weather log is on
+    assert plain["enabled"] is False and plain["log"] is True
+    for word in ("1", "on", "ON", "true", "yes", "enabled"):
+        assert _config_with(TTU_SAFETY_DEW=word)["enabled"] is True, word
     assert (plain["calm"], plain["above"], plain["spread"], plain["fc_age"]) == (8, 9, 5, 40)
     # a dead band turned upside down is corrected, loudly, not obeyed
     odd = _config_with(TTU_SAFETY_DEW_WIND_MAX_MPH="8", TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH="6")
     assert (odd["calm"], odd["above"]) == (8, 8)
     assert any("WIND_UNSAFE_ABOVE_MPH" in w for w in odd["warnings"])
-    # "off" switches it off; a word it does not know is reported, not read as "on"
+    # "off" keeps it off; a word it does not know is reported, not read as "on"
     for word in ("0", "off", "OFF", "false", "no", "disabled"):
         assert _config_with(TTU_SAFETY_DEW=word)["enabled"] is False, word
     typo = _config_with(TTU_SAFETY_DEW="of", TTU_SAFETY_WEATHER_LOG="off")
-    assert typo["enabled"] is True and typo["log"] is False
+    assert typo["enabled"] is False and typo["log"] is False     # the default: off
     assert any("TTU_SAFETY_DEW='of'" in w for w in typo["warnings"])
     # an old forecast cannot be asked for beyond the hours a download holds
     assert _config_with(TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN="600")["fc_age"] == 240
@@ -1400,13 +1406,14 @@ def test_without_the_dew_monitor_there_is_no_device_1(rig):
 
 
 def test_daemon_gives_the_dew_monitor_clock_steps_and_can_leave_it_out(daemon, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(config, "DEW_ENABLED", True)      # TTU_SAFETY_DEW=1 (opt-in)
     steps = []
     monkeypatch.setattr(DewMonitor, "clock_stepped",
                         lambda self, pre, post: steps.append((pre, post)))
     built = daemon()
     assert isinstance(built["monitor"].dew, DewMonitor)
     assert steps == [(built["t0"], built["t0"] + 3600.0)]
-    monkeypatch.setattr(config, "DEW_ENABLED", False)        # TTU_SAFETY_DEW=0
+    monkeypatch.setattr(config, "DEW_ENABLED", False)        # the default: TTU_SAFETY_DEW unset
     assert daemon()["monitor"].dew is None
 
 
@@ -1740,6 +1747,7 @@ def _daemon_events(daemon):  # noqa: F811
 
 def test_daemon_says_so_when_the_dew_monitor_has_no_lightning_layer(daemon, tmp_path,  # noqa: F811
                                                                     monkeypatch, caplog):
+    monkeypatch.setattr(config, "DEW_ENABLED", True)      # TTU_SAFETY_DEW=1 (opt-in)
     needs = "dew monitor needs the GLM lightning layer"
     always = "device 1 will ALWAYS read false"
     # the fixture runs with TTU_SAFETY_GLM=0; the libraries are there, so it is the
@@ -1783,6 +1791,7 @@ def test_daemon_says_so_when_the_dew_monitor_has_no_lightning_layer(daemon, tmp_
 def test_daemon_start_up_line_names_the_lightning_ring(daemon, caplog, monkeypatch):  # noqa: F811
     import logging
     caplog.set_level(logging.INFO)
+    monkeypatch.setattr(config, "DEW_ENABLED", True)      # TTU_SAFETY_DEW=1 (opt-in)
     daemon()
     assert "no GLM lightning within 60 km in the last 30 min" in caplog.text
     caplog.clear()

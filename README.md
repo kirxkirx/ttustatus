@@ -29,8 +29,9 @@ Safety logic is fail-safe: anything unknown/stale ⇒ never silently safe. See
 
 ## The two Alpaca SafetyMonitor devices
 
-The daemon exposes **two** ASCOM Alpaca SafetyMonitor devices on the same address and
-port (11111). They answer different questions, and only device 0 is a safety verdict.
+The daemon exposes up to **two** ASCOM Alpaca SafetyMonitor devices on the same address
+and port (11111): device 0 always, device 1 only with `TTU_SAFETY_DEW=1` (it is off by
+default). They answer different questions, and only device 0 is a safety verdict.
 
 | | Device 0: `TTU Safety Monitor` | Device 1: `TTU Dew Monitor` |
 |---|---|---|
@@ -56,10 +57,20 @@ use it, and in particular not the dome or safety-monitor settings of NINA:
   (lost observing time, never a roof left open).
 - It never opens or closes anything. `false` only hands the decision back to the rain
   sensor.
-- An observatory with no use for it removes it with `TTU_SAFETY_DEW=0`.
+- It is off unless `TTU_SAFETY_DEW=1` is set: an observatory with no use for it never
+  meets it (no device 1, no card on the page). The TTU domes use it, so the TTU Pi's
+  `ttustatus.env` has `TTU_SAFETY_DEW=1`.
 
 The exact rule of each device is in README_SAFETY.md: "Safety logic" for device 0,
 "Dew monitor (Alpaca device 1)" for device 1.
+
+## Dome status (optional)
+
+If each dome's own driver reports its roof and power switches (merlino-dome does), the
+status page shows one tile per dome, with a switch such as a light left on shown in the
+warning colour. It is display only, never an input of either `IsSafe`, and off until a
+`TTU_SAFETY_DOME<n>_KEY` is set: without one the page is exactly as it is without the
+feature. README_SAFETY.md, "Dome status", has the settings and the report format.
 
 ## Sister projects
 
@@ -135,7 +146,8 @@ run_safety_monitor.sh    loop launcher for the daemon (alternative to systemd, n
 safety/                  the daemon package (config, wu_poll, monitor, alpaca, ...)
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
   hazard_feeds.py        information-only hazard feeds (HMS, NIFC, SPC, LSR)
-  dew.py                 the dew monitor (Alpaca device 1), for the observatory's own dome code
+  dew.py                 the dew monitor (Alpaca device 1, off unless TTU_SAFETY_DEW=1)
+  domes.py               dome status reports (display only; off unless a dome key is set)
   weatherlog.py          weather log (CSV): collected in RAM, copied to the SD card once a day
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
 ttustatus.env.example    template for the secrets file (WU key, User-Agent contact, CARTO key)
@@ -158,6 +170,8 @@ cp ~/ttustatus/ttustatus.env.example ~/ttustatus.env
 nano ~/ttustatus.env          # set TTU_SAFETY_WU_KEY=<your key>
                               # uncomment TTU_SAFETY_NWS_UA and put YOUR REAL e-mail in it
                               # optional: TTU_SAFETY_CARTO_KEY=<key> (CARTO radar maps)
+                              # optional: TTU_SAFETY_DEW=1 (the dew monitor, device 1)
+                              # optional: TTU_SAFETY_DOME<n>_KEY etc. (the Domes card)
 chmod 600 ~/ttustatus.env
 
 # 4. install ONE systemd service — the daemon also runs the status page:

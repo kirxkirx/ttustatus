@@ -1,0 +1,14 @@
+{
+ "components": {
+  "sun": {
+   "age_s": 10,
+   "safe": true,
+   "stale": false,
+   "threshold_deg": 0.0,
+   "value_deg": -20.0
+  }
+ },
+ "is_safe": true,
+ "reasons": [],
+ "ts": 1794992800.0
+}

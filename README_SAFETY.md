@@ -13,8 +13,12 @@ address and port:
   while dew is expected to form. It is used only by this observatory's own custom
   dome-control code, to temporarily disable the dome's rain sensor, which is susceptible
   to dew. It is not a safety verdict and must not be selected in NINA or in any other
-  software: see [Dew monitor](#dew-monitor-alpaca-device-1). The daemon also keeps a
-  [weather log](#weather-log) for tuning it.
+  software: see [Dew monitor](#dew-monitor-alpaca-device-1). It is off unless
+  `TTU_SAFETY_DEW=1`. The daemon also keeps a [weather log](#weather-log) for tuning it.
+
+The status page can also show each dome's roof and power switches as the dome's own
+driver reports them: [Dome status](#dome-status-display-only), display only and off until
+a dome key is set.
 
 ## Architecture (two cooperating processes)
 
@@ -174,6 +178,14 @@ windy night it reads `false` although observing is perfectly safe. Selected by m
 errs to the cautious side, because it can never be `true` while device 0 is not. It never
 opens or closes anything; `false` only hands the decision back to the rain sensor.
 
+**Off unless asked for.** The dew monitor runs only with `TTU_SAFETY_DEW=1` in
+`ttustatus.env` (opt-in since 18 November 2026). Without it there is no device 1, no Dew
+monitor card on the status page, no section of `/setup` and no word about it in the
+weather-log text: an observatory whose dome driver does not ask for it never meets it. A
+site that uses it, as the TTU domes do, adds `TTU_SAFETY_DEW=1` **before** updating from
+an earlier version; otherwise its dome drivers' polls of device 1 fail, and they keep
+trusting the rain sensor (dew closes the roof again).
+
 `IsSafe(1) = true` only while **all** of these hold:
 
 | Check | Limit | Data |
@@ -291,13 +303,112 @@ on the SD card.
 
 - IsSafe: `http://<pi>:11111/api/v1/safetymonitor/1/issafe` (after `PUT .../1/connected`
   with `Connected=true`; device 1 has its own Connected flag)
-- Switch it off with `TTU_SAFETY_DEW=0`: device 1 then does not exist, and a driver
-  polling it gets an error and keeps trusting its rain sensor.
+- Switch it on with `TTU_SAFETY_DEW=1`; it is off by default. Without it device 1 does
+  not exist, and a driver polling it gets an error and keeps trusting its rain sensor.
 
 The thresholds are a first guess to be checked against the weather log. On 8 November
 2026 the roof was closed by dew at 22:07 local; Lubbock airport reported 4.4 °C of spread
 and 4.6 mph of wind at 21:53, but also broken cirrus at 25,000 ft. So on nights like that
 one, compare the logged `fc_cloud_pct` with the 30 % limit.
+
+## Dome status (display only)
+
+The status page can show each dome's roof and power switches, as the dome's own driver
+reports them. It is **off unless a dome key is set**: with no `TTU_SAFETY_DOME<n>_KEY` the
+daemon has no route for reports, its state has no `domes` key, and the status page,
+`/setup` and `/status` are exactly what they are without this feature. **It is never an
+input of either `IsSafe`**, and nothing on the Pi ever connects to a dome PC: the domes
+report (dome PCs behind NAT can).
+
+**Which domes are expected.** Dome n (1 to 8) is expected exactly when
+`TTU_SAFETY_DOME<n>_KEY` is set. Its tile is there from the daemon's start and reads
+`UNKNOWN`, *no report received yet*, until the first report arrives. Domes are never
+learned from the reports that arrive: a report with a key that is not configured is
+refused (403) and never adds a tile, and a dome PC that is off still shows, as `UNKNOWN`.
+Adding or removing a dome is adding or removing its lines in `ttustatus.env` and
+`sudo systemctl restart ttu-safety`.
+
+**The report.** Any dome software can send it; merlino-dome does, with `status-push-url`
+and `status-push-key` in its `MerlinoDome.ini`. One request carries a dome's whole status:
+
+```
+POST /domes/v1/report
+Authorization: Bearer KEY-OF-THIS-DOME
+Content-Type: application/json
+
+{"shutter": "closed", "current": true,
+ "switches": [{"name": "Mount power", "on": true}, {"name": "Light", "on": false}],
+ "source": "merlino-dome 0.4.3"}
+```
+
+| Field | Required | Value |
+|---|---|---|
+| `shutter` | yes | `open`, `closed`, `opening`, `closing`, `moving` (motion whose direction the sender does not know), `error` or `unknown` |
+| `current` | yes | `false`: the sender itself has no current reading from its hardware; the whole dome is then shown as unknown |
+| `switches` | no | at most 16 objects; `name` a non-empty string, `on` `true`, `false` or `null` (unknown) |
+| `source` | no | the sender and its version |
+
+- The body is one UTF-8 JSON object of at most 4096 bytes; keys not listed are ignored, so
+  the format can grow. The key identifies the dome: a report carries no dome number, no
+  label and no time (the Pi stamps its arrival on its monotonic clock). Each report
+  replaces the dome's previous one. Send one on every change and at least every 30 s.
+- Replies: `200 {"ok": true}`; `400 {"ok": false, "error": "<field>: ..."}`;
+  `403 {"ok": false, "error": "key not accepted"}`; `413` without a `Content-Length` or
+  above 4096 bytes; `404` from a daemon with no dome configured (or one older than the
+  route); `503` if the daemon's report store failed to start (see its log).
+- A test from any machine that can reach the Pi:
+
+```bash
+curl -X POST http://PI-ADDRESS:11111/domes/v1/report \
+  -H "Authorization: Bearer THE-KEY" -H "Content-Type: application/json" \
+  -d '{"shutter": "closed", "current": true}'
+```
+
+**What the page shows.** A *Domes* card right under the safety monitor's card, one tile per
+expected dome: the roof state in capitals (`OPEN`, `CLOSED`, `OPENING`, `CLOSING`,
+`MOVING`, `ERROR`, `UNKNOWN`), how long ago it was reported, and the switches as `Mount on`,
+`CCD off` or `Mount ?`. A dome without an accepted report for `TTU_SAFETY_DOME_STALE_SEC`
+(120 s), one whose driver says it has no current reading, and every dome while the
+daemon's state file is stale read `UNKNOWN`, never the last known state. No green and no
+red: neither a roof state nor a power state is a verdict. `UNKNOWN`, `ERROR` and a switch
+from the warn list that is on (`Light ON`: a light left on) are in the warning colour.
+
+**Which switches.** `TTU_SAFETY_DOME_SWITCHES` lists the switches shown, by the names the
+dome reports, each optionally with a label: `"Mount power=Mount,CCD power=CCD,Light"`.
+`all` (the default) shows every switch a dome reports (at most 8), `none` none.
+`TTU_SAFETY_DOME_WARN_ON="Light"` shows the ON state of the switches it names in the
+warning colour. Names are matched without regard to case. Either list can also be given
+for one dome, `TTU_SAFETY_DOME2_SWITCHES` or `TTU_SAFETY_DOME2_WARN_ON`, and then replaces
+the shared one for that dome alone: domes whose switches differ each show their own.
+
+**The key** is a shared secret per dome: 16 to 128 printable ASCII characters without
+blanks or quotes, for example `python3 -c "import secrets; print(secrets.token_urlsafe(24))"`.
+It is compared in constant time and never logged, shown or quoted in a warning. A key of
+the wrong shape, or one that two domes share, leaves that dome out with a configuration
+warning on the page. It travels in plain HTTP, like the `IsSafe` replies the domes act
+on: it stops whoever is not on the network path, and a false report could only change the
+display.
+
+**Where else to see it.** `/setup` lists each dome with its sender, the age of its last
+report and the reports refused for their key since the daemon started; `/status` carries
+the block under `domes` (no key, no sender address). The daemon log has a line for each
+dome's first report, each change of its roof or of a shown switch, and when it goes
+silent or reports again (`journalctl -u ttu-safety | grep dome`); a refused key is logged
+once, then at most every 10 min with a count. Nothing goes to `~/safety_events.log` or
+anywhere else on the SD card.
+
+**Example: the TTU observatory**, two domes each run by merlino-dome (its README has the
+dome side). In `~/ttustatus.env`:
+
+```
+TTU_SAFETY_DEW=1
+TTU_SAFETY_DOME1_NAME="Dome 1 (west)"
+TTU_SAFETY_DOME1_KEY=first-key
+TTU_SAFETY_DOME2_NAME="Dome 2 (east)"
+TTU_SAFETY_DOME2_KEY=second-key
+TTU_SAFETY_DOME_SWITCHES="Mount power=Mount,CCD power=CCD,Light"
+TTU_SAFETY_DOME_WARN_ON="Light"
+```
 
 ## Weather log
 
@@ -686,7 +797,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_HAZARD_FEEDS` | `1` | enable the information-only hazard feeds (`0` disables them) |
 | `TTU_SAFETY_HAZARD_FEEDS_POLL_SEC` | `600` | information-feed cadence (min 60; each feed also has its own minimum, see below) |
 | `TTU_SAFETY_HAZARD_LSR_HOURS` | `24` | storm-report look-back, hours (1-168) |
-| `TTU_SAFETY_DEW` | `1` | enable the dew monitor, Alpaca device 1 (`0` or `off`: no such device; a value that is neither on nor off is reported at startup and the default is used) |
+| `TTU_SAFETY_DEW` | `0` | enable the dew monitor, Alpaca device 1, with `1` or `on` (off by default since 18 November 2026: no such device, no card, no `/setup` section; a value that is neither on nor off is reported at startup and the default is used) |
 | `TTU_SAFETY_DEW_SPREAD_MAX_C` | `5` | dew-point spread limit, **degrees Celsius**: true only at or below |
 | `TTU_SAFETY_DEW_WIND_MAX_MPH` / `_WIND_UNSAFE_ABOVE_MPH` | `8` / `9` | wind limits, **miles per hour**: calm at or below the first, no longer calm above the second (set them equal for no dead band) |
 | `TTU_SAFETY_DEW_CLOUD_BELOW_PCT` / `_PRECIP_BELOW_PCT` | `30` / `5` | forecast cloud cover and precipitation probability must be **below** these, this hour and the next |
@@ -697,6 +808,11 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_DEW_GLM_MAX_AGE_MIN` | `15` | the last good GLM poll counts this long, and good polls further apart than this are a gap in the 30-minute watch (default: two poll intervals + 5 min; at least one poll interval + 2 min, at most 120). Polls closer together are a gap too when the GLM layer gave up any published granule between them (a poll reaches back at most 15 min; see "Time no poll read") |
 | `TTU_SAFETY_DEW_GLM_MIN_GRANULES` | `10` | granules of the last `TTU_SAFETY_GLM_WINDOW_MIN` minutes a GLM poll must have read to count as lightning data for device 1 (default: two per minute of `TTU_SAFETY_GLM_WINDOW_MIN`, two thirds of the look-back); a partial poll never counts |
 | `TTU_SAFETY_DEW_NAME` | `TTU Dew Monitor` | Alpaca name of device 1 |
+| `TTU_SAFETY_DOME<n>_KEY` | unset | the shared key of dome n (n = 1 to 8): a dome is expected exactly when its key is set; 16 to 128 printable ASCII characters, no blanks, no quotes. A secret: never logged or shown. See *Dome status* |
+| `TTU_SAFETY_DOME<n>_NAME` | `Dome <n>` | the dome's label on the page (at most 40 characters) |
+| `TTU_SAFETY_DOME_SWITCHES` / `TTU_SAFETY_DOME<n>_SWITCHES` | `all` | the switches the page shows: `all` (every switch the dome reports, at most 8), `none`, or `NAME[=LABEL],...` with names as the dome reports them; a dome's own list replaces the shared one for that dome |
+| `TTU_SAFETY_DOME_WARN_ON` / `TTU_SAFETY_DOME<n>_WARN_ON` | empty | switches whose ON state is shown in the warning colour, e.g. `Light`; `none` for a dome that highlights none |
+| `TTU_SAFETY_DOME_STALE_SEC` | `120` | a dome with no accepted report for this long reads UNKNOWN (30-3600; keep it at three times the sender's interval or more) |
 | `TTU_SAFETY_WEATHER_LOG` | `1` | enable the weather log (`0` disables it) |
 | `TTU_SAFETY_WEATHER_LOG_DIR` | `/var/www/html/weather_log` | the archive, on the SD card; inside the web root so the page can link to it |
 | `TTU_SAFETY_WEATHER_LOG_RAM_DIR` | `/dev/shm/ttu_weather_log` | where rows wait in RAM |
@@ -1451,8 +1567,9 @@ them, run there too. `raspios.yml` runs it inside real Raspberry Pi OS 64-bit im
 QEMU, with the Pi's own packages from apt, and test-deploys the daemon there:
 `ci/raspios_test.sh` installs README.md's packages, runs flake8 and the suite, runs
 `deploy/install.sh` for a throwaway user `ttuci` (systemctl stood in for — nothing boots in
-a chroot), starts the daemon the way the installed unit does (live NOAA radar and GLM data
-included; no map tiles), asks both Alpaca devices and `/setup`, and stops it with SIGTERM.
+a chroot), enables the optional dew monitor with `TTU_SAFETY_DEW=1`, starts the daemon the
+way the installed unit does (live NOAA radar and GLM data included; no map tiles), asks
+both Alpaca devices and `/setup`, and stops it with SIGTERM.
 One image is pinned to the Pi's release (trixie), the other is whatever Raspberry Pi
 currently publishes as its newest, so a new OS release is tested before the Pi is
 upgraded. It runs on pushes to main (not for documentation-only changes), weekly and by

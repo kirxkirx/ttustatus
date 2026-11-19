@@ -27,9 +27,9 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from . import (connectivity as conn_mod, dew as dew_mod, glm_lightning, nws_forecast,
-               radar as radar_mod, servertime, timesync, weatherlog as weatherlog_mod,
-               wu_poll)
+from . import (connectivity as conn_mod, dew as dew_mod, domes as domes_mod, glm_lightning,
+               nws_forecast, radar as radar_mod, servertime, timesync,
+               weatherlog as weatherlog_mod, wu_poll)
 
 log = logging.getLogger("ttu.safety.monitor")
 
@@ -693,7 +693,8 @@ class SafetyMonitor:
 
     def __init__(self, cfg, eventlog, poller: RainPoller, nws=None, glm=None, radar=None,
                  conn=None, hazards=None, hazard_feeds=None, hazards_error=None,
-                 hazard_feeds_error=None, dew=None, weatherlog=None, clock=None):
+                 hazard_feeds_error=None, dew=None, weatherlog=None, clock=None,
+                 domes=None):
         self.cfg = cfg
         self.log = eventlog
         self.poller = poller
@@ -727,6 +728,10 @@ class SafetyMonitor:
         # only records. None = switched off.
         self.dew = dew                  # DewMonitor or None
         self.weatherlog = weatherlog    # WeatherLog or None
+        # The domes' own status reports (safety/domes.py): DISPLAY ONLY, published beside
+        # `dew` when a dome is configured and never read by the decision. None = no dome
+        # configured, or the store could not be created (the domes then read UNKNOWN).
+        self.domes = domes              # DomeStore or None
         self._last_dew_safe = None      # for transition logging
         self._dew_last_read = None      # monotonic time a client last read IsSafe(1)
         self._lock = threading.Lock()
@@ -1028,6 +1033,11 @@ class SafetyMonitor:
             },
             "events_tail": [self._fmt_event(e) for e in self.log.recent(12)],
         }
+        # The domes' status reports: DISPLAY ONLY, made after the decision above and never
+        # read by it (tests pin this). Only when a dome is configured: with none, the state
+        # has exactly the keys it had before dome reports existed.
+        if getattr(self.cfg, "DOMES", ()):
+            state["domes"] = self._domes_component()
 
         self._log_transition(is_safe, reasons)
         self._log_dew_transition(dew)
@@ -1441,6 +1451,23 @@ class SafetyMonitor:
         comp["info_only"] = True
         return comp
 
+    def _domes_component(self) -> dict:
+        """DISPLAY ONLY, guarded like _hazard_info_component: whatever the store returns or
+        raises can at most be displayed. The configuration decides which domes are listed:
+        with the store missing or broken, every configured dome reads unknown ("error")."""
+        if self.domes is None:
+            return domes_mod.unavailable_component(
+                self.cfg, "dome report store not running; see the daemon log")
+        try:
+            comp = self.domes.component()
+            if not isinstance(comp, dict):
+                raise TypeError("domes component is %s, not a dict" % type(comp).__name__)
+            return _json_clean(comp)
+        except Exception as e:
+            self._log_component_error("domes", e)
+            return domes_mod.unavailable_component(self.cfg,
+                                                   "dome reports error: %s" % str(e)[:160])
+
     def _log_component_error(self, name, exc):
         """Log a broken layer's traceback when its error changes, else every
         COMPONENT_ERROR_LOG_SEC — not on each of the many evaluations per minute."""
@@ -1459,7 +1486,17 @@ class SafetyMonitor:
         page's staleness gate still sees a live daemon."""
         hz = state["components"].get("hazards") or {}
         dew = state.get("dew") or {}
-        sig = json.dumps({
+        extra = {}
+        if isinstance(state.get("domes"), dict):
+            # what the Domes card shows (roof, known/why, switch values; not the ages):
+            # a change is written at the next evaluation, an unchanged report writes nothing
+            dm = state["domes"]
+            extra["domes"] = [dm.get("error")] + [
+                (d.get("n"), d.get("shutter"), d.get("known"), d.get("why"),
+                 [(s.get("label"), s.get("on"), s.get("known"))
+                  for s in d.get("switches") or [] if isinstance(s, dict)])
+                for d in dm.get("domes") or [] if isinstance(d, dict)]
+        sig = json.dumps(dict(extra, **{
             "is_safe": state["is_safe"], "reasons": state["reasons"],
             "warnings": state["warnings"], "connected": state["connected"],
             # the device 1 verdict (and whether the dome driver is connected to it) is
@@ -1471,7 +1508,7 @@ class SafetyMonitor:
             # at once — even when the reasons read the same (two warnings, same text)
             "hazard_veto": sorted("%s|%s" % (v.get("key"), v.get("end_ts"))
                                   for v in hz.get("veto") or [] if isinstance(v, dict)),
-        }, sort_keys=True)
+        }), sort_keys=True)
         # (0 <= : after the clock steps BACK the difference is negative for the length of
         # the step — without the lower bound no heartbeat was written all that time, and
         # the file on disk stayed dated in the future, which the page reads as "fresh")

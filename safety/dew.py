@@ -169,7 +169,7 @@ def _lightning_block(why=None) -> dict:
             "watched_s": None}
 
 
-def unavailable_component(cfg, why="dew monitor disabled (TTU_SAFETY_DEW=0)") -> dict:
+def unavailable_component(cfg, why="dew monitor off (TTU_SAFETY_DEW is not 1)") -> dict:
     """The state block when the dew monitor is off or broke: never 'safe'."""
     return {"enabled": False, "is_safe": False, "reasons": [why],
             "checks": {"device0": None, "spread": None, "wind": None, "cloud": None,

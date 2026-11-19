@@ -9,6 +9,10 @@ A SECOND standard SafetyMonitor, device 1, is the dew monitor (safety/dew.py): i
 means "a WET reading of the dome's rain sensor right now is dew — the rain sensor may be
 ignored". It is for the dome driver, NOT for NINA; it has its own Connected flag, and it
 is absent (no such device) when the dew monitor is switched off.
+
+With a dome configured (TTU_SAFETY_DOME<n>_KEY), the domes' own drivers POST their status
+to /domes/v1/report (safety/domes.py): DISPLAY ONLY, never an input of either IsSafe. With
+none, that route does not exist.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ import time
 from flask import Flask, jsonify, request
 
 from . import __version__
+from . import domes as domes_mod
 from .radar import basemap_summary
 from .servertime import describe
 from .textclean import clean_text
@@ -182,7 +187,45 @@ def create_app(monitor, cfg) -> Flask:
     def status_json():
         return jsonify(monitor.evaluate())
 
+    # --- dome status reports (DISPLAY ONLY) ----------------------------------
+    # Registered only when a dome is configured: with none, a report gets the 404 of any
+    # unknown path, exactly as before this route existed.
+    if getattr(cfg, "DOMES", ()):
+        @app.post(domes_mod.REPORT_PATH)
+        def dome_report():
+            return _dome_report(getattr(monitor, "domes", None))
+
     return app
+
+
+def _dome_reply(code, error=None):
+    return jsonify({"ok": True} if error is None else {"ok": False, "error": error}), code
+
+
+def _dome_report(store):
+    """One dome report, checked in this order: its size (before the body is read), its
+    key, its JSON, its fields; then it is stored. It never evaluates, never writes a file,
+    and the key presented is never logged or echoed."""
+    length = request.content_length
+    if length is None or length > domes_mod.MAX_BODY:
+        return _dome_reply(413, "the body must have a Content-Length of at most %d bytes"
+                           % domes_mod.MAX_BODY)
+    if store is None:
+        return _dome_reply(503, "dome reports are unavailable on this daemon (see its log)")
+    scheme, _, presented = request.headers.get("Authorization", "").partition(" ")
+    dome = None
+    if scheme.lower() == "bearer" and presented.strip():
+        # compared as bytes: a header with non-ASCII characters is simply a wrong key
+        dome = store.match(presented.strip().encode("utf-8", "replace"))
+    if dome is None:
+        store.refused()
+        return _dome_reply(403, "key not accepted")
+    try:
+        report = domes_mod.parse_report(request.get_data(cache=False))
+    except domes_mod.ReportError as e:
+        return _dome_reply(400, str(e))
+    store.accept(dome, report)
+    return _dome_reply(200)
 
 
 def setup_page(monitor, cfg) -> str:
@@ -422,6 +465,7 @@ def _setup_html(monitor, cfg) -> str:
     source = '<a href="%s" rel="noopener">%s</a>' % (
         html.escape(SOURCE_URL), html.escape(SOURCE_URL.split("://", 1)[-1]))
     dew_html = _dew_html(st.get("dew"), row)
+    domes_html = _domes_html(st.get("domes"), getattr(monitor, "domes", None))
     wlog_html = _weather_log_html(st.get("weather_log"))
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -436,7 +480,7 @@ background:{badge_col}}}code{{background:#f3f3f3;padding:.1rem .3rem}}</style></
 {reasons}
 <h2>Inputs</h2><table>{''.join(rows)}</table>
 {basemap_line}
-{dew_html}
+{dew_html}{domes_html}
 {hazards_html}
 {wlog_html}
 <h2>Recent events</h2><ul>{events}</ul>
@@ -543,6 +587,65 @@ def _dew_html(dew, row) -> str:
         % (number, html.escape(verdict), why, "".join(rows),
            html.escape(str(al.get("issafe_path", "/api/v1/safetymonitor/1/issafe"))),
            "connected" if dew.get("connected") else "not connected", html.escape(asked)))
+
+
+# --- dome status reports on /setup (DISPLAY ONLY) -----------------------------------------
+_DOME_WHY_TEXT = {domes_mod.NO_REPORT: "no report received yet",
+                  domes_mod.NOT_CURRENT: "the dome driver has no current reading",
+                  domes_mod.ERROR: "dome reports unavailable: see the daemon log"}
+
+
+def _dome_age(seconds) -> str:
+    seconds = int(seconds)
+    return "%d s" % seconds if seconds < 90 else "%d min" % (seconds // 60)
+
+
+def _domes_html(dm, store) -> str:
+    """The Domes section: every expected dome with its roof, its shown switches, its
+    sender and the age of its last report, and how many reports were refused for their
+    key. Nothing at all when no dome is configured (the page is then as before)."""
+    if not isinstance(dm, dict) or not dm.get("enabled"):
+        return ""
+    rows = []
+    for d in dm.get("domes") or []:
+        if not isinstance(d, dict):
+            continue
+        age = d.get("age_s")
+        if d.get("known") is True:
+            when = "reported %s ago" % _dome_age(age) if _is_num(age) else "reported"
+        elif d.get("why") == domes_mod.STALE and _is_num(age):
+            when = "no report for %s" % _dome_age(age)
+        else:
+            when = _DOME_WHY_TEXT.get(d.get("why"), "no current report")
+        switches = []
+        for s in d.get("switches") or []:
+            if not isinstance(s, dict):
+                continue
+            known = s.get("known") is True and isinstance(s.get("on"), bool)
+            value = "?" if not known else ("on" if s["on"] else "off")
+            if known and s["on"] and s.get("warn") is True:
+                value = "ON (should be off)"
+            switches.append("%s %s" % (_txt(s.get("label"), 40), value))
+        rows.append("<tr><td>%s</td><td><b>%s</b> · %s</td><td>%s</td><td>%s</td></tr>" % (
+            html.escape(_txt(d.get("name"), 40)),
+            html.escape(_txt(d.get("shutter") if d.get("known") is True else "unknown",
+                             20).upper()),
+            html.escape(when), html.escape(" · ".join(switches) or "no switch shown"),
+            html.escape(_txt(d.get("source"), 60) or "sender not named")))
+    refused = store.refused_count if store is not None else None
+    stale = dm.get("stale_after_s")
+    notes = ["Reported by each dome's own driver to POST <code>%s</code> with its key "
+             "(TTU_SAFETY_DOME&lt;n&gt;_KEY); display only, not an input of either IsSafe."
+             % html.escape(domes_mod.REPORT_PATH)]
+    if _is_num(stale):
+        notes.append("A dome with no report for %d s reads UNKNOWN." % stale)
+    notes.append("Reports refused for their key since the daemon started: %s."
+                 % ("unknown (the report store is not running)" if refused is None
+                    else refused))
+    if dm.get("error"):
+        notes.append("Problem: %s" % html.escape(_txt(dm.get("error"), 200)))
+    return ("<h2>Domes</h2><table>%s</table>"
+            '<p style="color:#666;font-size:.85em">%s</p>' % ("".join(rows), " ".join(notes)))
 
 
 def _weather_log_html(wl) -> str:

@@ -36,6 +36,7 @@ from . import (config, discovery, glm_lightning, housekeeping, radar as radar_mo
 from .alpaca import create_app
 from .connectivity import ConnectivityWatch
 from .dew import DewMonitor
+from .domes import REPORT_PATH, DomeStore
 from .eventlog import EventLog
 from .monitor import (HAZARD_FEEDS_IMPORT_ERROR, NWS_ALERTS_IMPORT_ERROR, RainPoller,
                       SafetyMonitor, hazard_feeds, nws_alerts)
@@ -152,8 +153,9 @@ def build_hazard_layers(cfg, eventlog, errors=None):
 
 
 def _make_optional(factory, label, eventlog, consequence):
-    """Create the dew monitor or the weather log, or report why not and return None:
-    neither may ever keep the daemon — and with it IsSafe — from starting."""
+    """Create the dew monitor, the weather log or the dome report store, or report why not
+    and return None: none of them may ever keep the daemon — and with it IsSafe — from
+    starting."""
     try:
         return factory()
     except Exception as e:  # noqa: BLE001
@@ -254,6 +256,10 @@ def _run(cfg):
     weatherlog = (_make_optional(lambda: WeatherLog(cfg, eventlog), "weather log", eventlog,
                                  "no weather log (IsSafe unaffected)")
                   if cfg.WEATHER_LOG_ENABLED else None)
+    # The domes' own status reports (DISPLAY ONLY): only when a dome key is configured.
+    domes = (_make_optional(lambda: DomeStore(cfg), "dome report store", eventlog,
+                            "the configured domes read UNKNOWN (IsSafe unaffected)")
+             if cfg.DOMES else None)
     # Device 0 is UNSAFE until chrony confirms the clock (safety/timesync.py). Created
     # directly, NOT via _make_optional: if this check could not be created the daemon must
     # not start without it and serve "safe" from a clock nobody confirmed.
@@ -262,7 +268,7 @@ def _run(cfg):
                             hazards=hazards, hazard_feeds=hazard_info,
                             hazards_error=layer_errors.get("hazards"),
                             hazard_feeds_error=layer_errors.get("hazard_info"),
-                            dew=dew, weatherlog=weatherlog, clock=clock)
+                            dew=dew, weatherlog=weatherlog, clock=clock, domes=domes)
 
     for w in cfg.CONFIG_WARNINGS:
         log.warning("CONFIG: %s", w)
@@ -513,8 +519,14 @@ def _run(cfg):
                             "which is off", result="device %d always false"
                             % cfg.DEW_DEVICE_NUMBER)
     elif not cfg.DEW_ENABLED:
-        log.warning("dew monitor disabled (TTU_SAFETY_DEW=0) — no Alpaca device %d",
-                    cfg.DEW_DEVICE_NUMBER)
+        # off is the default (opt-in since 18 November 2026): a plain line, no warning
+        log.info("dew monitor off (TTU_SAFETY_DEW=1 serves it as Alpaca device %d)",
+                 cfg.DEW_DEVICE_NUMBER)
+    if cfg.DOMES:
+        log.info("dome status display: expecting %s; reports to POST %s, a dome without "
+                 "one for %d s reads UNKNOWN (display only, not an input of IsSafe)",
+                 ", ".join("dome %d (%s)" % (d.n, d.name) for d in cfg.DOMES), REPORT_PATH,
+                 cfg.DOME_STALE_SEC)
     if weatherlog is not None:
         _start_thread(weatherlog_loop, "weather-log")
         log.info("weather log: a row every %d s in RAM (%s), archived to %s every %g h in "

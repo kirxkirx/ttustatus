@@ -842,7 +842,12 @@ EVAL_INTERVAL = _clamp("TTU_SAFETY_EVAL_INTERVAL",
 # CELSIUS, the wind limits in MILES PER HOUR (WU reports degF and mph, NWS degC and km/h:
 # every conversion is in safety/dew.py); the lightning ring is in KILOMETRES, like the
 # main monitor's.
-DEW_ENABLED = _env_flag("TTU_SAFETY_DEW", True)
+# OFF unless TTU_SAFETY_DEW=1: opt-in since 18 November 2026, so that an observatory whose
+# dome driver does not ask for it never meets it (no device 1, no card on the page, no
+# /setup section, no word about it in the weather-log text). The TTU observatory sets
+# TTU_SAFETY_DEW=1 in ~/ttustatus.env; without it the domes' dew-monitor polls fail and
+# their drivers keep trusting the rain sensor.
+DEW_ENABLED = _env_flag("TTU_SAFETY_DEW", False)
 DEW_DEVICE_NUMBER = 1
 DEW_SERVER_NAME = _env_str("TTU_SAFETY_DEW_NAME", "TTU Dew Monitor")
 DEW_UNIQUE_ID = "ttu-dewmonitor-1-5c81d2e4"     # stable per-device id for Alpaca
@@ -918,6 +923,184 @@ if DEW_GLM_MAX_AGE_MIN * 60.0 < GLM_POLL_INTERVAL + 120.0:
 DEW_GLM_MIN_GRANULES = _clamp(
     "TTU_SAFETY_DEW_GLM_MIN_GRANULES",
     _env_int("TTU_SAFETY_DEW_GLM_MIN_GRANULES", max(1, 2 * GLM_WINDOW_MIN)), 1, 100000)
+
+# --- dome status display (DISPLAY ONLY: safety/domes.py) ------------------------------
+# Each dome's own driver may POST a small status report (roof state, power switches) to
+# /domes/v1/report, and the status page shows one tile per dome. It is NOT an input of
+# either IsSafe. A dome is expected exactly when its key is set, TTU_SAFETY_DOME<n>_KEY
+# for n = 1 to DOME_MAX: domes are never learned from the reports that arrive (a dome PC
+# that is off must still show as UNKNOWN, and nobody may add a tile to a public page).
+# With no key set there is no route, no `domes` key in the state and no card: the page is
+# byte for byte what it is without this code. The key is a SECRET: it is never logged,
+# shown or quoted in a warning (the _env_* helpers quote values, so it has its own parser).
+DOME_MAX = 8
+DOME_KEY_MIN, DOME_KEY_MAX = 16, 128
+DOME_NAME_MAX = 40              # a dome's label on the page
+DOME_LABEL_MAX = 40             # a switch's label (and the longest switch name a report keeps)
+DOME_SHOW_ALL_MAX = 8           # "all" shows at most this many switches of one dome
+_DOME_SHARED = ("TTU_SAFETY_DOME_SWITCHES", "TTU_SAFETY_DOME_WARN_ON",
+                "TTU_SAFETY_DOME_STALE_SEC")
+_DOME_VAR_RE = re.compile(r"TTU_SAFETY_DOME([1-9][0-9]*)_(KEY|NAME|SWITCHES|WARN_ON)")
+
+
+class DomeConfig:
+    """One expected dome: its number, its label, its key and which of its switches the
+    page shows. `switches` is "all", "none" or a tuple of (name, label), the name as the
+    dome reports it; `warn_on` holds the lower-case names of switches whose ON state is
+    shown in the warning colour (a light left on). The repr leaves the key out."""
+    __slots__ = ("n", "name", "key", "switches", "warn_on")
+
+    def __init__(self, n, name, key, switches="all", warn_on=frozenset()):
+        self.n, self.name, self.key = n, name, key
+        self.switches, self.warn_on = switches, frozenset(warn_on)
+
+    def __repr__(self):
+        return "DomeConfig(n=%d, name=%r, switches=%r, warn_on=%s)" % (
+            self.n, self.name, self.switches, sorted(self.warn_on))
+
+
+def _dome_key_problem(raw) -> str | None:
+    """Why `raw` cannot be a dome key, in words that never contain it; None if it can."""
+    if raw != raw.strip():
+        return "blanks around it"
+    if len(raw) < DOME_KEY_MIN:
+        return "shorter than %d characters" % DOME_KEY_MIN
+    if len(raw) > DOME_KEY_MAX:
+        return "longer than %d characters" % DOME_KEY_MAX
+    if any(not 33 <= ord(c) <= 126 or c in "\"'" for c in raw):
+        return "only printable ASCII characters without blanks or quotes are allowed"
+    return None
+
+
+def _dome_text(raw, limit, var, what, warnings) -> str:
+    """A label from the environment: control characters out, cut at `limit` (loudly)."""
+    text = "".join(c if c.isprintable() else " " for c in str(raw)).strip()
+    if len(text) > limit:
+        warnings.append(f"{var}: {what} {text[:limit]!r}... is longer than {limit} "
+                        f"characters — cut there")
+        text = text[:limit].rstrip()
+    return text
+
+
+def parse_dome_switches(raw, var, warnings):
+    """A switch list: "all", "none", or "NAME[=LABEL],..." with names as the dome reports
+    them (matched without regard to case). Returns "all", "none", a tuple of (name, label),
+    or None for a blank value (= not set)."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.lower() in ("all", "none"):
+        return text.lower()
+    out, seen = [], set()
+    for entry in text.split(","):
+        name, _, label = entry.partition("=")
+        name = _dome_text(name, 10 ** 6, var, "", warnings)
+        if not name:
+            if entry.strip():
+                warnings.append(f"{var}: an entry without a switch name ({entry.strip()!r}) "
+                                "is ignored")
+            continue
+        if len(name) > DOME_LABEL_MAX:
+            warnings.append(f"{var}: switch name {name[:DOME_LABEL_MAX]!r}... is longer than "
+                            f"{DOME_LABEL_MAX} characters, which no report keeps — ignored")
+            continue
+        if name.lower() in seen:
+            warnings.append(f"{var}: switch {name!r} is listed twice — the first is used")
+            continue
+        seen.add(name.lower())
+        label = _dome_text(label, DOME_LABEL_MAX, var, "label", warnings) or name
+        out.append((name, label))
+    if not out:
+        warnings.append(f"{var}={text!r} names no switch — showing every switch reported "
+                        "(all)")
+        return "all"
+    return tuple(out)
+
+
+def parse_dome_warn_on(raw, var, warnings):
+    """A warn list: "NAME,..." (or "none"). Returns a frozenset of lower-case names, or
+    None for a blank value (= not set)."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.lower() == "none":
+        return frozenset()
+    names = set()
+    for entry in text.split(","):
+        name = _dome_text(entry, 10 ** 6, var, "", warnings)
+        if "=" in name:
+            warnings.append(f"{var}: {name!r} — a warn list holds switch names only, no "
+                            "labels; the part after '=' is ignored")
+            name = name.split("=", 1)[0].strip()
+        if name:
+            names.add(name.lower())
+    return frozenset(names)
+
+
+def parse_domes(environ) -> tuple:
+    """(the expected domes in order of their number, the warnings) from an environment.
+    A dome is expected when its key is set and usable; a key of the wrong shape, or one
+    another dome already has, leaves that dome out with a warning that names the variable
+    and never the key."""
+    warnings = []
+    per = {}
+    for var in sorted(environ):
+        if not var.startswith("TTU_SAFETY_DOME") or var in _DOME_SHARED:
+            continue
+        m = _DOME_VAR_RE.fullmatch(var)
+        if m is None:
+            warnings.append(f"{var} is not a dome setting (TTU_SAFETY_DOME<n>_KEY, _NAME, "
+                            "_SWITCHES or _WARN_ON, or TTU_SAFETY_DOME_SWITCHES, _WARN_ON, "
+                            "_STALE_SEC) — ignored")
+            continue
+        n = int(m.group(1))
+        if n > DOME_MAX:
+            warnings.append(f"{var}: domes are numbered 1 to {DOME_MAX} — ignored")
+            continue
+        per.setdefault(n, {})[m.group(2)] = environ[var]
+    shared_sw = parse_dome_switches(environ.get("TTU_SAFETY_DOME_SWITCHES"),
+                                    "TTU_SAFETY_DOME_SWITCHES", warnings) or "all"
+    shared_warn = parse_dome_warn_on(environ.get("TTU_SAFETY_DOME_WARN_ON"),
+                                     "TTU_SAFETY_DOME_WARN_ON", warnings) or frozenset()
+    domes, used = [], {}
+    for n in sorted(per):
+        fields = per[n]
+        key_var = f"TTU_SAFETY_DOME{n}_KEY"
+        key = fields.get("KEY")
+        if key is None or not key.strip():
+            for field in sorted(fields):
+                if field != "KEY":
+                    warnings.append(f"TTU_SAFETY_DOME{n}_{field} is set but {key_var} is "
+                                    f"not — dome {n} is not shown")
+            continue
+        problem = _dome_key_problem(key)
+        if problem:
+            warnings.append(f"{key_var} is not a usable key ({problem}) — dome {n} is not "
+                            "shown")
+            continue
+        if key in used:
+            warnings.append(f"{key_var} is the same key as TTU_SAFETY_DOME{used[key]}_KEY "
+                            f"— dome {n} is not shown (each dome needs its own key)")
+            continue
+        used[key] = n
+        name_var = f"TTU_SAFETY_DOME{n}_NAME"
+        name = _dome_text(fields.get("NAME", ""), DOME_NAME_MAX, name_var, "name", warnings)
+        switches = parse_dome_switches(fields.get("SWITCHES"),
+                                       f"TTU_SAFETY_DOME{n}_SWITCHES", warnings)
+        warn_on = parse_dome_warn_on(fields.get("WARN_ON"),
+                                     f"TTU_SAFETY_DOME{n}_WARN_ON", warnings)
+        domes.append(DomeConfig(n, name or f"Dome {n}", key,
+                                shared_sw if switches is None else switches,
+                                shared_warn if warn_on is None else warn_on))
+    return tuple(domes), warnings
+
+
+DOMES, _dome_warnings = parse_domes(os.environ)
+CONFIG_WARNINGS.extend(_dome_warnings)
+# A dome with no accepted report for this long reads UNKNOWN on the page. Keep it at three
+# times the sender's interval or more (merlino-dome reports every 30 s by default).
+DOME_STALE_SEC = _clamp("TTU_SAFETY_DOME_STALE_SEC",
+                        _env_int("TTU_SAFETY_DOME_STALE_SEC", 120), 30, 3600)
 
 # --- weather log -------------------------------------------------------------
 # What the daemon already knows (station medians, forecast, radar, enclosure sensor, both

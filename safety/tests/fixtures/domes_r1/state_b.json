@@ -1,0 +1,294 @@
+{
+ "alpaca": {
+  "address": "192.168.1.10",
+  "device_number": 0,
+  "issafe_path": "/api/v1/safetymonitor/0/issafe",
+  "name": "TTU Safety Monitor",
+  "port": 11111
+ },
+ "components": {
+  "clock": {
+   "check_sec": 30,
+   "checked_age_s": null,
+   "confirmed_age_s": null,
+   "enabled": false,
+   "grace_left_s": null,
+   "grace_sec": 600,
+   "leap": null,
+   "max_error_limit_s": 1.0,
+   "max_error_s": null,
+   "offset_s": null,
+   "reference": null,
+   "safe": true,
+   "state": "disabled",
+   "stratum": null,
+   "synchronised": false,
+   "why": "the clock check is switched off (TTU_SAFETY_CLOCK_SYNC=0)"
+  },
+  "connectivity": {
+   "enabled": false,
+   "offline_min": 0,
+   "offline_sec": 0,
+   "online": null,
+   "probed": false,
+   "safe": true,
+   "source": "internet reachability probe (disabled)",
+   "threshold_sec": 3600
+  },
+  "glm": {
+   "available": false,
+   "cooloff_hours": 0.5,
+   "coverage": null,
+   "enabled": false,
+   "error": null,
+   "granules_in_window": 0,
+   "granules_scanned": 0,
+   "in_ring": false,
+   "last_flash_ts": null,
+   "last_poll_ts": null,
+   "latched": false,
+   "latched_until": null,
+   "nearest_bearing": null,
+   "nearest_km": null,
+   "partial": false,
+   "polling_active": false,
+   "safe": true,
+   "seconds_remaining": 0,
+   "skipped_s": 0,
+   "source": "GOES-19 GLM total lightning (disabled)",
+   "trigger_km": 50.0,
+   "warnings": []
+  },
+  "hazard_info": {
+   "available": false,
+   "enabled": false,
+   "feeds": {
+    "fire_perimeters": {
+     "age_s": null,
+     "count": 0,
+     "error": "disabled",
+     "interval_s": null,
+     "label": "Fire perimeters",
+     "ok": false,
+     "source": "NIFC WFIGS interagency perimeters"
+    },
+    "fires": {
+     "age_s": null,
+     "count": 0,
+     "error": "disabled",
+     "interval_s": null,
+     "label": "Wildfires",
+     "ok": false,
+     "source": "NIFC WFIGS incident locations"
+    },
+    "lsr": {
+     "age_s": null,
+     "count": 0,
+     "error": "disabled",
+     "interval_s": null,
+     "label": "Local storm reports",
+     "ok": false,
+     "source": "NWS Local Storm Reports via IEM"
+    },
+    "smoke": {
+     "age_s": null,
+     "count": 0,
+     "error": "disabled",
+     "interval_s": null,
+     "label": "Smoke (satellite analysis)",
+     "ok": false,
+     "source": "NOAA/NESDIS Hazard Mapping System"
+    },
+    "spc_md": {
+     "age_s": null,
+     "count": 0,
+     "error": "disabled",
+     "interval_s": null,
+     "label": "SPC mesoscale discussions",
+     "ok": false,
+     "source": "NOAA Storm Prediction Center via IEM"
+    },
+    "spc_outlook": {
+     "age_s": null,
+     "count": 0,
+     "error": "disabled",
+     "interval_s": null,
+     "label": "SPC Day 1 outlook",
+     "ok": false,
+     "source": "NOAA Storm Prediction Center"
+    }
+   },
+   "fires": [],
+   "info_only": true,
+   "lsr": [],
+   "note": "Information only: these feeds never affect the safety monitor \u2014 only the configured NWS warnings over the site do.",
+   "on_map": 0,
+   "safe": true,
+   "smoke": null,
+   "source": "NOAA HMS smoke \u00b7 NIFC WFIGS fires \u00b7 NOAA SPC outlook \u00b7 SPC mesoscale discussions and NWS storm reports via IEM (disabled)",
+   "spc": {
+    "category": null,
+    "color": null,
+    "expire_local": null,
+    "issue_local": null,
+    "label": "unavailable",
+    "mds": [],
+    "ok": false,
+    "on_map": [],
+    "text": null,
+    "valid_local": null
+   },
+   "totals": {}
+  },
+  "hazards": {
+   "area_age_s": null,
+   "area_fresh": false,
+   "areas": [],
+   "at_site": [],
+   "available": false,
+   "counts": {
+    "at_site": 0,
+    "nearby": 0
+   },
+   "enabled": false,
+   "error": null,
+   "nearby": [],
+   "point_age_s": null,
+   "point_fresh": false,
+   "reasons": [],
+   "safe": true,
+   "site_zones": [],
+   "source": "NWS api.weather.gov active alerts (disabled)",
+   "stale_after_s": 600.0,
+   "veto": [],
+   "veto_events": [
+    "Tornado Warning",
+    "Dust Storm Warning",
+    "High Wind Warning"
+   ],
+   "veto_pending": []
+  },
+  "humidity": {
+   "age_s": 0,
+   "safe": true,
+   "stale": false,
+   "threshold_pct": 95.0,
+   "value_pct": 40.0
+  },
+  "nws": {
+   "age_min": null,
+   "available": false,
+   "grid": null,
+   "hours": [],
+   "next_hour": null,
+   "now_hour": null,
+   "reasons": [],
+   "safe": true,
+   "source": "NWS api.weather.gov gridpoint forecast (disabled)",
+   "stale": true,
+   "thresholds": {
+    "cloud_pct": 60.0,
+    "precip_prob_pct": 20.0,
+    "thunder_prob_pct": 15.0
+   },
+   "update_time": null
+  },
+  "radar": {
+   "age_s": null,
+   "attribution": "Radar: NOAA/NSSL MRMS",
+   "available": false,
+   "basemap": {
+    "chosen_by": {},
+    "day": null,
+    "night": null,
+    "night_inverted": false
+   },
+   "basemap_notes": [],
+   "basemap_warnings": [],
+   "clock": {
+    "ok": null,
+    "skew_s": null,
+    "tolerance_s": 60.0
+   },
+   "dbz": 20.0,
+   "enabled": false,
+   "frame_source": null,
+   "frame_source_name": null,
+   "frame_utc": null,
+   "freeze_sec": 900,
+   "in_ring": false,
+   "latched": false,
+   "nearest_km": null,
+   "pixels": 0,
+   "polling_active": false,
+   "ring_streak": 0,
+   "safe": true,
+   "seconds_remaining": 0,
+   "source": "NOAA/NSSL MRMS SeamlessHSR reflectivity (disabled)",
+   "sources": {},
+   "stale_after_s": 1200,
+   "thumb_available": false,
+   "thumb_path": "/var/www/html/ttu_radar.png",
+   "thumb_path_day": null,
+   "trigger_after": 2,
+   "trigger_km": 30.0,
+   "unconfirmed_echo": false,
+   "warnings": [],
+   "why": null
+  },
+  "rain": {
+   "blind_polls": 0,
+   "blind_since": null,
+   "enabled": true,
+   "failed_polls": 0,
+   "last_good_poll_age_s": null,
+   "last_good_poll_ts": null,
+   "last_poll_age_s": null,
+   "last_poll_ts": null,
+   "last_rain_ts": null,
+   "last_throttle_ts": null,
+   "latched": false,
+   "latched_until": null,
+   "note": null,
+   "polling_active": true,
+   "raining": [],
+   "results": [],
+   "safe": true,
+   "seconds_remaining": 0,
+   "stale": false,
+   "stale_for_s": null,
+   "stations_error": 0,
+   "stations_live": 0,
+   "stations_total": 0,
+   "throttle": null
+  },
+  "sun": {
+   "age_s": 0,
+   "safe": true,
+   "stale": false,
+   "threshold_deg": 0.0,
+   "value_deg": -12.0
+  }
+ },
+ "connected": true,
+ "dew": {
+  "enabled": false
+ },
+ "events_tail": [
+  "2026-11-18 01:00:00  INIT  (safe)"
+ ],
+ "geocode": {
+  "lat": 33.748,
+  "lon": -101.958,
+  "source": "built-in default (TTU)"
+ },
+ "is_safe": false,
+ "reasons": [
+  "humidity 97% > 95%",
+  "rain reported by 2 WU station(s)"
+ ],
+ "ts": 1794999970.0,
+ "warnings": [
+  "configuration: TTU_SAFETY_X='y' is not a number \u2014 using default 1"
+ ]
+}
