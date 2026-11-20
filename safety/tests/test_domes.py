@@ -148,9 +148,12 @@ def body(**kw):
 
 def test_a_valid_report_and_unknown_keys():
     r = parse_report(body(extra={"x": 1}, battery_v=12.9))
-    assert r == {"shutter": "closed", "current": True, "rain_wet": None,
+    assert r == {"shutter": "closed", "current": True,         # no rain_wet sent: no key
                  "switches": [("Mount power", True), ("Light", False)],
                  "source": "merlino-dome 0.4.3"}
+    for wet in (True, False, None):                            # sent: kept, null included
+        r = parse_report(body(rain_wet=wet))
+        assert "rain_wet" in r and r["rain_wet"] is wet
     r = parse_report(json.dumps({"shutter": "open", "current": False}).encode())
     assert r["switches"] == [] and r["source"] is None
 
@@ -210,7 +213,7 @@ def test_every_configured_dome_is_listed_before_its_first_report():
     assert comp["enabled"] is True and comp["stale_after_s"] == 120 and comp["error"] is None
     west, east = comp["domes"]
     assert west == {"n": 1, "name": "Dome 1 (west)", "shutter": "unknown", "known": False,
-                    "rain_wet": None, "age_s": None, "why": "no report yet", "source": None,
+                    "age_s": None, "why": "no report yet", "source": None,
                     "switches": [{"label": "Mount", "on": None, "known": False, "warn": False},
                                  {"label": "CCD", "on": None, "known": False, "warn": False},
                                  {"label": "Light", "on": None, "known": False,
@@ -262,10 +265,43 @@ def test_not_current_stale_null_and_missing_switches_are_unknown():
     d = by_n(store.component(mono=10.0 + 120.5))[1]
     assert (d["known"], d["why"], d["shutter"], d["age_s"]) == (False, "stale", "unknown", 120)
     assert d["rain_wet"] is None
-    # a later report replaces the earlier one
+    # a later report replaces the earlier one (without rain_wet: the rain line goes too)
     store.accept(WEST, parse_report(body(shutter="opening")), mono=200.0)
     d = by_n(store.component(mono=201.0))[1]
     assert (d["known"], d["shutter"]) == (True, "opening")
+    assert "rain_wet" not in d
+
+
+def test_a_rain_reading_only_for_a_dome_whose_report_carries_one():
+    store = DomeStore(Cfg(WEST, EAST))
+    assert all("rain_wet" not in d for d in store.component(mono=0.0)["domes"])
+    store.accept(WEST, parse_report(body(rain_wet=False)), mono=1.0)
+    store.accept(EAST, parse_report(body()), mono=1.0)          # a sender without one
+    comp = by_n(store.component(mono=2.0))
+    assert comp[1]["rain_wet"] is False and "rain_wet" not in comp[2]
+    store.accept(WEST, parse_report(body(rain_wet=None)), mono=3.0)
+    comp = by_n(store.component(mono=4.0))
+    assert "rain_wet" in comp[1] and comp[1]["rain_wet"] is None   # sent, no reading
+    broken = domes.unavailable_component(Cfg(WEST, EAST), "store failed")
+    assert all("rain_wet" not in d for d in broken["domes"])
+
+
+@pytest.mark.parametrize("seconds,text", [
+    (0, "0 s"), (45.7, "45 s"), (89, "89 s"), (90, "1 min"), (190, "3 min"),
+    (3600, "60 min"), (-3, "0 s")])
+def test_age_text(seconds, text):
+    assert domes.age_text(seconds) == text
+
+
+def test_a_short_stale_limit_logs_seconds_not_0_min(caplog):
+    caplog.set_level(logging.INFO, logger="ttu.safety.domes")
+    store = DomeStore(Cfg(WEST, stale=30))
+    store.accept(WEST, parse_report(body()), mono=0.0)
+    store.component(mono=45.0)
+    store.accept(WEST, parse_report(body()), mono=80.0)
+    assert "no report for 45 s — shown as UNKNOWN" in caplog.text
+    assert "reporting again after 80 s" in caplog.text
+    assert " 0 min" not in caplog.text and " 1 min" not in caplog.text
 
 
 def test_none_shows_no_switch_and_all_shows_at_most_the_limit():
@@ -478,9 +514,12 @@ def test_r8_identical_reports_write_no_state_beyond_the_heartbeat(env, monkeypat
     mon.domes.accept(WEST, parse_report(body(shutter="opening")))
     mon.evaluate()
     assert len(writes) == n + 1        # a change is written at once
+    mon.domes.accept(WEST, parse_report(body(shutter="opening", rain_wet=None)))
+    mon.evaluate()
+    assert len(writes) == n + 2        # a rain line appears (UNKNOWN): written too
     mon.domes.accept(WEST, parse_report(body(shutter="opening", rain_wet=True)))
     mon.evaluate()
-    assert len(writes) == n + 2        # rain alone updates the page snapshot too
+    assert len(writes) == n + 3        # rain alone updates the page snapshot too
 
 
 def test_the_daemon_builds_the_store_only_with_a_dome(daemon, monkeypatch, caplog):  # noqa: F811

@@ -125,12 +125,12 @@ def test_each_domes_rain_reading_tracks_its_latest_report(rig):
 
     def readings():
         state = rig["client"].get("/status").get_json()
-        return [d["rain_wet"] for d in state["domes"]["domes"]]
+        return [d.get("rain_wet", "not sent") for d in state["domes"]["domes"]]
 
     assert readings() == [True, False]
-    assert post(rig, report(), key=KEY1).status_code == 200   # legacy sender
+    assert post(rig, report(), key=KEY1).status_code == 200   # a sender without one
     assert post(rig, report(rain_wet=None), key=KEY2).status_code == 200
-    assert readings() == [None, None]
+    assert readings() == ["not sent", None]     # no rain line / a rain line reading UNKNOWN
 
 
 def test_the_route_never_evaluates(rig, monkeypatch):

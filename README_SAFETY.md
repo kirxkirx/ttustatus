@@ -338,14 +338,14 @@ Content-Type: application/json
 
 {"shutter": "closed", "current": true, "rain_wet": false,
  "switches": [{"name": "Mount power", "on": true}, {"name": "Light", "on": false}],
- "source": "merlino-dome 0.4.3"}
+ "source": "merlino-dome 0.4.4"}
 ```
 
 | Field | Required | Value |
 |---|---|---|
 | `shutter` | yes | `open`, `closed`, `opening`, `closing`, `moving` (motion whose direction the sender does not know), `error` or `unknown` |
 | `current` | yes | `false`: the sender itself has no current reading from its hardware; the whole dome is then shown as unknown |
-| `rain_wet` | no | filtered board reading: `true` (WET), `false` (DRY), or `null` (UNKNOWN). Older senders omit it. |
+| `rain_wet` | no | filtered board reading: `true` (WET), `false` (DRY), or `null` (UNKNOWN). A sender without one omits it, and its tile then has no rain line. |
 | `switches` | no | at most 16 objects; `name` a non-empty string, `on` `true`, `false` or `null` (unknown) |
 | `source` | no | the sender and its version |
 
@@ -374,8 +374,10 @@ daemon's state file is stale read `UNKNOWN`, never the last known state. No gree
 red: neither a roof state nor a power state is a verdict. `UNKNOWN`, `ERROR` and a switch
 from the warn list that is on (`Light ON`: a light left on) are in the warning colour.
 
-The rain sensor reading appears beside the switches, even when no switches are selected.
-A dew override can leave the sensor reading WET. Missing or expired readings show UNKNOWN.
+A dome whose latest report carries `rain_wet` also shows its rain sensor beside the
+switches, even when no switches are selected; a dome whose driver does not send it has no
+rain line. A dew override can leave the sensor reading WET. A `null` or expired reading
+shows UNKNOWN.
 
 **Which switches.** `TTU_SAFETY_DOME_SWITCHES` lists the switches shown, by the names the
 dome reports, each optionally with a label: `"Mount power=Mount,CCD power=CCD,Light"`.

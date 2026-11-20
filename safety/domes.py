@@ -15,7 +15,7 @@ The report (unknown fields are ignored so v1 can gain optional readings):
     Content-Type: application/json
     {"shutter": "closed", "current": true, "rain_wet": false,
      "switches": [{"name": "Mount power", "on": true}, ...],
-     "source": "merlino-dome 0.4.3"}
+     "source": "merlino-dome 0.4.4"}
 """
 from __future__ import annotations
 
@@ -50,9 +50,10 @@ def _no_constants(name):
 
 
 def parse_report(body: bytes) -> dict:
-    """The report in `body` as {"shutter", "current", "rain_wet", "switches": [(name, on)], "source"},
-    texts cleaned and cut; ReportError naming the field otherwise. Keys not in the format
-    are ignored, so the format can grow."""
+    """The report in `body` as {"shutter", "current", "switches": [(name, on)], "source"},
+    plus "rain_wet" only when the report carries that field; texts cleaned and cut;
+    ReportError naming the field otherwise. Keys not in the format are ignored, so the
+    format can grow."""
     try:
         obj = json.loads(body.decode("utf-8"), parse_constant=_no_constants)
     except UnicodeDecodeError:
@@ -67,7 +68,7 @@ def parse_report(body: bytes) -> dict:
     current = obj.get("current")
     if not isinstance(current, bool):
         raise ReportError("current: must be true or false")
-    rain_wet = obj.get("rain_wet")  # older senders omit this reading
+    rain_wet = obj.get("rain_wet")  # a sender without a rain sensor reading omits it
     if rain_wet is not None and not isinstance(rain_wet, bool):
         raise ReportError("rain_wet: must be true, false or null")
     switches = obj.get("switches", [])
@@ -91,8 +92,12 @@ def parse_report(body: bytes) -> dict:
     if source is not None and not isinstance(source, str):
         raise ReportError("source: must be a string")
     source = clean_text(source or "").strip()[:SOURCE_MAX].strip() or None
-    return {"shutter": shutter, "current": current, "rain_wet": rain_wet,
-            "switches": parsed, "source": source}
+    report = {"shutter": shutter, "current": current, "switches": parsed, "source": source}
+    if "rain_wet" in obj:
+        # Kept only when sent: a dome whose reports carry no rain reading gets no rain line
+        # (a null that IS sent is a reading the sender does not have: UNKNOWN).
+        report["rain_wet"] = rain_wet
+    return report
 
 
 def unavailable_component(cfg, error) -> dict:
@@ -101,7 +106,7 @@ def unavailable_component(cfg, error) -> dict:
     return {"enabled": True, "stale_after_s": int(cfg.DOME_STALE_SEC),
             "error": str(error)[:200],
             "domes": [{"n": d.n, "name": d.name, "shutter": "unknown", "known": False,
-                       "rain_wet": None, "age_s": None, "why": ERROR, "source": None, "switches": []}
+                       "age_s": None, "why": ERROR, "source": None, "switches": []}
                       for d in cfg.DOMES]}
 
 
@@ -111,6 +116,12 @@ def rain_sensor_text(rain_wet) -> str:
     if rain_wet is False:
         return "Rain sensor DRY"
     return "Rain sensor UNKNOWN"
+
+
+def age_text(seconds) -> str:
+    """How long, for the log, /setup and the page: '45 s' under 90 s, else '3 min'."""
+    seconds = max(0, int(seconds))
+    return "%d s" % seconds if seconds < 90 else "%d min" % (seconds // 60)
 
 
 def _shown_switches(dome, report, known, show_all_max) -> dict:
@@ -211,7 +222,7 @@ class DomeStore:
             return
         gap = mono - prev[1]
         if gap > self._stale_sec:
-            log.info("%s: reporting again after %d min — %s", label, int(gap // 60),
+            log.info("%s: reporting again after %s — %s", label, age_text(gap),
                      _describe(now_view))
             return
         old_view = self._view(dome, prev[0])
@@ -256,16 +267,20 @@ class DomeStore:
                 known, why = False, NOT_CURRENT
             else:
                 known, why = True, None
-            blocks.append({
+            block = {
                 "n": dome.n, "name": dome.name,
                 "shutter": report["shutter"] if known else "unknown",
                 "known": known,
-                "rain_wet": report["rain_wet"] if known else None,
                 "age_s": None if age is None else int(age),
                 "why": why,
                 "source": report["source"] if report else None,
                 "switches": list(_shown_switches(dome, report, known, self._show_all).values()),
-            })
+            }
+            if report is not None and "rain_wet" in report:
+                # Only a dome whose latest report carries the reading has a rain line; the
+                # reading is unknown whenever the report is.
+                block["rain_wet"] = report["rain_wet"] if known else None
+            blocks.append(block)
         return {"enabled": True, "stale_after_s": int(self._stale_sec), "error": None,
                 "domes": blocks}
 
@@ -274,8 +289,8 @@ class DomeStore:
             if self._stale_logged.get(dome.n):
                 return
             self._stale_logged[dome.n] = True
-        log.warning("dome %d (%s): no report for %d min — shown as UNKNOWN", dome.n,
-                    dome.name, int(age // 60))
+        log.warning("dome %d (%s): no report for %s — shown as UNKNOWN", dome.n,
+                    dome.name, age_text(age))
 
 
 def _describe(view) -> str:

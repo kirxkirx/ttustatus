@@ -43,12 +43,18 @@ def sw(label, on, known=True, warn=False):
     return {"label": label, "on": on, "known": known, "warn": warn}
 
 
+NOT_SENT = object()        # the dome's reports carry no rain_wet: its block has no such key
+
+
 def dome(n=1, name="Dome 1 (west)", shutter="closed", known=True, age_s=12, why=None,
-         switches=None, rain_wet=None):
-    return {"n": n, "name": name, "shutter": shutter, "known": known, "age_s": age_s,
-            "rain_wet": rain_wet, "why": why, "source": "merlino-dome 0.4.3",
-            "switches": [sw("Mount", True), sw("CCD", False), sw("Light", False)]
-            if switches is None else switches}
+         switches=None, rain_wet=NOT_SENT):
+    d = {"n": n, "name": name, "shutter": shutter, "known": known, "age_s": age_s,
+         "why": why, "source": "merlino-dome 0.4.4",
+         "switches": [sw("Mount", True), sw("CCD", False), sw("Light", False)]
+         if switches is None else switches}
+    if rain_wet is not NOT_SENT:
+        d["rain_wet"] = rain_wet
+    return d
 
 
 def state(*domes_, ts=None):
@@ -110,7 +116,9 @@ def test_report_expiry_is_rechecked_when_rendering(monkeypatch, limit, report_ag
     west = tile(page, "Dome 1 (west)")
     if expired:
         assert ">UNKNOWN</div>" in west and ">OPEN</div>" not in west
-        assert "no report for %d min" % ((report_age + state_age) // 60) in west
+        # seconds under 90 s (a short configured limit), never "no report for 1 min"
+        words = {140: "2 min", 70: "70 s"}[report_age + state_age]
+        assert "no report for %s<" % words in west
         for label in ("Mount", "CCD", "Light"):
             assert msp._DOME_DOT_UNKNOWN + label + " ?" in west
         assert "Light ON" not in west
@@ -203,6 +211,17 @@ def test_rain_is_shown_even_without_switches(wet, expected):
     assert "Rain sensor " + expected in t
 
 
+def test_no_rain_line_for_a_dome_whose_reports_carry_none():
+    t = tile(msp.build_domes_html(state(dome())), "Dome 1 (west)")
+    assert "Rain sensor" not in t and msp._DOME_DOT_ON + "Mount on" in t
+    # no switch and no rain reading: name, roof and age alone, no empty readings line
+    t = tile(msp.build_domes_html(state(dome(switches=[]))), "Dome 1 (west)")
+    assert "Rain sensor" not in t and t.count('<div class="s">') == 1
+    # a reading the sender does not have is a line all the same: UNKNOWN
+    t = tile(msp.build_domes_html(state(dome(rain_wet=None))), "Dome 1 (west)")
+    assert "Rain sensor UNKNOWN" in t
+
+
 def test_the_card_sits_right_after_the_safety_card(tmp_path, monkeypatch):
     st = copy.deepcopy(domes_r1.load_state("a"))
     st["domes"] = state(dome())["domes"]
@@ -237,9 +256,11 @@ def test_setup_lists_the_domes_and_the_refused_count():
     html = alpaca.setup_page(mon, config)
     part = html[html.index("<h2>Domes</h2>"):]
     assert "Dome 1 (west)" in part and "<b>CLOSED</b> · reported 12 s ago" in part
-    assert "Mount on · Light ON (should be off)" in part and "merlino-dome 0.4.3" in part
+    assert "Mount on · Light ON (should be off)" in part and "merlino-dome 0.4.4" in part
     assert "Dome 2 (east)" in part and "<b>UNKNOWN</b> · no report received yet" in part
-    assert "Rain sensor DRY" in part and "Rain sensor UNKNOWN" in part
+    # dome 1 sends a rain reading; dome 2 (no report yet, no switch) shows neither
+    assert "Light ON (should be off) · Rain sensor DRY" in part
+    assert "Rain sensor UNKNOWN" not in part and "<td>no switch shown</td>" in part
     assert "refused for their key since the daemon started: 3." in part
     assert "/domes/v1/report" in part
 

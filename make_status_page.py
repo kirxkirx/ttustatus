@@ -30,7 +30,7 @@ from astropy.utils import iers
 # Stdlib-only helpers of the daemon's package (the page runs from the repository's
 # directory, beside safety/): ISO times read alike on every Python, and the text scrub
 # that makes any feed text writable as UTF-8 and free of control / bidi characters.
-from safety.domes import rain_sensor_text
+from safety.domes import age_text, rain_sensor_text
 from safety.isotime import parse_iso
 from safety.textclean import clean_text
 
@@ -4368,7 +4368,7 @@ def _dome_switch_html(s, known):
 
 def _dome_tile_html(d, stale, state_age, stale_after_s):
     """One dome's tile: its name, the roof state in capitals, how old the report is (or
-    why the roof is unknown), and its switches."""
+    why the roof is unknown), its switches, and its rain sensor if its reports carry one."""
     age = d.get("age_s")
     age = (age + state_age) if _dew_num(age) is not None and age >= 0 else None
     # A report can expire between the daemon's evaluation and this page's render.
@@ -4382,7 +4382,7 @@ def _dome_tile_html(d, stale, state_age, stale_after_s):
     elif known:
         line = "reported %s ago" % format_age_short(age) if age is not None else "reported"
     elif report_stale or d.get("why") == "stale":
-        line = ("no report for %d min" % (age // 60) if age is not None
+        line = ("no report for %s" % age_text(age) if age is not None
                 else "no report for a while")
     else:
         line = _DOME_WHY.get(d.get("why"), "no current report")
@@ -4390,8 +4390,9 @@ def _dome_tile_html(d, stale, state_age, stale_after_s):
              else '<div class="v">%s</div>') % roof
     switches = [s for s in d.get("switches") or [] if isinstance(s, dict)]
     readings = [_dome_switch_html(s, known) for s in switches]
-    readings.append(rain_sensor_text(d.get("rain_wet") if known else None))
-    sw = '\n      <div class="s">%s</div>' % " &middot; ".join(readings)
+    if "rain_wet" in d:     # only a dome whose reports carry the reading has a rain line
+        readings.append(rain_sensor_text(d["rain_wet"] if known else None))
+    sw = ('\n      <div class="s">%s</div>' % " &middot; ".join(readings)) if readings else ""
     return ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>%s\n    </div>\n'
             % (html.escape(str(d.get("name") or "Dome %s" % d.get("n"))), value,

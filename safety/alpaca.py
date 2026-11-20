@@ -598,11 +598,6 @@ _DOME_WHY_TEXT = {domes_mod.NO_REPORT: "no report received yet",
                   domes_mod.ERROR: "dome reports unavailable: see the daemon log"}
 
 
-def _dome_age(seconds) -> str:
-    seconds = int(seconds)
-    return "%d s" % seconds if seconds < 90 else "%d min" % (seconds // 60)
-
-
 def _domes_html(dm, store) -> str:
     """The Domes section: every expected dome with its roof, its shown switches, its
     sender and the age of its last report, and how many reports were refused for their
@@ -615,9 +610,9 @@ def _domes_html(dm, store) -> str:
             continue
         age = d.get("age_s")
         if d.get("known") is True:
-            when = "reported %s ago" % _dome_age(age) if _is_num(age) else "reported"
+            when = "reported %s ago" % domes_mod.age_text(age) if _is_num(age) else "reported"
         elif d.get("why") == domes_mod.STALE and _is_num(age):
-            when = "no report for %s" % _dome_age(age)
+            when = "no report for %s" % domes_mod.age_text(age)
         else:
             when = _DOME_WHY_TEXT.get(d.get("why"), "no current report")
         readings = []
@@ -629,13 +624,14 @@ def _domes_html(dm, store) -> str:
             if known and s["on"] and s.get("warn") is True:
                 value = "ON (should be off)"
             readings.append("%s %s" % (_txt(s.get("label"), 40), value))
-        readings.append(domes_mod.rain_sensor_text(d.get("rain_wet") if d.get("known") is True
-                                                   else None))
+        if "rain_wet" in d:     # only a dome whose reports carry the reading
+            readings.append(domes_mod.rain_sensor_text(
+                d["rain_wet"] if d.get("known") is True else None))
         rows.append("<tr><td>%s</td><td><b>%s</b> · %s</td><td>%s</td><td>%s</td></tr>" % (
             html.escape(_txt(d.get("name"), 40)),
             html.escape(_txt(d.get("shutter") if d.get("known") is True else "unknown",
                              20).upper()),
-            html.escape(when), html.escape(" · ".join(readings)),
+            html.escape(when), html.escape(" · ".join(readings) or "no switch shown"),
             html.escape(_txt(d.get("source"), 60) or "sender not named")))
     refused = store.refused_count if store is not None else None
     stale = dm.get("stale_after_s")
