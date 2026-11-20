@@ -1,7 +1,8 @@
 #!/bin/bash
-# Test-deploy ttustatus inside a THROWAWAY Raspberry Pi OS system, as root: the GitHub job
-# runs it in an image's chroot under QEMU; it also runs in any Raspberry Pi OS root
-# filesystem or on a scratch SD card — never on the observatory Pi (see the guard below).
+# CI ONLY: test-deploy ttustatus as root inside a DISPOSABLE Raspberry Pi OS image.
+# The GitHub job runs it in the image's chroot under QEMU. It installs system packages,
+# recreates a test account and installs a test service. For an actual observatory Pi,
+# follow README_SAFETY.md's "Deploy on the Pi" instructions (deploy/install.sh).
 #
 #   1. installs what README.md's "Deploy" section tells the Pi's owner to install, from
 #      the image's own apt sources — so the suite runs against the Pi's Python, Pillow,
@@ -11,7 +12,8 @@
 #      stand-in for systemctl: no systemd runs in a chroot), then the daemon started the
 #      way the installed unit starts it, and asked what NINA and the dome driver ask.
 #
-# usage: ci/raspios_test.sh [repo]          (default: the directory above this script)
+# usage inside the disposable image: ci/test_disposable_raspios_image.sh [repo]
+# repo defaults to the directory above this script
 # env:   PORT (default 11111, the unit's), SKIP_APT=1 (packages already installed)
 set -euo pipefail
 REPO=$(cd "${1:-$(dirname "$0")/..}" && pwd)

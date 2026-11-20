@@ -1,9 +1,9 @@
 name: Raspberry Pi OS
 
-# The test suite and a deployment smoke test (ci/raspios_test.sh) inside real Raspberry Pi
-# OS (64-bit) images, run under QEMU by pguyot/arm-runner-action: the Pi's own Python,
-# Pillow, numpy, netCDF4 and chrony from apt, where normal CI (ci.yml) uses the newest pip
-# packages on x86. Two images:
+# The test suite and a deployment smoke test (ci/test_disposable_raspios_image.sh) inside
+# disposable Raspberry Pi OS (64-bit) images, run under QEMU by pguyot/arm-runner-action:
+# the Pi's own Python, Pillow, numpy, netCDF4 and chrony from apt, where normal CI (ci.yml)
+# uses the newest pip packages on x86. Two images:
 #   * pinned — Raspberry Pi OS trixie of 2026-06-18 (Debian 13.5). The observatory Pi runs
 #     trixie (Debian 13.6, aarch64); no image was published for 13.6 itself, and apt
 #     brings the packages the test installs up to date either way;
@@ -77,4 +77,4 @@ jobs:
           bind_mount_repository: true
           shell: /bin/bash -eo pipefail
           commands: |
-            bash ci/raspios_test.sh
+            bash ci/test_disposable_raspios_image.sh

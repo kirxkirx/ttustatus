@@ -1560,23 +1560,23 @@ curl -X PUT localhost:11234/api/v1/safetymonitor/0/connected -d Connected=true
 curl localhost:11234/api/v1/safetymonitor/0/issafe          # -> Value: true
 ```
 
-**On Raspberry Pi OS itself.** Normal CI (`ci.yml`) runs the suite on x86 with the newest
-pip packages, on Python 3.9, 3.11, 3.13 and 3.14; the 3.13 leg (the Pi's Python) also
-installs numpy and netCDF4, so the GLM layer's netCDF and flash tests, which skip without
-them, run there too. `raspios.yml` runs it inside real Raspberry Pi OS 64-bit images under
+**CI in disposable Raspberry Pi OS images.** Normal CI (`ci.yml`) runs the suite on x86
+with the newest pip packages, on Python 3.9, 3.11, 3.13 and 3.14; the 3.13 leg (the Pi's
+Python) also installs numpy and netCDF4, so the GLM layer's netCDF and flash tests, which
+skip without them, run there too. `raspios.yml` runs it inside real Raspberry Pi OS 64-bit images under
 QEMU, with the Pi's own packages from apt, and test-deploys the daemon there:
-`ci/raspios_test.sh` installs README.md's packages, runs flake8 and the suite, runs
-`deploy/install.sh` for a throwaway user `ttuci` (systemctl stood in for — nothing boots in
-a chroot), enables the optional dew monitor with `TTU_SAFETY_DEW=1`, starts the daemon the
+`ci/test_disposable_raspios_image.sh` installs README.md's packages, runs flake8 and the
+suite, and runs `deploy/install.sh` for a throwaway user `ttuci` (systemctl stood in for —
+nothing boots in a chroot), enables the optional dew monitor with `TTU_SAFETY_DEW=1`, starts the daemon the
 way the installed unit does (live NOAA radar and GLM data included; no map tiles), asks
 both Alpaca devices and `/setup`, and stops it with SIGTERM.
 One image is pinned to the Pi's release (trixie), the other is whatever Raspberry Pi
 currently publishes as its newest, so a new OS release is tested before the Pi is
 upgraded. It runs on pushes to main (not for documentation-only changes), weekly and by
-hand (*Actions → Raspberry Pi OS → Run workflow*). The script also runs as root in any
-throwaway Raspberry Pi OS system (`sudo ci/raspios_test.sh` on a scratch SD card) — **never
-on the observatory Pi**: it installs a `ttu-safety` unit, and it refuses to run where a
-`ttu-safety` unit for any other user exists.
+hand (*Actions → Raspberry Pi OS → Run workflow*). The script is for the disposable CI
+image: it installs system packages, recreates the test account and installs a test
+`ttu-safety` unit. It refuses to replace a `ttu-safety` unit for any other user. For the
+observatory Pi, follow [Deploy on the Pi](#deploy-on-the-pi).
 In CI the image is a plain chroot that shares the runner VM's processes, so the script
 never picks processes by user: it stops only its own daemon's process group, and `ttuci`
 gets a fixed UID (4242) that cannot be the GitHub runner's (1001). If a run ends
