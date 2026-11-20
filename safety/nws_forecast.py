@@ -182,7 +182,7 @@ def fetch(cfg):
     # not an exception that escapes poll_now — that froze _latest at the last good
     # forecast forever while retrying every 60 s.
     try:
-        now = datetime.now(timezone.utc)
+        now = datetime.fromtimestamp(time.time(), timezone.utc)
         hour0 = now.replace(minute=0, second=0, microsecond=0)
         maps = {k: (_expand_log_only(p.get(prop)) if k in LOG_ONLY
                     else _expand(p.get(prop), k in _THRESHOLDED))
@@ -194,8 +194,10 @@ def fetch(cfg):
         update = p.get("updateTime")
         age_min = (now - _iso(update)).total_seconds() / 60.0 if update else None
 
+        outlook = [at(hour0 + timedelta(hours=k)) for k in range(OUTLOOK_HOURS)]
         hours = []
-        for k in range(cfg.NWS_RENDER_HOURS):
+        # Keep enough extra rows to advance the displayed table between downloads.
+        for k in range(cfg.NWS_RENDER_HOURS + math.ceil(2 * cfg.NWS_POLL_INTERVAL / 3600)):
             h = hour0 + timedelta(hours=k)
             row = at(h)
             row["local"] = _local(h, cfg.LOCAL_TZ).strftime("%a %H:%M")
@@ -205,47 +207,79 @@ def fetch(cfg):
 
         return {
             "ok": True, "error": None, "grid": label, "update_time": update,
-            "age_min": round(age_min, 1) if age_min is not None else None,
-            "fetched_ts": time.time(),
-            "now_hour": at(hour0),
-            "next_hour": at(hour0 + timedelta(hours=1)),
+            "age_min": age_min, "fetched_ts": now.timestamp(),
+            "now_hour": outlook[0], "next_hour": outlook[1],
             "hours": hours,
             # for outlook(): the hour of the download and the hours from it on
             "hour0_ts": hour0.timestamp(),
-            "outlook_hours": [at(hour0 + timedelta(hours=k)) for k in range(OUTLOOK_HOURS)],
+            "outlook_hours": outlook,
         }
     except Exception as e:  # noqa: BLE001 — any malformed payload = unavailable
         return {"ok": False, "error": f"malformed forecast payload: {e!r}"}
+
+
+def _issue_problem(result, cfg, now):
+    age = result.get("age_min")
+    if age is None:
+        return "NWS update time missing"
+    fetched = result.get("fetched_ts", now)
+    if age < -2 or now < fetched - 120:
+        return "Forecast timestamp is in the future"
+    if now > fetched + (cfg.NWS_STALE_AFTER_MIN - age) * 60:
+        return "Forecast stale"
+    return None
+
+
+def _hour_index(result, now):
+    return int((now - result["hour0_ts"]) // 3600) if "hour0_ts" in result else 0
+
+
+def _hour_pair(result, now):
+    hours = result.get("outlook_hours")
+    if hours is None:
+        return result["now_hour"], result["next_hour"]
+    k = _hour_index(result, now)
+    return tuple(hours[i] if 0 <= i < len(hours) else {} for i in (k, k + 1))
+
+
+def _coverage_problem(pair):
+    for label, hour in zip(("this hour", "next hour"), pair):
+        if not any(_num(hour.get(key), keep_inf=True) is not None for key in _THRESHOLDED):
+            return "No forecast data for " + label
+    return None
 
 
 def evaluate(result, cfg, now_ts=None):
     """Pure: decide safe + reasons from a fetch() result. 'available' False if none/stale."""
     if now_ts is None:
         now_ts = time.time()
-    if not result or not result.get("ok"):
-        return {"available": False, "safe": True, "reasons": [], "stale": True}
-    # The forecast must RE-AGE: age_min was computed at fetch time and never advanced,
-    # so a silenced poller kept presenting an old forecast as available forever.
-    fetched = result.get("fetched_ts")
-    if fetched is not None and (now_ts - fetched) > 2 * cfg.NWS_POLL_INTERVAL:
-        return {"available": False, "safe": True, "reasons": [], "stale": True}
-    age = result.get("age_min")
-    # negative beyond skew = the forecast is from "the future" = the clock is wrong;
-    # data selected under a wrong clock must not be presented as a current forecast
-    if age is None or age > cfg.NWS_STALE_AFTER_MIN or age < -2.0:
-        return {"available": False, "safe": True, "reasons": [], "stale": True}
+    if not result:
+        why = "Waiting for first forecast"
+    elif not result.get("ok"):
+        why = "Forecast fetch failed"
+    elif now_ts - result.get("fetched_ts", now_ts) > 2 * cfg.NWS_POLL_INTERVAL:
+        why = "No recent forecast download"
+    else:
+        why = _issue_problem(result, cfg, now_ts)
+    if why:
+        return {"available": False, "safe": True, "reasons": [], "stale": True, "why": why}
     checks = (
         ("cloud_cover_pct", cfg.NWS_CLOUD_MAX, "cloud cover"),
         ("precip_prob_pct", cfg.NWS_PRECIP_PROB_MAX, "precip probability"),
         ("thunder_prob_pct", cfg.NWS_THUNDER_PROB_MAX, "thunder probability"),
     )
     reasons = []
-    for label, hour in (("this hour", result["now_hour"]), ("next hour", result["next_hour"])):
+    pair = _hour_pair(result, now_ts)
+    for label, hour in zip(("this hour", "next hour"), pair):
         for key, limit, name in checks:
             v = _num(hour.get(key), keep_inf=True)      # +inf reads 100 %: above every one
             if v is not None and v > limit:
                 reasons.append(f"NWS {name} {v:g}% > {limit:g}% ({label})")
-    return {"available": True, "safe": not reasons, "reasons": reasons, "stale": False}
+    # A missing hour cannot establish a clear two-hour window. A known breach in the
+    # other hour must still veto, even when the window is incomplete.
+    why = _coverage_problem(pair)
+    return {"available": why is None, "safe": not reasons, "reasons": reasons,
+            "stale": False, "why": why}
 
 
 def _safety_view(hour):
@@ -270,8 +304,8 @@ class NwsForecastPoller:
                 self._last_good = res
             self._last_poll_ts = time.time() if now_ts is None else now_ts
         if res.get("ok"):
-            log.info("NWS forecast updated (grid %s, age %s min)",
-                     res.get("grid"), res.get("age_min"))
+            log.info("NWS forecast downloaded (grid %s, NWS update %s)",
+                     res.get("grid"), res.get("update_time"))
         else:
             log.warning("NWS forecast fetch failed: %s", res.get("error"))
         return res
@@ -297,9 +331,7 @@ class NwsForecastPoller:
         """The forecast for the hour that contains `now` and for the hour after it, from
         the last GOOD download — for the dew monitor and the weather log.
 
-        Two differences from component(), whose now_hour / next_hour feed the main
-        monitor: the hours are found by the clock (component() keeps the two hours of the
-        moment of the download), and one failed poll does not blank it — the last good
+        Unlike component(), one failed poll does not blank the outlook. The last good
         download stays in use until it is max_age_s old (default: two poll intervals).
         Anything else — no download yet, too old, a forecast NWS stopped updating, hours
         it does not cover — is "not available", with the reason in 'why'. Each hour is a
@@ -316,7 +348,6 @@ class NwsForecastPoller:
             out["why"] = "no forecast downloaded yet"
             return out
         fetched, hour0 = res.get("fetched_ts"), res.get("hour0_ts")
-        hours = res.get("outlook_hours") or []
         out["update_time"], out["grid"] = res.get("update_time"), res.get("grid")
         if fetched is None or hour0 is None:
             out["why"] = "forecast download has no timestamp"
@@ -326,24 +357,22 @@ class NwsForecastPoller:
         if age > max_age_s or age < -120.0:
             out["why"] = "last good forecast download is %d min old" % round(age / 60.0)
             return out
-        issued = res.get("age_min")         # the forecast's own age when downloaded
-        if issued is None or issued > self.cfg.NWS_STALE_AFTER_MIN or issued < -2.0:
-            out["why"] = "forecast is stale (NWS has not updated it)"
+        pair = _hour_pair(res, now)
+        out["why"] = _issue_problem(res, self.cfg, now) or _coverage_problem(pair)
+        if out["why"]:
             return out
-        k = int((now - hour0) // 3600)
-        if k < 0 or k + 1 >= len(hours):
-            out["why"] = "forecast download does not cover this hour and the next"
-            return out
-        out.update(available=True, this_hour=dict(hours[k]), next_hour=dict(hours[k + 1]))
+        out.update(available=True, this_hour=dict(pair[0]), next_hour=dict(pair[1]))
         return out
 
     def component(self, now=None):
+        if now is None:
+            now = time.time()
         with self._lock:
             res = self._latest
         ev = evaluate(res, self.cfg, now)
         comp = {
             "safe": ev["safe"], "available": ev["available"], "stale": ev["stale"],
-            "reasons": ev["reasons"],
+            "reasons": ev["reasons"], "why": ev["why"],
             # WHY it is unavailable, so the page can say more than "N/A"
             "error": (res or {}).get("error"),
             "source": "NWS api.weather.gov gridpoint forecast",
@@ -354,12 +383,15 @@ class NwsForecastPoller:
             "now_hour": None, "next_hour": None, "hours": [],
         }
         if res and res.get("ok"):
+            idx = max(0, _hour_index(res, now))
+            this_hour, next_hour = _hour_pair(res, now)
+            age = res.get("age_min")
             comp.update({
                 "grid": res.get("grid"), "update_time": res.get("update_time"),
-                "age_min": res.get("age_min"),
-                "now_hour": _safety_view(res["now_hour"]),
-                "next_hour": _safety_view(res["next_hour"]),
-                "hours": res.get("hours", []),
+                "age_min": round(age + (now - res.get("fetched_ts", now)) / 60, 1)
+                if age is not None else None,
+                "now_hour": _safety_view(this_hour), "next_hour": _safety_view(next_hour),
+                "hours": res.get("hours", [])[idx:idx + self.cfg.NWS_RENDER_HOURS],
             })
         return comp
 
@@ -367,7 +399,7 @@ class NwsForecastPoller:
 def unavailable_component(cfg):
     """The component dict when NWS is disabled/absent (does not affect IsSafe)."""
     return {
-        "safe": True, "available": False, "stale": True, "reasons": [],
+        "safe": True, "enabled": False, "available": False, "stale": True, "reasons": [],
         "source": "NWS api.weather.gov gridpoint forecast (disabled)",
         "thresholds": {"cloud_pct": cfg.NWS_CLOUD_MAX,
                        "precip_prob_pct": cfg.NWS_PRECIP_PROB_MAX,

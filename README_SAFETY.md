@@ -16,7 +16,7 @@ address and port:
   software: see [Dew monitor](#dew-monitor-alpaca-device-1). It is off unless
   `TTU_SAFETY_DEW=1`. The daemon also keeps a [weather log](#weather-log) for tuning it.
 
-The status page can also show each dome's roof and power switches as the dome's own
+The status page can also show each dome's roof, rain sensor and power switches as the dome's own
 driver reports them: [Dome status](#dome-status-display-only), display only and off until
 a dome key is set.
 
@@ -313,7 +313,7 @@ one, compare the logged `fc_cloud_pct` with the 30 % limit.
 
 ## Dome status (display only)
 
-The status page can show each dome's roof and power switches, as the dome's own driver
+The status page can show each dome's roof, rain sensor and power switches, as the dome's own driver
 reports them. It is **off unless a dome key is set**: with no `TTU_SAFETY_DOME<n>_KEY` the
 daemon has no route for reports, its state has no `domes` key, and the status page,
 `/setup` and `/status` are exactly what they are without this feature. **It is never an
@@ -336,7 +336,7 @@ POST /domes/v1/report
 Authorization: Bearer KEY-OF-THIS-DOME
 Content-Type: application/json
 
-{"shutter": "closed", "current": true,
+{"shutter": "closed", "current": true, "rain_wet": false,
  "switches": [{"name": "Mount power", "on": true}, {"name": "Light", "on": false}],
  "source": "merlino-dome 0.4.3"}
 ```
@@ -345,6 +345,7 @@ Content-Type: application/json
 |---|---|---|
 | `shutter` | yes | `open`, `closed`, `opening`, `closing`, `moving` (motion whose direction the sender does not know), `error` or `unknown` |
 | `current` | yes | `false`: the sender itself has no current reading from its hardware; the whole dome is then shown as unknown |
+| `rain_wet` | no | filtered board reading: `true` (WET), `false` (DRY), or `null` (UNKNOWN). Older senders omit it. |
 | `switches` | no | at most 16 objects; `name` a non-empty string, `on` `true`, `false` or `null` (unknown) |
 | `source` | no | the sender and its version |
 
@@ -372,6 +373,9 @@ expected dome: the roof state in capitals (`OPEN`, `CLOSED`, `OPENING`, `CLOSING
 daemon's state file is stale read `UNKNOWN`, never the last known state. No green and no
 red: neither a roof state nor a power state is a verdict. `UNKNOWN`, `ERROR` and a switch
 from the warn list that is on (`Light ON`: a light left on) are in the warning colour.
+
+The rain sensor reading appears beside the switches, even when no switches are selected.
+A dew override can leave the sensor reading WET. Missing or expired readings show UNKNOWN.
 
 **Which switches.** `TTU_SAFETY_DOME_SWITCHES` lists the switches shown, by the names the
 dome reports, each optionally with a label: `"Mount power=Mount,CCD power=CCD,Light"`.
@@ -750,7 +754,7 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_NWS_UA` | `ttu-safety-monitor` | User-Agent of the NWS, IEM radar, hazard-feed and map-tile requests (WU, GLM and the connectivity probe send their own). **Absolutely crucial: put a REAL e-mail address in it**: `ttu-safety-monitor (+https://github.com/kirxkirx/ttustatus; you@example.org)` with `you@example.org` replaced by your own address (double-quoted in `ttustatus.env`). OpenStreetMap blocks a placeholder like `you@example.org` — the daemon then requests no OSM tiles, and a map with no CARTO basemap (cached or keyed) has no basemap — and NWS asks for a contact. The default names the app but has no contact (warned at startup, and on the page when OSM is used) |
 | `TTU_SAFETY_NWS_GRID` | (auto) | e.g. `LUB/46,41`; skips the `/points` lookup |
 | `TTU_SAFETY_NWS_POLL_INTERVAL` | `900` | seconds between NWS forecast pulls (15 min; 300-3600) |
-| `TTU_SAFETY_NWS_STALE_MIN` | `150` | a forecast NWS has not updated for this many minutes is unavailable (30-1440) |
+| `TTU_SAFETY_NWS_STALE_MIN` | `720` | maximum age of the NWS issue time in minutes, inclusive (12 hours by default, configurable from 30 to 1440 minutes) |
 | `TTU_SAFETY_NWS_CLOUD_MAX` / `_PRECIP_MAX` / `_THUNDER_MAX` | `60` / `20` / `15` | % thresholds (unsafe when exceeded, this or next hour; 0-100, and 100 never trips) |
 | `TTU_SAFETY_GLM` | `1` | enable the GLM lightning component (`0`/`off`/`false`/`no`/`disabled` disables; another word is reported at startup and leaves it on) |
 | `TTU_SAFETY_GLM_TRIGGER_KM` | `50` | flash within this radius → UNSAFE (1-20000) |
@@ -1170,7 +1174,12 @@ gridpoint URL that `/points` names is followed only when it starts with
 `https://api.weather.gov/gridpoints/`, and every reply is read whole within 60 s and 4 MB.
 Both the daemon's
 `/setup` page and the observatory status page show the inputs, the conclusion, and (on the
-observatory page) a 12-hour forecast table with a source note.
+observatory page) a 12-hour forecast table with the NWS update time in the site's local zone.
+The table starts at the current hour. The raw grid can span several days, and the daemon
+selects this hour and next by their validity times on every evaluation. Both hours need
+forecast data for the tile to show a complete window. A known threshold breach in either
+hour still counts if the other hour is missing. The default issue-age limit is 12 hours
+for both monitors. Download freshness is checked separately.
 
 ### NWS alerts component (the hazard veto)
 

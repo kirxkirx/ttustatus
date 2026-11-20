@@ -98,7 +98,8 @@ def test_the_scheme_is_matched_without_regard_to_case(rig):
     (report(shutter="ajar"), "shutter"), (report(current="true"), "current"),
     (report(switches="Mount"), "switches"),
     (report(switches=[{"name": "Mount"}]), "switches[0].on"),
-    (report(source=["x"]), "source"),
+    (report(source=["x"]), "source"), (report(rain_wet=1), "rain_wet"),
+    (report(rain_wet="false"), "rain_wet"),
 ])
 def test_a_malformed_report_is_400_naming_the_field(rig, data, field):
     r = post(rig, data)
@@ -116,6 +117,20 @@ def test_the_key_of_dome_2_updates_dome_2_only(rig):
     west, east = rig["monitor"].evaluate()["domes"]["domes"]
     assert east["shutter"] == "open" and east["known"] is True
     assert west["known"] is False
+
+
+def test_each_domes_rain_reading_tracks_its_latest_report(rig):
+    for key, wet in ((KEY1, True), (KEY2, False)):
+        assert post(rig, report(rain_wet=wet), key=key).status_code == 200
+
+    def readings():
+        state = rig["client"].get("/status").get_json()
+        return [d["rain_wet"] for d in state["domes"]["domes"]]
+
+    assert readings() == [True, False]
+    assert post(rig, report(), key=KEY1).status_code == 200   # legacy sender
+    assert post(rig, report(rain_wet=None), key=KEY2).status_code == 200
+    assert readings() == [None, None]
 
 
 def test_the_route_never_evaluates(rig, monkeypatch):

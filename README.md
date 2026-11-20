@@ -66,7 +66,7 @@ The exact rule of each device is in README_SAFETY.md: "Safety logic" for device 
 
 ## Dome status (optional)
 
-If each dome's own driver reports its roof and power switches (merlino-dome does), the
+If each dome's own driver reports its roof, rain sensor and power switches (merlino-dome does), the
 status page shows one tile per dome, with a switch such as a light left on shown in the
 warning colour. It is display only, never an input of either `IsSafe`, and off until a
 `TTU_SAFETY_DOME<n>_KEY` is set: without one the page is exactly as it is without the

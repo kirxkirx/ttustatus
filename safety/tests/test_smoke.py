@@ -77,7 +77,7 @@ def test_nws_forecast_section_and_tile_render():
             "nws": nws}
     comp["connectivity"] = {"probed": True, "online": False, "safe": False, "offline_min": 75}
     tiles = msp.build_safety_tiles_html(comp)
-    assert "NWS (now/next)" in tiles                   # relabelled tile
+    assert "NWS hourly forecast" in tiles and "Last updated" in tiles
     assert "C85%/P20%/T0%" in tiles and "C90%/P30%/T5%" in tiles   # both hours packed
     assert "no&nbsp;rain" in tiles                     # rain wording fixed
     assert "Lightning (GLM" in tiles                   # GLM tile present (off by default here)
@@ -87,6 +87,17 @@ def test_nws_forecast_section_and_tile_render():
     assert "mph" in fc                                 # wind column present
     # no forecast data -> section omitted, no crash
     assert msp.build_forecast_html({"components": {"nws": {"hours": []}}}) == ""
+
+
+def test_nws_tile_distinguishes_an_old_issue_from_a_failed_download(monkeypatch):
+    monkeypatch.setenv("TTU_SAFETY_LOCAL_TZ", "America/Chicago")
+    stale = {"available": False, "why": "Forecast stale", "update_time": "2026-11-19T23:45:15Z"}
+    page = msp.build_safety_tiles_html({"nws": stale})
+    assert "Forecast stale" in page and "Last updated Thu 17:45 CST" in page
+    error = {"available": False, "why": "Forecast fetch failed", "error": "HTTP 503 <error>"}
+    page = msp.build_safety_tiles_html({"nws": error})
+    assert "Forecast fetch failed" in page and "HTTP 503 &lt;error&gt;" in page
+    assert "Last updated" not in page
 
 
 def test_radar_section_renders():

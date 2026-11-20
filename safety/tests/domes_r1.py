@@ -2,7 +2,8 @@
 byte for byte what they were before the dome code existed.
 
 The expected outputs in fixtures/domes_r1/ were rendered by THIS module from the code as
-it stood before the dome change (ttustatus 7516afb), from three fixed daemon states:
+it stood before the dome change (ttustatus 7516afb), with subsequent NWS forecast display
+changes applied to that baseline, from three fixed daemon states:
   a: a real evaluation, dew monitor and weather log on (SAFE)
   b: UNSAFE, with reasons and warnings, dew monitor off, no weather log
   c: an old daemon's minimal state, two hours stale (the page only: /setup always shows

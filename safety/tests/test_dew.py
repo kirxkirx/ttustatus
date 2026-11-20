@@ -1090,7 +1090,7 @@ def test_outlook_unavailable_cases(monkeypatch):
     poller, _ = _poller(monkeypatch, age_min=config.NWS_STALE_AFTER_MIN + 1)
     assert "stale" in poller.outlook(NOW + 10, 2400)["why"]
     poller, _ = _poller(monkeypatch, age_min=-3.0)        # "issued" after it was fetched
-    assert "stale" in poller.outlook(NOW + 10, 2400)["why"]
+    assert "future" in poller.outlook(NOW + 10, 2400)["why"]
     poller, _ = _poller(monkeypatch)
     assert poller.outlook(NOW - 7200, 1e9)["available"] is False    # before its first hour
     # a download dated more than two minutes AHEAD of the clock (same hour) is not used

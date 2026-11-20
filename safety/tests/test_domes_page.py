@@ -44,9 +44,9 @@ def sw(label, on, known=True, warn=False):
 
 
 def dome(n=1, name="Dome 1 (west)", shutter="closed", known=True, age_s=12, why=None,
-         switches=None):
+         switches=None, rain_wet=None):
     return {"n": n, "name": name, "shutter": shutter, "known": known, "age_s": age_s,
-            "why": why, "source": "merlino-dome 0.4.3",
+            "rain_wet": rain_wet, "why": why, "source": "merlino-dome 0.4.3",
             "switches": [sw("Mount", True), sw("CCD", False), sw("Light", False)]
             if switches is None else switches}
 
@@ -101,7 +101,7 @@ def test_report_expiry_is_rechecked_when_rendering(monkeypatch, limit, report_ag
                                                    state_age, expired):
     now = 1_800_000_000.0
     monkeypatch.setattr(msp.time, "time", lambda: now)
-    st = state(dome(shutter="open", age_s=report_age,
+    st = state(dome(shutter="open", age_s=report_age, rain_wet=True,
                     switches=[sw("Mount", True), sw("CCD", False),
                               sw("Light", True, warn=True)]),
                dome(2, "Dome 2 (east)", "closed", age_s=0), ts=now - state_age)
@@ -114,9 +114,11 @@ def test_report_expiry_is_rechecked_when_rendering(monkeypatch, limit, report_ag
         for label in ("Mount", "CCD", "Light"):
             assert msp._DOME_DOT_UNKNOWN + label + " ?" in west
         assert "Light ON" not in west
+        assert "Rain sensor UNKNOWN" in west and "Rain sensor WET" not in west
     else:
         assert ">OPEN</div>" in west and "reported " in west
         assert msp._DOME_DOT_ON + "Mount on" in west and "Light ON" in west
+        assert "Rain sensor WET" in west
     # Expiring one dome does not hide another dome's fresh report.
     assert ">CLOSED</div>" in tile(page, "Dome 2 (east)")
 
@@ -195,9 +197,10 @@ def test_no_green_and_no_red_in_the_card():
         assert GREEN not in page and RED not in page and "var(--good" not in page
 
 
-def test_no_switch_line_when_no_switch_is_shown():
-    t = tile(msp.build_domes_html(state(dome(switches=[]))), "Dome 1 (west)")
-    assert t.count('<div class="s">') == 1
+@pytest.mark.parametrize("wet,expected", [(True, "WET"), (False, "DRY"), (None, "UNKNOWN")])
+def test_rain_is_shown_even_without_switches(wet, expected):
+    t = tile(msp.build_domes_html(state(dome(switches=[], rain_wet=wet))), "Dome 1 (west)")
+    assert "Rain sensor " + expected in t
 
 
 def test_the_card_sits_right_after_the_safety_card(tmp_path, monkeypatch):
@@ -226,7 +229,7 @@ class _Store:
 
 def test_setup_lists_the_domes_and_the_refused_count():
     st = copy.deepcopy(domes_r1.load_state("a"))
-    st["domes"] = state(dome(switches=[sw("Mount", True), sw("Light", True, warn=True)]),
+    st["domes"] = state(dome(rain_wet=False, switches=[sw("Mount", True), sw("Light", True, warn=True)]),
                         dome(2, "Dome 2 (east)", "unknown", False, None, "no report yet",
                              []))["domes"]
     mon = domes_r1.FixedMonitor(st)
@@ -236,6 +239,7 @@ def test_setup_lists_the_domes_and_the_refused_count():
     assert "Dome 1 (west)" in part and "<b>CLOSED</b> · reported 12 s ago" in part
     assert "Mount on · Light ON (should be off)" in part and "merlino-dome 0.4.3" in part
     assert "Dome 2 (east)" in part and "<b>UNKNOWN</b> · no report received yet" in part
+    assert "Rain sensor DRY" in part and "Rain sensor UNKNOWN" in part
     assert "refused for their key since the daemon started: 3." in part
     assert "/domes/v1/report" in part
 

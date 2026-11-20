@@ -148,7 +148,7 @@ def body(**kw):
 
 def test_a_valid_report_and_unknown_keys():
     r = parse_report(body(extra={"x": 1}, battery_v=12.9))
-    assert r == {"shutter": "closed", "current": True,
+    assert r == {"shutter": "closed", "current": True, "rain_wet": None,
                  "switches": [("Mount power", True), ("Light", False)],
                  "source": "merlino-dome 0.4.3"}
     r = parse_report(json.dumps({"shutter": "open", "current": False}).encode())
@@ -210,7 +210,7 @@ def test_every_configured_dome_is_listed_before_its_first_report():
     assert comp["enabled"] is True and comp["stale_after_s"] == 120 and comp["error"] is None
     west, east = comp["domes"]
     assert west == {"n": 1, "name": "Dome 1 (west)", "shutter": "unknown", "known": False,
-                    "age_s": None, "why": "no report yet", "source": None,
+                    "rain_wet": None, "age_s": None, "why": "no report yet", "source": None,
                     "switches": [{"label": "Mount", "on": None, "known": False, "warn": False},
                                  {"label": "CCD", "on": None, "known": False, "warn": False},
                                  {"label": "Light", "on": None, "known": False,
@@ -246,19 +246,22 @@ def test_the_key_of_dome_2_updates_dome_2_and_nothing_else():
 
 def test_not_current_stale_null_and_missing_switches_are_unknown():
     store = DomeStore(Cfg(WEST, stale=120))
-    store.accept(WEST, parse_report(body(current=False)), mono=0.0)
+    store.accept(WEST, parse_report(body(current=False, rain_wet=True)), mono=0.0)
     d = by_n(store.component(mono=1.0))[1]
     assert (d["known"], d["why"], d["shutter"]) == (False, "not current", "unknown")
+    assert d["rain_wet"] is None
     assert all(s["known"] is False and s["on"] is None for s in d["switches"])
-    store.accept(WEST, parse_report(body(switches=[{"name": "Mount power", "on": None}])),
+    store.accept(WEST, parse_report(body(rain_wet=True, switches=[{"name": "Mount power", "on": None}])),
                  mono=10.0)
     d = by_n(store.component(mono=11.0))[1]
     assert d["known"] is True
+    assert d["rain_wet"] is True
     assert d["switches"][0] == {"label": "Mount", "on": None, "known": False, "warn": False}
     assert d["switches"][2]["known"] is False         # Light: not in this report at all
     # staleness by the monotonic clock alone
     d = by_n(store.component(mono=10.0 + 120.5))[1]
     assert (d["known"], d["why"], d["shutter"], d["age_s"]) == (False, "stale", "unknown", 120)
+    assert d["rain_wet"] is None
     # a later report replaces the earlier one
     store.accept(WEST, parse_report(body(shutter="opening")), mono=200.0)
     d = by_n(store.component(mono=201.0))[1]
@@ -475,6 +478,9 @@ def test_r8_identical_reports_write_no_state_beyond_the_heartbeat(env, monkeypat
     mon.domes.accept(WEST, parse_report(body(shutter="opening")))
     mon.evaluate()
     assert len(writes) == n + 1        # a change is written at once
+    mon.domes.accept(WEST, parse_report(body(shutter="opening", rain_wet=True)))
+    mon.evaluate()
+    assert len(writes) == n + 2        # rain alone updates the page snapshot too
 
 
 def test_the_daemon_builds_the_store_only_with_a_dome(daemon, monkeypatch, caplog):  # noqa: F811

@@ -230,7 +230,7 @@ NWS_GRID = _env_str("TTU_SAFETY_NWS_GRID", "")   # e.g. "LUB/46,41"; empty => re
 NWS_POLL_INTERVAL = _clamp("TTU_SAFETY_NWS_POLL_INTERVAL",
                            _env_int("TTU_SAFETY_NWS_POLL_INTERVAL", 900), 300, 3600)
 NWS_STALE_AFTER_MIN = _clamp("TTU_SAFETY_NWS_STALE_MIN",
-                             _env_int("TTU_SAFETY_NWS_STALE_MIN", 150), 30, 1440)
+                             _env_int("TTU_SAFETY_NWS_STALE_MIN", 720), 30, 1440)
 # % ; unsafe when > (0-100: 100 never trips, so it switches that check off)
 NWS_CLOUD_MAX = _clamp("TTU_SAFETY_NWS_CLOUD_MAX",
                        _env_float("TTU_SAFETY_NWS_CLOUD_MAX", 60.0), 0.0, 100.0)
@@ -925,7 +925,7 @@ DEW_GLM_MIN_GRANULES = _clamp(
     _env_int("TTU_SAFETY_DEW_GLM_MIN_GRANULES", max(1, 2 * GLM_WINDOW_MIN)), 1, 100000)
 
 # --- dome status display (DISPLAY ONLY: safety/domes.py) ------------------------------
-# Each dome's own driver may POST a small status report (roof state, power switches) to
+# Each dome's own driver may POST a small status report (roof state, rain sensor, power switches) to
 # /domes/v1/report, and the status page shows one tile per dome. It is NOT an input of
 # either IsSafe. A dome is expected exactly when its key is set, TTU_SAFETY_DOME<n>_KEY
 # for n = 1 to DOME_MAX: domes are never learned from the reports that arrive (a dome PC

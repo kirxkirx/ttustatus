@@ -27,9 +27,10 @@ from astropy.coordinates import AltAz
 from astropy.coordinates import get_sun
 from astropy.utils import iers
 
-# Two stdlib-only helpers of the daemon's package (the page runs from the repository's
+# Stdlib-only helpers of the daemon's package (the page runs from the repository's
 # directory, beside safety/): ISO times read alike on every Python, and the text scrub
 # that makes any feed text writable as UTF-8 and free of control / bidi characters.
+from safety.domes import rain_sensor_text
 from safety.isotime import parse_iso
 from safety.textclean import clean_text
 
@@ -2849,17 +2850,23 @@ def build_safety_tiles_html(comp, state_stale=False):
         return "C%s%%/P%s%%/T%s%%" % (g("cloud_cover_pct"), g("precip_prob_pct"),
                                       g("thunder_prob_pct"))
 
+    updated = _hz_local(_hz_iso_ts(nws.get("update_time")))
     if not nws.get("available"):
-        nws_v = '<div class="v mono" style="font-size:15px">N/A</div>'
         err = nws.get("error")
-        why = (" (%s)" % html.escape(str(err)[:60])) if err else ""
-        nws_s = safety_dot_html(True, unknown=True) + "forecast unavailable" + why
+        why = nws.get("why") or ("Forecast disabled" if nws.get("enabled") is False
+                                 else "Forecast unavailable")
+        nws_v = '<div class="v mono" style="font-size:15px">%s</div>' % html.escape(why)
+        safe = nws.get("safe", True)
+        dot = safety_dot_html(safe, unknown=safe)
+        detail = html.escape(str(err or " · ".join(nws.get("reasons") or []))[:160])
     else:
+        values = _cpt(nws.get("now_hour")), _cpt(nws.get("next_hour"))
         nws_v = ('<div class="v mono" style="font-size:13px;line-height:1.4">'
-                 'now %s<br>nxt %s</div>' % (_cpt(nws.get("now_hour")),
-                                             _cpt(nws.get("next_hour"))))
-        nws_s = (safety_dot_html(bool(nws.get("safe")))
-                 + "Cloud &middot; Precip &middot; Thunder")
+                 'This hour %s<br>Next hour %s</div>' % values)
+        dot = safety_dot_html(bool(nws.get("safe")))
+        detail = "Cloud &middot; Precip &middot; Thunder"
+    last_update = "Last updated " + html.escape(updated) if updated else ""
+    nws_s = dot + "<br>".join(line for line in (detail, last_update) if line)
 
     glm = comp.get("glm") or {}
     glm_tk = glm.get("trigger_km", 50)
@@ -2900,7 +2907,7 @@ def build_safety_tiles_html(comp, state_stale=False):
     tile = ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>\n    </div>\n')
     items = [("Sun altitude", sun_v, sun_s), ("Humidity", hum_v, hum_s),
-             ("Rain (WU)", rain_v, rain_s), ("NWS (now/next)", nws_v, nws_s),
+             ("Rain (WU)", rain_v, rain_s), ("NWS hourly forecast", nws_v, nws_s),
              ("Lightning (GLM)", glm_v, glm_s)]
     hz_tile = _hazards_tile(comp.get("hazards"))
     if hz_tile is not None:           # absent = a daemon older than this page: no tile
@@ -4127,11 +4134,10 @@ def build_forecast_html(state):
             wind(hr)))
     pre = html.escape("\n".join(lines))
     grid = html.escape(str(nws.get("grid") or "?"))
-    upd = html.escape(str(nws.get("update_time") or "?"))
+    upd = html.escape(_hz_local(_hz_iso_ts(nws.get("update_time"))) or "?")
     blurb = (
         "Source: <b>NWS</b> (US National Weather Service) gridpoint forecast for grid %s "
-        "via api.weather.gov &mdash; free, no key, model-blended (HRRR near-term / GFS), "
-        "updated about hourly (last %s UTC). Cloud cover, precipitation probability and "
+        "via api.weather.gov. Last updated %s. Cloud cover, precipitation probability and "
         "thunder probability for <b>this hour and next</b> drive the safety monitor's "
         "pre-emptive check; the full table here is for reference." % (grid, upd)
     )
@@ -4383,10 +4389,9 @@ def _dome_tile_html(d, stale, state_age, stale_after_s):
     value = ('<div class="v" style="color:var(--warn)">%s</div>' if roof in ("UNKNOWN", "ERROR")
              else '<div class="v">%s</div>') % roof
     switches = [s for s in d.get("switches") or [] if isinstance(s, dict)]
-    sw = ""
-    if switches:
-        sw = ('\n      <div class="s">%s</div>'
-              % " &middot; ".join(_dome_switch_html(s, known) for s in switches))
+    readings = [_dome_switch_html(s, known) for s in switches]
+    readings.append(rain_sensor_text(d.get("rain_wet") if known else None))
+    sw = '\n      <div class="s">%s</div>' % " &middot; ".join(readings)
     return ('    <div class="tile">\n      <div class="k">%s</div>\n      %s\n'
             '      <div class="s">%s</div>%s\n    </div>\n'
             % (html.escape(str(d.get("name") or "Dome %s" % d.get("n"))), value,

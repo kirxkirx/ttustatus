@@ -1,6 +1,6 @@
 """Dome status reports: DISPLAY ONLY.
 
-Each dome's own driver POSTs its status (roof state, power switches) to /domes/v1/report
+Each dome's own driver POSTs its status (roof state, rain sensor, power switches) to /domes/v1/report
 with its own key (README_SAFETY.md, "Dome status"); the dome PCs sit behind NAT, so they
 report and nothing here ever connects to them. This module checks a report against the
 format, keeps the latest accepted report of each CONFIGURED dome in memory, and turns
@@ -9,11 +9,11 @@ dome. Nothing here is an input of either IsSafe: SafetyMonitor publishes the blo
 `dew`, not inside `components`, and its decision never reads it (tests pin this). Nothing
 is written to a file (no SD-card wear) and nothing goes to the event log.
 
-The report (the contract with every sender; a change to it is a new path):
+The report (unknown fields are ignored so v1 can gain optional readings):
     POST /domes/v1/report
     Authorization: Bearer KEY-OF-THIS-DOME
     Content-Type: application/json
-    {"shutter": "closed", "current": true,
+    {"shutter": "closed", "current": true, "rain_wet": false,
      "switches": [{"name": "Mount power", "on": true}, ...],
      "source": "merlino-dome 0.4.3"}
 """
@@ -50,7 +50,7 @@ def _no_constants(name):
 
 
 def parse_report(body: bytes) -> dict:
-    """The report in `body` as {"shutter", "current", "switches": [(name, on)], "source"},
+    """The report in `body` as {"shutter", "current", "rain_wet", "switches": [(name, on)], "source"},
     texts cleaned and cut; ReportError naming the field otherwise. Keys not in the format
     are ignored, so the format can grow."""
     try:
@@ -67,6 +67,9 @@ def parse_report(body: bytes) -> dict:
     current = obj.get("current")
     if not isinstance(current, bool):
         raise ReportError("current: must be true or false")
+    rain_wet = obj.get("rain_wet")  # older senders omit this reading
+    if rain_wet is not None and not isinstance(rain_wet, bool):
+        raise ReportError("rain_wet: must be true, false or null")
     switches = obj.get("switches", [])
     if not isinstance(switches, list):
         raise ReportError("switches: must be a list")
@@ -88,7 +91,8 @@ def parse_report(body: bytes) -> dict:
     if source is not None and not isinstance(source, str):
         raise ReportError("source: must be a string")
     source = clean_text(source or "").strip()[:SOURCE_MAX].strip() or None
-    return {"shutter": shutter, "current": current, "switches": parsed, "source": source}
+    return {"shutter": shutter, "current": current, "rain_wet": rain_wet,
+            "switches": parsed, "source": source}
 
 
 def unavailable_component(cfg, error) -> dict:
@@ -97,8 +101,16 @@ def unavailable_component(cfg, error) -> dict:
     return {"enabled": True, "stale_after_s": int(cfg.DOME_STALE_SEC),
             "error": str(error)[:200],
             "domes": [{"n": d.n, "name": d.name, "shutter": "unknown", "known": False,
-                       "age_s": None, "why": ERROR, "source": None, "switches": []}
+                       "rain_wet": None, "age_s": None, "why": ERROR, "source": None, "switches": []}
                       for d in cfg.DOMES]}
+
+
+def rain_sensor_text(rain_wet) -> str:
+    if rain_wet is True:
+        return "Rain sensor WET"
+    if rain_wet is False:
+        return "Rain sensor DRY"
+    return "Rain sensor UNKNOWN"
 
 
 def _shown_switches(dome, report, known, show_all_max) -> dict:
@@ -248,6 +260,7 @@ class DomeStore:
                 "n": dome.n, "name": dome.name,
                 "shutter": report["shutter"] if known else "unknown",
                 "known": known,
+                "rain_wet": report["rain_wet"] if known else None,
                 "age_s": None if age is None else int(age),
                 "why": why,
                 "source": report["source"] if report else None,

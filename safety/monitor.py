@@ -1488,11 +1488,11 @@ class SafetyMonitor:
         dew = state.get("dew") or {}
         extra = {}
         if isinstance(state.get("domes"), dict):
-            # what the Domes card shows (roof, known/why, switch values; not the ages):
+            # what the Domes card shows (roof, rain, known/why, switch values; not the ages):
             # a change is written at the next evaluation, an unchanged report writes nothing
             dm = state["domes"]
             extra["domes"] = [dm.get("error")] + [
-                (d.get("n"), d.get("shutter"), d.get("known"), d.get("why"),
+                (d.get("n"), d.get("shutter"), d.get("rain_wet"), d.get("known"), d.get("why"),
                  [(s.get("label"), s.get("on"), s.get("known"))
                   for s in d.get("switches") or [] if isinstance(s, dict)])
                 for d in dm.get("domes") or [] if isinstance(d, dict)]

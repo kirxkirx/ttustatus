@@ -307,9 +307,12 @@ def _setup_html(monitor, cfg) -> str:
     if nws:
         if not nws.get("available"):
             err = nws.get("error")
-            nv = "unavailable / stale (not gating)" + (
-                " — %s" % str(err)[:60] if err else "")
-            nws_unknown = True
+            nv = nws.get("why") or ("Forecast disabled" if nws.get("enabled") is False
+                                    else "Forecast unavailable")
+            detail = err or " | ".join(nws.get("reasons") or [])
+            if detail:
+                nv += " — " + str(detail)[:160]
+            nws_unknown = nws.get("safe", True)
         else:
             nws_unknown = False
             th = nws.get("thresholds", {})
@@ -617,7 +620,7 @@ def _domes_html(dm, store) -> str:
             when = "no report for %s" % _dome_age(age)
         else:
             when = _DOME_WHY_TEXT.get(d.get("why"), "no current report")
-        switches = []
+        readings = []
         for s in d.get("switches") or []:
             if not isinstance(s, dict):
                 continue
@@ -625,12 +628,14 @@ def _domes_html(dm, store) -> str:
             value = "?" if not known else ("on" if s["on"] else "off")
             if known and s["on"] and s.get("warn") is True:
                 value = "ON (should be off)"
-            switches.append("%s %s" % (_txt(s.get("label"), 40), value))
+            readings.append("%s %s" % (_txt(s.get("label"), 40), value))
+        readings.append(domes_mod.rain_sensor_text(d.get("rain_wet") if d.get("known") is True
+                                                   else None))
         rows.append("<tr><td>%s</td><td><b>%s</b> · %s</td><td>%s</td><td>%s</td></tr>" % (
             html.escape(_txt(d.get("name"), 40)),
             html.escape(_txt(d.get("shutter") if d.get("known") is True else "unknown",
                              20).upper()),
-            html.escape(when), html.escape(" · ".join(switches) or "no switch shown"),
+            html.escape(when), html.escape(" · ".join(readings)),
             html.escape(_txt(d.get("source"), 60) or "sender not named")))
     refused = store.refused_count if store is not None else None
     stale = dm.get("stale_after_s")
