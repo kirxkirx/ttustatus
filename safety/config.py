@@ -851,13 +851,16 @@ DEW_ENABLED = _env_flag("TTU_SAFETY_DEW", False)
 DEW_DEVICE_NUMBER = 1
 DEW_SERVER_NAME = _env_str("TTU_SAFETY_DEW_NAME", "TTU Dew Monitor")
 DEW_UNIQUE_ID = "ttu-dewmonitor-1-5c81d2e4"     # stable per-device id for Alpaca
+# The limits are the owner's, still being checked against the weather log (which records
+# the domes' roofs and rain sensors for that). Since 23 November 2026: spread 4 degC, wind
+# 5 mph (calm until above 6), cloud below 50 %. Before: 5 degC, 8 mph (9), 30 %.
 DEW_SPREAD_MAX_C = _clamp("TTU_SAFETY_DEW_SPREAD_MAX_C",
-                          _env_float("TTU_SAFETY_DEW_SPREAD_MAX_C", 5.0), 0.0, 50.0)
+                          _env_float("TTU_SAFETY_DEW_SPREAD_MAX_C", 4.0), 0.0, 50.0)
 DEW_WIND_MAX_MPH = _clamp("TTU_SAFETY_DEW_WIND_MAX_MPH",
-                          _env_float("TTU_SAFETY_DEW_WIND_MAX_MPH", 8.0), 0.0, 200.0)
+                          _env_float("TTU_SAFETY_DEW_WIND_MAX_MPH", 5.0), 0.0, 200.0)
 DEW_WIND_UNSAFE_ABOVE_MPH = _clamp(
     "TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH",
-    _env_float("TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH", 9.0), 0.0, 200.0)
+    _env_float("TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH", 6.0), 0.0, 200.0)
 if DEW_WIND_UNSAFE_ABOVE_MPH < DEW_WIND_MAX_MPH:
     CONFIG_WARNINGS.append(
         f"TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH={DEW_WIND_UNSAFE_ABOVE_MPH:g} is below "
@@ -865,7 +868,7 @@ if DEW_WIND_UNSAFE_ABOVE_MPH < DEW_WIND_MAX_MPH:
         "for both (no dead band)")
     DEW_WIND_UNSAFE_ABOVE_MPH = DEW_WIND_MAX_MPH
 DEW_CLOUD_BELOW_PCT = _clamp("TTU_SAFETY_DEW_CLOUD_BELOW_PCT",
-                             _env_float("TTU_SAFETY_DEW_CLOUD_BELOW_PCT", 30.0), 0.0, 101.0)
+                             _env_float("TTU_SAFETY_DEW_CLOUD_BELOW_PCT", 50.0), 0.0, 101.0)
 DEW_PRECIP_BELOW_PCT = _clamp("TTU_SAFETY_DEW_PRECIP_BELOW_PCT",
                               _env_float("TTU_SAFETY_DEW_PRECIP_BELOW_PCT", 5.0), 0.0, 101.0)
 # Fewer stations with a usable reading than this = no data = rain sensor trusted.
@@ -933,6 +936,8 @@ DEW_GLM_MIN_GRANULES = _clamp(
 # With no key set there is no route, no `domes` key in the state and no card: the page is
 # byte for byte what it is without this code. The key is a SECRET: it is never logged,
 # shown or quoted in a warning (the _env_* helpers quote values, so it has its own parser).
+# The weather log records each expected dome's roof state and rain sensor reading (two
+# columns per dome, so none without a dome): what to hold the dew monitor's limits against.
 DOME_MAX = 8
 DOME_KEY_MIN, DOME_KEY_MAX = 16, 128
 DOME_NAME_MAX = 40              # a dome's label on the page
@@ -1104,7 +1109,8 @@ DOME_STALE_SEC = _clamp("TTU_SAFETY_DOME_STALE_SEC",
 
 # --- weather log -------------------------------------------------------------
 # What the daemon already knows (station medians, forecast, radar, enclosure sensor, both
-# monitors' verdicts) as CSV rows — the data for tuning the dew monitor. SD-CARD WEAR
+# monitors' verdicts, each configured dome's roof state and rain sensor reading) as CSV
+# rows — the data for tuning the dew monitor. SD-CARD WEAR
 # comes first: rows are appended to files in RAM (WEATHER_LOG_RAM_DIR, /dev/shm) and
 # copied to the SD card in ONE append per file once every WEATHER_LOG_FLUSH_HOURS, in
 # daytime only (sun above WEATHER_LOG_FLUSH_SUN_ABOVE_DEG; with the sun's altitude
@@ -1116,7 +1122,8 @@ WEATHER_LOG_ENABLED = _env_flag("TTU_SAFETY_WEATHER_LOG", True)
 # the not-yet-archived RAM files.
 WEATHER_LOG_DIR = _env_str("TTU_SAFETY_WEATHER_LOG_DIR", "/var/www/html/weather_log")
 WEATHER_LOG_RAM_DIR = _env_str("TTU_SAFETY_WEATHER_LOG_RAM_DIR", _SHM + "/ttu_weather_log")
-# One summary row this often, plus one whenever either monitor's verdict changes.
+# One summary row this often, plus one whenever either monitor's verdict changes or a
+# dome's roof state or rain sensor reading does.
 WEATHER_LOG_INTERVAL_SEC = _clamp("TTU_SAFETY_WEATHER_LOG_INTERVAL",
                                   _env_int("TTU_SAFETY_WEATHER_LOG_INTERVAL", 300), 30)
 # One row per WU station per WU poll (night only: that is when WU is polled).

@@ -18,7 +18,8 @@ address and port:
 
 The status page can also show each dome's roof, rain sensor and power switches as the dome's own
 driver reports them: [Dome status](#dome-status-display-only), display only and off until
-a dome key is set.
+a dome key is set. Each dome's roof state and rain sensor reading also go into the
+weather log.
 
 ## Architecture (two cooperating processes)
 
@@ -191,9 +192,9 @@ trusting the rain sensor (dew closes the roof again).
 | Check | Limit | Data |
 |---|---|---|
 | The main monitor | device 0 is SAFE | this daemon (every rain, lightning, radar, forecast and daylight check above) |
-| Dew-point spread (air temperature minus dew point) | **at most 5 °C** | median of the WU stations |
-| Wind speed | calm: **at most 8 mph**, and it stays "calm" until the wind is **above 9 mph** | median of the WU stations |
-| Forecast cloud cover | **below 30 %**, this hour and the next | NWS gridpoint forecast |
+| Dew-point spread (air temperature minus dew point) | **at most 4 °C** | median of the WU stations |
+| Wind speed | calm: **at most 5 mph**, and it stays "calm" until the wind is **above 6 mph** | median of the WU stations |
+| Forecast cloud cover | **below 50 %**, this hour and the next | NWS gridpoint forecast |
 | Forecast precipitation probability | **below 5 %**, this hour and the next | NWS gridpoint forecast |
 | Lightning | **no flash within 60 km** of the site in the last 30 min, with the GLM layer watching for all of that time | GOES-19 GLM, the main monitor's lightning layer |
 
@@ -203,9 +204,9 @@ WU rain check or a broken layer of device 0 also reads `false`
 
 Deliberately simple: there is no lower limit on the spread (fog is not treated as
 dangerous to the equipment), no waiting period once every line holds and no memory of
-earlier dew. The only state is the 8–9 mph dead band, so wind hovering at the limit does
+earlier dew. The only state is the 5–6 mph dead band, so wind hovering at the limit does
 not flip the answer with every station update (after a restart the wind must be seen at
-8 mph or below once), and the lightning record of the last 30 minutes described next.
+5 mph or below once), and the lightning record of the last 30 minutes described next.
 
 **Lightning.** This is the main monitor's lightning check with a wider ring. Device 0
 goes UNSAFE for a flash within 50 km (and device 1 is then false anyway); device 1 is
@@ -235,7 +236,7 @@ The check sees what the GLM polls have read and no more; see
 
 **Why spread, and why wind.** The plate radiates to the sky and runs a few degrees colder
 than the air, so it collects dew once the spread is smaller than that cooling, long
-before the air is saturated (5 °C of spread is roughly 70 % relative humidity). Wind keeps
+before the air is saturated (4 °C of spread is roughly 75 % relative humidity). Wind keeps
 the plate at air temperature. The humidity sensor of the main monitor cannot be used for
 this: it sits inside the enclosure.
 
@@ -306,10 +307,14 @@ on the SD card.
 - Switch it on with `TTU_SAFETY_DEW=1`; it is off by default. Without it device 1 does
   not exist, and a driver polling it gets an error and keeps trusting its rain sensor.
 
-The thresholds are a first guess to be checked against the weather log. On 8 November
-2026 the roof was closed by dew at 22:07 local; Lubbock airport reported 4.4 °C of spread
-and 4.6 mph of wind at 21:53, but also broken cirrus at 25,000 ft. So on nights like that
-one, compare the logged `fc_cloud_pct` with the 30 % limit.
+The thresholds are still to be checked against the weather log. They started as 5 °C of
+spread, 8 mph of wind (calm until above 9) and 30 % of cloud; on 23 November 2026 the
+spread and wind limits were tightened to 4 °C and 5 mph (6) and the cloud limit was
+relaxed to 50 %. On 8 November 2026 the roof was closed by dew at 22:07 local; Lubbock
+airport reported 4.4 °C of spread and 4.6 mph of wind at 21:53, but also broken cirrus
+at 25,000 ft. So on nights like that one, compare the logged `fc_cloud_pct` with the
+50 % limit, and each dome's logged rain sensor reading and roof state (`dome<n>_rain_wet`,
+`dome<n>_roof`, see [Weather log](#weather-log)) with what device 1 said at that moment.
 
 ## Dome status (display only)
 
@@ -379,6 +384,13 @@ switches, even when no switches are selected; a dome whose driver does not send 
 rain line. A dew override can leave the sensor reading WET. A `null` or expired reading
 shows UNKNOWN.
 
+**In the weather log.** Each expected dome's roof state and rain sensor reading are also
+recorded in the [weather log](#weather-log), columns `dome<n>_roof` and
+`dome<n>_rain_wet`, with a row of its own whenever either changes: that is where to see
+in which weather the sensor really turns WET, what the dew monitor said at that moment,
+and whether the roof closed. Like the tile, it is a record only, no input of either
+`IsSafe`.
+
 **Which switches.** `TTU_SAFETY_DOME_SWITCHES` lists the switches shown, by the names the
 dome reports, each optionally with a label: `"Mount power=Mount,CCD power=CCD,Light"`.
 `all` (the default) shows every switch a dome reports (at most 8), `none` none.
@@ -400,8 +412,9 @@ report and the reports refused for their key since the daemon started; `/status`
 the block under `domes` (no key, no sender address). The daemon log has a line for each
 dome's first report, each change of its roof or of a shown switch, and when it goes
 silent or reports again (`journalctl -u ttu-safety | grep dome`); a refused key is logged
-once, then at most every 10 min with a count. Nothing goes to `~/safety_events.log` or
-anywhere else on the SD card.
+once, then at most every 10 min with a count. Nothing goes to `~/safety_events.log`. The
+roof states and rain sensor readings in the weather log are all that reaches the SD card,
+with the log's daily copy; the report store itself never writes a file.
 
 **Example: the TTU observatory**, two domes each run by merlino-dome (its README has the
 dome side). In `~/ttustatus.env`:
@@ -424,14 +437,17 @@ from. Nothing is fetched for it: these are data the daemon already has.
 Two CSV tables, each file starting with a header line:
 
 - **weather**: one row every 5 min, plus one at once whenever the verdict of device 0 or
-  device 1 changes (column `event`: `interval`, `device0`, `device1`, `start`). Columns:
+  device 1 changes or a dome's roof state or rain sensor reading does (column `event`:
+  `interval`, `device0`, `device1`, `dome1`, `dome2`, ..., `start`; several at once are
+  joined, as in `device1+dome2`). Columns:
   UTC and local time, sun altitude, both verdicts (`safe0`, `safe1`), the station medians
   device 1 used (`spread_c`, `wind_mph`, `gust_mph`, `temp_c`, `dewpoint_c`, `rh_pct`) and
   how many stations they come from, each device 1 check (`check_spread`, `check_wind`,
   `check_cloud`, `check_precip`, `check_lightning`: 1 passes, 0 fails, blank = no data),
   the forecast for this hour and the next (`fc_cloud_pct`, `fc_precip_pct`, `fc_temp_c`,
   `fc_dewpoint_c`, `fc_wind_mph`, ...), rain latch, radar and lightning state, the
-  enclosure sensor (`encl_temp_c`, `encl_rh_pct`) and both lists of reasons.
+  enclosure sensor (`encl_temp_c`, `encl_rh_pct`), each dome's roof state and rain sensor
+  reading (`dome1_roof`, `dome1_rain_wet`, ...: next paragraph) and both lists of reasons.
 - **stations**: one row per WU station per WU poll (temperature, dew point, spread,
   humidity, wind, gust, rain rate, distance, age of the observation), to see which
   stations are representative of the site. WU is polled at night only, so there are no
@@ -439,6 +455,29 @@ Two CSV tables, each file starting with a header line:
 
 Units are in the column names: temperatures in °C, wind in mph, the rain rate in inches
 per hour as WU reports it. The forecast wind arrives in km/h and is logged in mph.
+
+**The domes' roofs and rain sensors.** The weather table has two columns per expected
+dome (a dome with a `TTU_SAFETY_DOME<n>_KEY`, see
+[Dome status](#dome-status-display-only)):
+
+| Column | Value |
+|---|---|
+| `dome<n>_roof` | the roof as that dome's driver reports it: `open`, `closed`, `opening`, `closing`, `moving` or `error` |
+| `dome<n>_rain_wet` | its rain sensor: `1` WET, `0` DRY |
+
+A blank means not known: no report yet, none for `TTU_SAFETY_DOME_STALE_SEC`, or a report
+without a current board reading; for the rain sensor also a driver that sends no
+`rain_wet`. A change of either value writes a row at the daemon's next evaluation
+(`event` = `dome<n>`; within `TTU_SAFETY_EVAL_INTERVAL`, 30 s), so the log has the time
+a sensor turned WET or DRY and the time a roof closed, beside the spread, the wind, the
+forecast and the answer of device 1 at that time: the data for checking the dew
+monitor's limits against real dew. The rain columns of the same row (`rain_latched`,
+`rain_stations`, `radar_in_ring`) tell whether rain was about. The rain column is the
+sensor's reading, not what the dome did with it: merlino-dome reports WET also while it
+is ignoring the sensor. A roof that goes from `open` to `closing` while its sensor reads
+WET, `safe0` is 1 and `safe1` is 0 is what a closure by the rain sensor looks like (the
+log cannot tell it from an operator or a sequence closing the roof at that moment). With
+no dome expected there are no such columns, and the files are what they were before.
 
 **Download.** The status page has a "Weather log" block with links to every file; the
 directory is inside the web root:
@@ -475,8 +514,10 @@ are dropped.
 oldest months are deleted, never the current one, with a `WEATHER-LOG` line in the event
 log. At about 0.2 MB a day that is decades away; the limit is a guarantee, not a routine.
 
-If a later version changes the columns in the middle of a month, that month continues in
-`weather_2026-11_b.csv`, so every file stays one consistent table.
+If the columns change in the middle of a month (a later version, or a dome added to or
+removed from `ttustatus.env`), that month continues in `weather_2026-11_b.csv`, so every
+file stays one consistent table. (The update that added the domes' roof and rain sensor
+columns is such a change at a site with domes, and none at a site without.)
 
 ## Deploy on the Pi
 
@@ -667,7 +708,7 @@ The Pi runs 24/7 from an SD card on imperfect power, so every recurring write ma
 | `~/safety_hazard_latch.json` | only when the set of vetoing NWS warnings (or one's end time) changes — a few writes per warning, and at most hourly while a long warning keeps being listed (its 24 h release bound is renewed), every 10 min while a warning without an end time is (its last sighting); written by the alerts thread only, never on an IsSafe request; a failed write is retried at most once a minute | SD (must survive reboot) |
 | `~/safety_events.log` (audit trail) | only on events | SD (its purpose). Capped at 1 GB together with its one backup (`TTU_SAFETY_EVENT_LOG_MAX_MB`): at half the cap it is renamed `safety_events.log.1` (replacing the older backup) and a new file starts. At a few kB a day that is decades, so the cap only guards against an event storm filling the card |
 | `~/.ttu-safety.lock` (single-instance lock) | created once; one short line at each daemon start | SD (a few bytes per start) |
-| `/dev/shm/ttu_weather_log/` (weather-log rows not archived yet) | every 5 min, plus every WU poll | RAM |
+| `/dev/shm/ttu_weather_log/` (weather-log rows not archived yet) | every 5 min and at each change of a verdict or of a dome's roof state or rain sensor reading, plus every WU poll | RAM |
 | `/dev/shm/ttu-glm-*.nc` (each GLM granule while it is read, then deleted; read from memory only where there is no `/dev/shm`) | about 20 per GLM poll at night (0.2–0.6 MB each), up to about 45 on the first poll after a pause | RAM |
 | `/var/www/html/weather_log/*.csv` (weather-log archive) | one append per monthly file every 24 h, in daytime, and when the daemon is stopped | SD (its purpose; about 0.2 MB a day) |
 | `~/.cache/ttu-radar/` basemaps | once ever (per site, theme and source — CARTO or OpenStreetMap; never a partial one, never one with a refused tile) | SD (avoids re-fetching map tiles per boot) |
@@ -804,9 +845,9 @@ All optional; defaults suit the Pi. Set them in the systemd unit or before launc
 | `TTU_SAFETY_HAZARD_FEEDS_POLL_SEC` | `600` | information-feed cadence (min 60; each feed also has its own minimum, see below) |
 | `TTU_SAFETY_HAZARD_LSR_HOURS` | `24` | storm-report look-back, hours (1-168) |
 | `TTU_SAFETY_DEW` | `0` | enable the dew monitor, Alpaca device 1, with `1` or `on` (off by default since 18 November 2026: no such device, no card, no `/setup` section; a value that is neither on nor off is reported at startup and the default is used) |
-| `TTU_SAFETY_DEW_SPREAD_MAX_C` | `5` | dew-point spread limit, **degrees Celsius**: true only at or below |
-| `TTU_SAFETY_DEW_WIND_MAX_MPH` / `_WIND_UNSAFE_ABOVE_MPH` | `8` / `9` | wind limits, **miles per hour**: calm at or below the first, no longer calm above the second (set them equal for no dead band) |
-| `TTU_SAFETY_DEW_CLOUD_BELOW_PCT` / `_PRECIP_BELOW_PCT` | `30` / `5` | forecast cloud cover and precipitation probability must be **below** these, this hour and the next |
+| `TTU_SAFETY_DEW_SPREAD_MAX_C` | `4` | dew-point spread limit, **degrees Celsius**: true only at or below |
+| `TTU_SAFETY_DEW_WIND_MAX_MPH` / `_WIND_UNSAFE_ABOVE_MPH` | `5` / `6` | wind limits, **miles per hour**: calm at or below the first, no longer calm above the second (set them equal for no dead band) |
+| `TTU_SAFETY_DEW_CLOUD_BELOW_PCT` / `_PRECIP_BELOW_PCT` | `50` / `5` | forecast cloud cover and precipitation probability must be **below** these, this hour and the next |
 | `TTU_SAFETY_DEW_MIN_STATIONS` | `3` | WU stations needed for the spread median, and for the wind median |
 | `TTU_SAFETY_DEW_OBS_MAX_AGE_MIN` | `30` | a station's observation counts this long |
 | `TTU_SAFETY_DEW_FORECAST_MAX_AGE_MIN` | `40` | the last good NWS download counts this long (two poll intervals + 10 min; at most 240) |

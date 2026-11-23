@@ -528,18 +528,18 @@ def _dew_html(dew, row) -> str:
     rows.append(row("Dew-point spread (WU stations, median)",
                     "%s of %s station(s) (needs ≤ %s °C)"
                     % (num(dew.get("spread_c"), " °C"), dew.get("stations_used", 0),
-                       lim("spread_max_c", 5)), ok, unknown=unknown))
+                       lim("spread_max_c", 4)), ok, unknown=unknown))
     ok, unknown = check("wind")
     rows.append(row("Wind (WU stations, median)",
                     "%s of %s station(s) (calm ≤ %s mph, until above %s mph)"
                     % (num(dew.get("wind_mph"), " mph"), dew.get("stations_wind", 0),
-                       lim("wind_max_mph", 8), lim("wind_unsafe_above_mph", 9)),
+                       lim("wind_max_mph", 5), lim("wind_unsafe_above_mph", 6)),
                     ok, unknown=unknown))
     ok, unknown = check("cloud")
     rows.append(row("Forecast cloud cover (this / next hour)",
                     "%s / %s (needs < %s%%)"
                     % (num(fc.get("cloud_now"), "%", 0), num(fc.get("cloud_next"), "%", 0),
-                       lim("cloud_below_pct", 30)), ok, unknown=unknown))
+                       lim("cloud_below_pct", 50)), ok, unknown=unknown))
     ok, unknown = check("precip")
     rows.append(row("Forecast precipitation probability (this / next hour)",
                     "%s / %s (needs < %s%%)"

@@ -1,10 +1,11 @@
 """The dew monitor — Alpaca device 1 ("a WET rain-sensor reading right now is dew").
 
-The rule is the owner's: device 0 SAFE, dew-point spread <= 5 degC and wind <= 8 mph (both
-medians of the WU stations; wind stays calm until it is above 9 mph), forecast cloud cover
-< 30 % and precipitation probability < 5 % for this hour and the next, and no GLM lightning
+The rule is the owner's: device 0 SAFE, dew-point spread <= 4 degC and wind <= 5 mph (both
+medians of the WU stations; wind stays calm until it is above 6 mph), forecast cloud cover
+< 50 % and precipitation probability < 5 % for this hour and the next, and no GLM lightning
 within 60 km (for 30 min after the last poll that saw a flash that close). No lower spread
-limit, no memory of earlier dew. Missing data = false.
+limit, no memory of earlier dew. Missing data = false. (The spread, wind and cloud limits
+are the owner's of 23 November 2026; before that they were 5 degC, 8 / 9 mph and 30 %.)
 """
 import json
 import os
@@ -148,9 +149,9 @@ def test_a_temperature_difference_converts_without_the_32_degree_offset():
 
 
 def test_the_thresholds_are_the_owners():
-    assert config.DEW_SPREAD_MAX_C == 5.0
-    assert config.DEW_WIND_MAX_MPH == 8.0 and config.DEW_WIND_UNSAFE_ABOVE_MPH == 9.0
-    assert config.DEW_CLOUD_BELOW_PCT == 30.0 and config.DEW_PRECIP_BELOW_PCT == 5.0
+    assert config.DEW_SPREAD_MAX_C == 4.0
+    assert config.DEW_WIND_MAX_MPH == 5.0 and config.DEW_WIND_UNSAFE_ABOVE_MPH == 6.0
+    assert config.DEW_CLOUD_BELOW_PCT == 50.0 and config.DEW_PRECIP_BELOW_PCT == 5.0
     assert config.DEW_DEVICE_NUMBER == 1 and config.DEVICE_NUMBER == 0
     # data freshness: 3 stations, 30 min per observation, 40 min per forecast download
     assert config.DEW_MIN_STATIONS == 3 and config.DEW_OBS_MAX_AGE_MIN == 30.0
@@ -193,7 +194,7 @@ def test_settings_from_the_environment():
     assert plain["enabled"] is False and plain["log"] is True
     for word in ("1", "on", "ON", "true", "yes", "enabled"):
         assert _config_with(TTU_SAFETY_DEW=word)["enabled"] is True, word
-    assert (plain["calm"], plain["above"], plain["spread"], plain["fc_age"]) == (8, 9, 5, 40)
+    assert (plain["calm"], plain["above"], plain["spread"], plain["fc_age"]) == (5, 6, 4, 40)
     # a dead band turned upside down is corrected, loudly, not obeyed
     odd = _config_with(TTU_SAFETY_DEW_WIND_MAX_MPH="8", TTU_SAFETY_DEW_WIND_UNSAFE_ABOVE_MPH="6")
     assert (odd["calm"], odd["above"]) == (8, 8)
@@ -268,11 +269,13 @@ def test_never_safe_while_device_0_is_unsafe():
     assert [k for k, ok in v["checks"].items() if ok is not True] == ["device0"]
 
 
-def test_spread_limit_is_five_celsius_inclusive():
-    assert verdict(three(temp_f=50.0, dewpt_f=41.0))["is_safe"] is True     # exactly 5.0 C
-    v = verdict(three(temp_f=50.0, dewpt_f=40.8))                          # 5.11 C
+def test_spread_limit_is_four_celsius_inclusive():
+    assert verdict(three(temp_f=50.0, dewpt_f=42.8))["is_safe"] is True     # 7.2 F: 4.0 C
+    v = verdict(three(temp_f=50.0, dewpt_f=42.6))                          # 4.11 C
     assert v["is_safe"] is False and v["checks"]["spread"] is False
-    assert any("spread" in r and "5" in r for r in v["reasons"])
+    assert v["reasons"] == ["dew-point spread 4.1 °C is above 4 °C (air too dry for dew)"]
+    # 5 C, the limit until 23 November 2026, is now too dry
+    assert verdict(three(temp_f=50.0, dewpt_f=41.0))["checks"]["spread"] is False
 
 
 def test_spread_is_a_difference_in_celsius_not_a_converted_temperature():
@@ -290,14 +293,14 @@ def test_no_lower_spread_limit_fog_does_not_bring_the_sensor_back():
 
 
 def test_wind_limit_is_in_miles_per_hour():
-    assert verdict(three(wind=8.0))["is_safe"] is True
-    # 12 mph is 19 km/h: far too windy. (It would pass a limit mistaken for 12.87 km/h.)
-    v = verdict(three(wind=12.0))
+    assert verdict(three(wind=5.0))["is_safe"] is True
+    # 8 mph is 12.9 km/h: too windy. (It would pass a limit mistaken for 8.05 km/h.)
+    v = verdict(three(wind=8.0))
     assert v["is_safe"] is False and v["checks"]["wind"] is False
-    assert any("12 mph" in r and "9 mph" in r for r in v["reasons"])
+    assert any("8 mph" in r and "6 mph" in r for r in v["reasons"])
 
 
-def test_wind_dead_band_safe_at_8_or_below_unsafe_above_9():
+def test_wind_dead_band_safe_at_5_or_below_unsafe_above_6():
     mon = DewMonitor(config)
     t = NOW
 
@@ -306,16 +309,16 @@ def test_wind_dead_band_safe_at_8_or_below_unsafe_above_9():
         t += 60
         return verdict(three(wind=wind, now=t), mon=mon, now=t)
 
-    first = at(8.5)                 # never seen calm yet: between the limits is NOT calm
+    first = at(5.5)                 # never seen calm yet: between the limits is NOT calm
     assert first["is_safe"] is False and first["wind_calm"] is False
-    assert any("has not dropped to 8 mph" in r for r in first["reasons"])
-    assert at(8.0)["is_safe"] is True
-    assert at(8.5)["is_safe"] is True       # inside the band: stays calm
-    assert at(9.0)["is_safe"] is True       # "unsafe ABOVE 9"
-    assert at(9.1)["is_safe"] is False
-    assert at(8.5)["is_safe"] is False      # inside the band: stays not calm
-    assert at(8.1)["is_safe"] is False
-    assert at(8.0)["is_safe"] is True
+    assert any("has not dropped to 5 mph" in r for r in first["reasons"])
+    assert at(5.0)["is_safe"] is True
+    assert at(5.5)["is_safe"] is True       # inside the band: stays calm
+    assert at(6.0)["is_safe"] is True       # "unsafe ABOVE 6"
+    assert at(6.1)["is_safe"] is False
+    assert at(5.5)["is_safe"] is False      # inside the band: stays not calm
+    assert at(5.1)["is_safe"] is False
+    assert at(5.0)["is_safe"] is True
 
 
 def test_wind_dead_band_is_forgotten_when_the_wind_data_goes_missing():
@@ -323,17 +326,17 @@ def test_wind_dead_band_is_forgotten_when_the_wind_data_goes_missing():
     assert verdict(three(wind=5.0), mon=mon)["is_safe"] is True
     later = NOW + 3600                      # every observation is now too old
     assert mon.evaluate(True, outlook(), later)["wind_calm"] is False
-    fresh = three(wind=8.5, now=later)
+    fresh = three(wind=5.5, now=later)      # inside the band, and "calm" is forgotten
     assert verdict(fresh, mon=mon, now=later)["is_safe"] is False
 
 
 @pytest.mark.parametrize("cloud,precip,ok,failing", [
-    ((29, 29), (4, 4), True, None),
-    ((30, 10), (0, 0), False, "cloud"),          # "< 30 %", this hour
-    ((10, 30), (0, 0), False, "cloud"),          # ...and the next hour
+    ((49, 49), (4, 4), True, None),
+    ((50, 10), (0, 0), False, "cloud"),          # "< 50 %", this hour
+    ((10, 50), (0, 0), False, "cloud"),          # ...and the next hour
     ((10, 10), (5, 0), False, "precip"),         # "< 5 %", this hour
     ((10, 10), (0, 5), False, "precip"),
-    ((10, 45), (0, 20), False, "cloud"),
+    ((10, 55), (0, 20), False, "cloud"),
 ])
 def test_forecast_limits_apply_to_this_hour_and_the_next(cloud, precip, ok, failing):
     v = verdict(three(), fc=outlook(cloud=cloud, precip=precip))
@@ -347,7 +350,7 @@ def test_a_missing_forecast_value_is_not_a_pass():
     v = verdict(three(), fc=outlook(cloud=(10, None)))
     assert v["is_safe"] is False and v["checks"]["cloud"] is None
     assert any("cloud cover for next hour is missing" in r for r in v["reasons"])
-    v = verdict(three(), fc=outlook(cloud=(40, None)))
+    v = verdict(three(), fc=outlook(cloud=(55, None)))
     assert v["checks"]["cloud"] is False        # a breach is a breach, whatever is missing
 
 
@@ -896,17 +899,17 @@ def test_a_broken_sensor_does_not_vote_for_dew():
 
 
 def test_limits_are_inclusive_despite_float_conversion():
-    # 68.9 F - 59.9 F is 9.000000000000007 F = 5.0000000000000036 C: still "at most 5"
-    v = verdict(three(temp_f=68.9, dewpt_f=59.9))
-    assert v["spread_c"] > 5.0 and v["is_safe"] is True
-    assert verdict(three(temp_f=68.9, dewpt_f=59.8))["is_safe"] is False
+    # 68.9 F - 61.7 F is 7.200000000000003 F = 4.000000000000002 C: still "at most 4"
+    v = verdict(three(temp_f=68.9, dewpt_f=61.7))
+    assert v["spread_c"] > 4.0 and v["is_safe"] is True
+    assert verdict(three(temp_f=68.9, dewpt_f=61.6))["is_safe"] is False
     # ...but the allowance is the last bit of a float, not a real margin
-    assert verdict(three(temp_f=50.0, dewpt_f=40.98))["is_safe"] is False    # 5.011 C
-    assert verdict(three(wind=8.0))["is_safe"] is True
-    assert verdict(three(wind=8.01))["is_safe"] is False
+    assert verdict(three(temp_f=50.0, dewpt_f=42.78))["is_safe"] is False    # 4.011 C
+    assert verdict(three(wind=5.0))["is_safe"] is True
+    assert verdict(three(wind=5.01))["is_safe"] is False
     mon = DewMonitor(config)
     assert verdict(three(wind=5.0), mon=mon)["is_safe"] is True
-    assert verdict(three(wind=9.01, age_s=60), mon=mon)["is_safe"] is False
+    assert verdict(three(wind=6.01, age_s=60), mon=mon)["is_safe"] is False
 
 
 def test_a_dew_point_well_above_the_temperature_is_a_fault_not_saturation():
@@ -1421,7 +1424,7 @@ def test_setup_page_shows_the_dew_monitor_as_ignored_or_trusted(rig):
     page = rig["client"].get("/setup").get_data(as_text=True)
     assert "Dew monitor (device 1)" in page
     assert "rain sensor may be IGNORED (dew likely)" in page
-    assert "needs ≤ 5 °C" in page and "calm ≤ 8 mph, until above 9 mph" in page
+    assert "needs ≤ 4 °C" in page and "calm ≤ 5 mph, until above 6 mph" in page
     assert "no flash seen (needs none within 60 km for 30 min)" in page
     rig["nws"].precip = (9, 0)
     page = rig["client"].get("/setup/v1/safetymonitor/1/setup").get_data(as_text=True)

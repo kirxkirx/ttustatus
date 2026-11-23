@@ -5,9 +5,17 @@ records the numbers that verdict was made from — the WU stations' temperature,
 and wind, the NWS forecast, the radar state, the enclosure sensor — next to what both
 Alpaca monitors said. Nothing is fetched for it: these are data the daemon already has.
 
+It also records what the dew monitor is all about: whether each dome's rain sensor read
+WET or DRY at that moment, and whether its roof was open or closed, as the dome's own
+driver reported them (safety/domes.py). Two columns per CONFIGURED dome, dome<n>_roof
+and dome<n>_rain_wet, so with no dome configured the table is the one it always was. The
+readings are copied from the `domes` block of the state; they stay what that block is,
+no input of either IsSafe.
+
 Two kinds of rows:
   * weather  — a summary row every WEATHER_LOG_INTERVAL_SEC, plus one at once whenever
-               the verdict of device 0 or device 1 changes (column `event` says which);
+               the verdict of device 0 or device 1 changes, or a dome's roof state or
+               rain sensor reading does (column `event` says which);
   * stations — one row per WU station per WU poll (so one can see which stations are
                representative of the site). WU is polled at night only.
 
@@ -23,9 +31,10 @@ SD-CARD WEAR comes first — the Pi runs from an SD card:
 The archive (WEATHER_LOG_DIR, inside the web root, so the status page can link to it):
     weather_2026-11.csv   stations_2026-11.csv        one pair per month (UTC)
     weather_current.csv   stations_current.csv        symlinks to the RAM files
-Every file starts with a header line. If a later version changes the columns in the
-middle of a month, that month continues in weather_2026-11_b.csv (then _c ...), so every
-file stays one consistent table.
+Every file starts with a header line. If the columns change in the middle of a month (a
+later version, or a dome added to or taken out of the configuration), that month
+continues in weather_2026-11_b.csv (then _c ...), so every file stays one consistent
+table.
 
 Copying is all-or-nothing and never duplicates rows, even if the daemon is killed in the
 middle. The rows to be archived are first moved aside inside the RAM directory
@@ -55,7 +64,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from . import dew as dew_mod, nws_forecast
+from . import dew as dew_mod, domes as domes_mod, nws_forecast
 
 log = logging.getLogger("ttu.safety.weatherlog")
 
@@ -81,6 +90,7 @@ SUMMARY_COLUMNS = (
     "glm_latched", "glm_nearest_km",
     # the DHT sensor INSIDE the enclosure (not outdoor air)
     "encl_temp_c", "encl_rh_pct",
+    # (each configured dome's roof and rain-sensor columns go here: summary_columns())
     "reasons0", "reasons1",
 )
 
@@ -89,7 +99,24 @@ STATION_COLUMNS = (
     "temp_c", "dewpoint_c", "spread_c", "rh_pct", "wind_mph", "gust_mph", "precip_in_hr",
 )
 
+# The header lines with no dome configured. A WeatherLog works with its own (_headers):
+# the weather table gains two columns per configured dome, see summary_columns().
 HEADERS = {"weather": ",".join(SUMMARY_COLUMNS), "stations": ",".join(STATION_COLUMNS)}
+
+# The weather table's columns for dome n, from the latest report of the dome's own driver:
+#   dome<n>_roof      the roof: open, closed, opening, closing, moving or error
+#   dome<n>_rain_wet  the rain sensor: 1 = WET, 0 = DRY
+# Blank = not known (no report yet, the latest report too old or without a current board
+# reading; for the rain sensor also a sender that reports none). The rain column is what
+# the sensor read, not what the dome made of it: merlino-dome reports WET also while it
+# is ignoring the sensor. A roof that goes open -> closing while its sensor reads WET,
+# device 0 says SAFE and device 1 says "trust the rain sensor" is what a closure by the
+# rain sensor looks like (the log cannot tell it from an operator closing at that moment).
+DOME_ROOF_COLUMN = "dome%d_roof"
+DOME_RAIN_COLUMN = "dome%d_rain_wet"
+# The roof states that are logged: what a report may say (domes.SHUTTER_STATES), less
+# "unknown", which is a blank like every other unknown.
+ROOF_STATES = tuple(s for s in domes_mod.SHUTTER_STATES if s != "unknown")
 
 _ARCHIVE_RE = re.compile(r"^(weather|stations)_(\d{4}-\d{2})(?:_([b-z]))?\.csv$")
 _ROW_MONTH_RE = re.compile(r"^(\d{4}-\d{2})-\d{2}T")
@@ -123,6 +150,47 @@ def _iso_utc(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def dome_numbers(cfg) -> tuple:
+    """The numbers of the configured domes, in order (none configured: an empty tuple)."""
+    return tuple(d.n for d in getattr(cfg, "DOMES", ()) or ())
+
+
+def dome_columns(cfg) -> tuple:
+    """The weather table's columns of the configured domes: for each, in order of its
+    number, its roof column and then its rain-sensor column."""
+    return tuple(column % n for n in dome_numbers(cfg)
+                 for column in (DOME_ROOF_COLUMN, DOME_RAIN_COLUMN))
+
+
+def summary_columns(cfg) -> tuple:
+    """The columns of the weather table under this configuration: SUMMARY_COLUMNS with the
+    two columns of each configured dome in front of the two text columns (those stay
+    last: they are long). With no dome configured these are SUMMARY_COLUMNS, unchanged."""
+    at = SUMMARY_COLUMNS.index("reasons0")
+    return SUMMARY_COLUMNS[:at] + dome_columns(cfg) + SUMMARY_COLUMNS[at:]
+
+
+def dome_readings(state, numbers) -> tuple:
+    """For each dome in `numbers` a pair (roof, wet), as the `domes` block of this
+    evaluation has it: roof is one of ROOF_STATES or None (not known), wet is True (WET),
+    False (DRY) or None (no reading). That block already decides what is known: a dome
+    that has not reported, or whose report is stale or not current, has neither here; one
+    whose driver sends no rain reading has a roof state only. Whatever else the block may
+    hold is "not known", never an exception."""
+    block = state.get("domes") if isinstance(state, dict) else None
+    listed = block.get("domes") if isinstance(block, dict) else None
+    by_n = {}
+    for d in listed if isinstance(listed, list) else ():
+        if not isinstance(d, dict) or d.get("known") is not True:
+            continue
+        n, roof, wet = d.get("n"), d.get("shutter"), d.get("rain_wet")
+        # (bool is an int in Python: a True must pass neither for dome 1 nor for a number)
+        if isinstance(n, int) and not isinstance(n, bool):
+            by_n[n] = (roof if isinstance(roof, str) and roof in ROOF_STATES else None,
+                       wet if isinstance(wet, bool) else None)
+    return tuple(by_n.get(n, (None, None)) for n in numbers)
+
+
 class WeatherLog:
     def __init__(self, cfg, eventlog=None):
         self.cfg = cfg
@@ -133,8 +201,16 @@ class WeatherLog:
         # never across SD I/O — observe() takes it inside the safety evaluation.
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()           # one archive run at a time (SD I/O)
+        # The weather table of THIS configuration: a roof and a rain-sensor column per
+        # configured dome. Fixed while the daemon runs, like the configuration; a daemon
+        # restarted with another set of domes finds a RAM file with another header and
+        # sets it aside (_load_ram_state), so no file ever mixes two layouts.
+        self._dome_ns = dome_numbers(cfg)
+        self._columns = summary_columns(cfg)
+        self._headers = dict(HEADERS, weather=",".join(self._columns))
         self._last_row_ts = None
         self._last_verdicts = None                    # (safe0, safe1) of the last row
+        self._last_domes = None                       # the domes' (roof, wet) in it
         self._last_station_poll_ts = None
         self._last_flush_ts = None                    # wall time of the last archive run
         self._created_ts = time.time()                # when this daemon started logging
@@ -203,9 +279,10 @@ class WeatherLog:
                     first = f.readline().rstrip("\r\n")
             except OSError:
                 continue
-            if first and first != HEADERS[kind]:
-                # written by a version with other columns: keep it apart, as a file of
-                # its own that the next archive run copies under its own header
+            if first and first != self._headers[kind]:
+                # written with other columns (an earlier version, or another set of
+                # domes): keep it apart, as a file of its own that the next archive run
+                # copies under its own header
                 self._set_aside_locked(kind)
         try:
             with open(self._meta(), encoding="utf-8") as f:
@@ -356,7 +433,7 @@ class WeatherLog:
                 writer.writerow(row)
             data = buf.getvalue()
             # (may remove this very file: decide about the header only afterwards)
-            self._make_room_locked(len(data.encode("utf-8")) + len(HEADERS[kind]) + 1)
+            self._make_room_locked(len(data.encode("utf-8")) + len(self._headers[kind]) + 1)
             os.makedirs(self.ram, exist_ok=True)
             prefix = ""
             try:
@@ -380,9 +457,9 @@ class WeatherLog:
                                 # read) and start on a new line.
                                 prefix = "\n"
                     if size == 0:
-                        prefix = HEADERS[kind] + "\n"
+                        prefix = self._headers[kind] + "\n"
             except OSError:
-                prefix = HEADERS[kind] + "\n"       # no such file yet
+                prefix = self._headers[kind] + "\n"       # no such file yet
             with open(path, "a", encoding="utf-8", newline="") as f:
                 f.write(prefix + data)
             self._cur_rows[kind] += len(rows)
@@ -397,7 +474,9 @@ class WeatherLog:
         dt = nws_forecast._local(datetime.fromtimestamp(ts, timezone.utc), self.cfg.LOCAL_TZ)
         return dt.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
 
-    def _summary_row(self, state, now, event, outlook, inputs) -> list:
+    def _summary_row(self, state, now, event, outlook, inputs, domes) -> list:
+        """One row of the weather table. `domes`: the (roof, wet) pair of each
+        configured dome (dome_readings), in the order of _dome_ns."""
         comp = state.get("components") or {}
         dew = state.get("dew") or {}
         checks = dew.get("checks") or {}
@@ -456,7 +535,10 @@ class WeatherLog:
             "reasons0": _text(" | ".join(str(r) for r in state.get("reasons") or [])),
             "reasons1": _text(" | ".join(str(r) for r in dew.get("reasons") or [])),
         }
-        return [values[c] for c in SUMMARY_COLUMNS]
+        for n, (roof, wet) in zip(self._dome_ns, domes):
+            values[DOME_ROOF_COLUMN % n] = roof or ""     # open, closed, ...; blank: not known
+            values[DOME_RAIN_COLUMN % n] = _flag(wet)     # 1 WET, 0 DRY, blank: no reading
+        return [values[c] for c in self._columns]
 
     def _station_rows(self, poll_ts, results) -> list:
         utc, local = _iso_utc(poll_ts), self._local(poll_ts)
@@ -487,30 +569,40 @@ class WeatherLog:
 
     def observe(self, state, now=None, outlook=None, inputs=None) -> None:
         """Called at the end of every safety evaluation. Writes a summary row when one is
-        due and the station rows of a new WU poll — to RAM. Never raises."""
+        due and the station rows of a new WU poll — to RAM. Never raises.
+
+        A summary row is due every WEATHER_LOG_INTERVAL_SEC, and at once when a verdict
+        changed or a dome's roof state or rain sensor reading did (each change is one
+        row, so the log has the minute the sensor turned WET and the minute the roof
+        closed, with the numbers of that minute beside them)."""
         try:
             now = time.time() if now is None else now
             dew = state.get("dew") or {}
             verdicts = (bool(state.get("is_safe")),
                         bool(dew.get("is_safe")) if dew.get("enabled") else None)
+            domes = dome_readings(state, self._dome_ns)
             rain = (state.get("components") or {}).get("rain") or {}
             with self._lock:
                 event = None
-                if self._last_row_ts is None or self._last_verdicts is None:
+                if (self._last_row_ts is None or self._last_verdicts is None
+                        or self._last_domes is None):
                     event = "start"
                 else:
                     changed = [name for name, new, old in (
                         ("device0", verdicts[0], self._last_verdicts[0]),
                         ("device1", verdicts[1], self._last_verdicts[1])) if new != old]
+                    changed += ["dome%d" % n for n, new, old in zip(
+                        self._dome_ns, domes, self._last_domes) if new != old]
                     elapsed = now - self._last_row_ts
                     if changed:
                         event = "+".join(changed)
                     elif elapsed < 0 or elapsed >= self.cfg.WEATHER_LOG_INTERVAL_SEC:
                         event = "interval"      # (elapsed < 0: the clock stepped back)
                 if event:
-                    self._append_locked(
-                        "weather", [self._summary_row(state, now, event, outlook, inputs)])
+                    self._append_locked("weather", [self._summary_row(
+                        state, now, event, outlook, inputs, domes)])
                     self._last_row_ts, self._last_verdicts = now, verdicts
+                    self._last_domes = domes
                 poll_ts = rain.get("last_poll_ts")
                 if (self.cfg.WEATHER_LOG_STATIONS and isinstance(poll_ts, (int, float))
                         and poll_ts != self._last_station_poll_ts):
@@ -630,7 +722,7 @@ class WeatherLog:
             self._pend_rows[kind], self._cur_rows[kind] = self._cur_rows[kind], 0
             # a fresh file at once, so the page's "current" link never dangles
             with open(self._cur(kind), "w", encoding="utf-8", newline="") as f:
-                f.write(HEADERS[kind] + "\n")
+                f.write(self._headers[kind] + "\n")
 
     def _recover(self) -> None:
         """Finish or undo what an archive run that was killed left behind. MUST run
@@ -724,7 +816,7 @@ class WeatherLog:
                 except UnicodeDecodeError:
                     # half a character: a write cut short on a full RAM disk
                     lines.append(None)
-            header = HEADERS[kind]
+            header = self._headers[kind]
             if lines and lines[0] and lines[0].startswith("utc,"):
                 header = lines[0].rstrip("\r")
             columns = header.count(",") + 1

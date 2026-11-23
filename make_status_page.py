@@ -4221,13 +4221,13 @@ def build_dew_html(state):
          sub("device0", "device 0 must be SAFE")),
         ("Dew-point spread", value(spread, "°C"),
          sub("spread", "needs &le; %s °C &middot; %d station%s"
-             % (lim("spread_max_c", 5), n_used, "" if n_used == 1 else "s"))),
+             % (lim("spread_max_c", 4), n_used, "" if n_used == 1 else "s"))),
         ("Wind", value(wind, "mph"),
          sub("wind", "calm &le; %s mph, until &gt; %s &middot; %d station%s"
-             % (lim("wind_max_mph", 8), lim("wind_unsafe_above_mph", 9), n_wind,
+             % (lim("wind_max_mph", 5), lim("wind_unsafe_above_mph", 6), n_wind,
                 "" if n_wind == 1 else "s"))),
         ("Forecast cloud", pair(fc.get("cloud_now"), fc.get("cloud_next")),
-         sub("cloud", "needs &lt; %s%% this and next hour" % lim("cloud_below_pct", 30))),
+         sub("cloud", "needs &lt; %s%% this and next hour" % lim("cloud_below_pct", 50))),
         ("Forecast precip.", pair(fc.get("precip_now"), fc.get("precip_next")),
          sub("precip", "needs &lt; %s%% this and next hour" % lim("precip_below_pct", 5))),
     ]
@@ -4540,14 +4540,23 @@ def build_weather_log_html(state):
             else time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(last)))
     total = wl.get("total_bytes")
     # The dew monitor is named only while it is on: a site that never switched it on must
-    # not read about it here (it is off unless TTU_SAFETY_DEW=1).
+    # not read about it here (it is off unless TTU_SAFETY_DEW=1). The same goes for the
+    # domes' roofs and rain sensors: logged, and named, only with a dome configured.
     dew = state.get("dew")
+    domes = state.get("domes")
+    what = ["the safety monitor"]
     if isinstance(dew, dict) and dew.get("enabled"):
-        changes = ("the safety monitor or the dew monitor (station medians, forecast, radar, "
-                   "enclosure sensor, both verdicts and their reasons)")
+        what.append("the dew monitor")
+        verdicts = "both verdicts and their reasons"
     else:
-        changes = ("the safety monitor (station medians, forecast, radar, enclosure sensor, "
-                   "the verdict and its reasons)")
+        verdicts = "the verdict and its reasons"
+    columns = "station medians, forecast, radar, enclosure sensor, "
+    if isinstance(domes, dict) and domes.get("enabled"):
+        what.append("a dome's roof or rain sensor")
+        columns += "the domes' roofs and rain sensors, "
+    changes = "%s (%s%s)" % (
+        " or ".join(what) if len(what) < 3 else "%s, %s or %s" % tuple(what),
+        columns, verdicts)
     blurb = (
         "CSV for a spreadsheet: one <b>weather</b> row every %s min and at every change of "
         "%s, and one <b>stations</b> row per Weather "

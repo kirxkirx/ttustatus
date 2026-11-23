@@ -70,7 +70,9 @@ If each dome's own driver reports its roof, rain sensor and power switches (merl
 status page shows one tile per dome, with a switch such as a light left on shown in the
 warning colour. It is display only, never an input of either `IsSafe`, and off until a
 `TTU_SAFETY_DOME<n>_KEY` is set: without one the page is exactly as it is without the
-feature. README_SAFETY.md, "Dome status", has the settings and the report format.
+feature. The weather log also records each dome's roof state and rain sensor reading
+(WET or DRY), for checking the dew monitor's limits. README_SAFETY.md, "Dome status", has
+the settings and the report format.
 
 ## Sister projects
 
@@ -147,7 +149,7 @@ safety/                  the daemon package (config, wu_poll, monitor, alpaca, .
   nws_alerts.py          NWS active alerts: the Tornado/Dust Storm/High Wind Warning veto + map/list
   hazard_feeds.py        information-only hazard feeds (HMS, NIFC, SPC, LSR)
   dew.py                 the dew monitor (Alpaca device 1, off unless TTU_SAFETY_DEW=1)
-  domes.py               dome status reports (display only; off unless a dome key is set)
+  domes.py               dome status reports (display and weather log only; off unless a dome key is set)
   weatherlog.py          weather log (CSV): collected in RAM, copied to the SD card once a day
 tools/                   alpaca_discovery_proxy.py / responder (only for cross-subnet NINA)
 ttustatus.env.example    template for the secrets file (WU key, User-Agent contact, CARTO key)

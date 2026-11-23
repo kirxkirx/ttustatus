@@ -1035,7 +1035,9 @@ class SafetyMonitor:
         }
         # The domes' status reports: DISPLAY ONLY, made after the decision above and never
         # read by it (tests pin this). Only when a dome is configured: with none, the state
-        # has exactly the keys it had before dome reports existed.
+        # has exactly the keys it had before dome reports existed. (The weather log below
+        # copies each dome's roof state and rain sensor reading from this block: a record,
+        # no input.)
         if getattr(self.cfg, "DOMES", ()):
             state["domes"] = self._domes_component()
 

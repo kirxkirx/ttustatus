@@ -44,7 +44,7 @@ from .nws_forecast import NwsForecastPoller
 from .glm_lightning import GlmLightningPoller
 from .radar import RadarPoller
 from .timesync import ClockSyncWatch
-from .weatherlog import WeatherLog
+from .weatherlog import WeatherLog, dome_columns
 
 log = logging.getLogger("ttu.safety")
 
@@ -533,6 +533,10 @@ def _run(cfg):
                  "daytime and on shutdown, at most %g MB kept",
                  cfg.WEATHER_LOG_INTERVAL_SEC, cfg.WEATHER_LOG_RAM_DIR, cfg.WEATHER_LOG_DIR,
                  cfg.WEATHER_LOG_FLUSH_HOURS, cfg.WEATHER_LOG_MAX_MB)
+        if cfg.DOMES:
+            log.info("weather log: with each dome's roof state and rain sensor reading "
+                     "(%s), and a row at once when one changes",
+                     ", ".join(dome_columns(cfg)))
     elif not cfg.WEATHER_LOG_ENABLED:
         log.warning("weather log disabled (TTU_SAFETY_WEATHER_LOG=0)")
     if cfg.PAGE_ENABLED:

@@ -7,7 +7,10 @@ format, keeps the latest accepted report of each CONFIGURED dome in memory, and 
 them into the state file's `domes` block, which the status page shows as one tile per
 dome. Nothing here is an input of either IsSafe: SafetyMonitor publishes the block beside
 `dew`, not inside `components`, and its decision never reads it (tests pin this). Nothing
-is written to a file (no SD-card wear) and nothing goes to the event log.
+here writes a file (no SD-card wear) and nothing goes to the event log. One reader besides
+the page: the weather log (safety/weatherlog.py) copies each dome's roof state and rain
+sensor reading from the block into its rows, which is how they reach the SD card at all,
+with that log's daily copy.
 
 The report (unknown fields are ignored so v1 can gain optional readings):
     POST /domes/v1/report

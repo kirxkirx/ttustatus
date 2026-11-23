@@ -6,6 +6,7 @@ standing in for /dev/shm.
 """
 import csv
 import json
+import logging
 import os
 import signal
 import sys
@@ -14,8 +15,10 @@ import types
 
 import pytest
 
-from safety import config, server, weatherlog as wlmod, wu_poll
+from safety import config, domes as domes_mod, server, weatherlog as wlmod, wu_poll
+from safety.config import DomeConfig
 from safety.dew import DewMonitor
+from safety.domes import DomeStore, parse_report
 from safety.eventlog import EventLog
 from safety.monitor import RainPoller, SafetyMonitor
 from safety.weatherlog import HEADERS, STATION_COLUMNS, SUMMARY_COLUMNS, WeatherLog
@@ -30,6 +33,9 @@ def dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "WEATHER_LOG_DIR", str(sd))
     monkeypatch.setattr(config, "WEATHER_LOG_RAM_DIR", str(ram))
     monkeypatch.setattr(config, "EVENT_LOG", str(tmp_path / "events.log"))
+    # no dome, whatever the environment running the tests has: the table every test here
+    # expects, until one of them configures domes (see "the domes' rain sensors" below)
+    monkeypatch.setattr(config, "DOMES", ())
     return sd, ram
 
 
@@ -690,6 +696,230 @@ def test_clock_step_writes_the_next_row_at_once(wl, dirs):
     assert len(read(ram / "weather_current.csv")) == 2
 
 
+# --- the domes' roofs and rain sensors -----------------------------------------------------
+# What each dome's rain sensor read (WET / DRY) and what its roof did, as the dome's own
+# driver reports them: the ground truth the dew monitor's limits are checked against. Two
+# columns per CONFIGURED dome; a record only, never an input (test_domes.py pins that for
+# the `domes` block).
+WEST = DomeConfig(1, "Dome 1 (west)", "k1-" + "a" * 29)
+EAST = DomeConfig(3, "Dome 3 (east)", "k3-" + "c" * 29)      # numbers need not be 1, 2, ...
+DOME_COLUMNS = ["dome1_roof", "dome1_rain_wet", "dome3_roof", "dome3_rain_wet"]
+
+
+@pytest.fixture
+def domed(dirs, monkeypatch):
+    """The weather log of a site with two domes, and the store their reports go to."""
+    monkeypatch.setattr(config, "DOMES", (WEST, EAST))
+    monkeypatch.setattr(config, "DOME_STALE_SEC", 120)
+    log = WeatherLog(config)
+    log._created_ts = NOV
+    return log, DomeStore(config)
+
+
+def report(store, dome, mono, **fields):
+    """A dome's report arrives at `mono` (the store's clock): roof open, plus `fields`."""
+    rep = {"shutter": "open", "current": True, "source": "merlino-dome 0.4.4"}
+    rep.update(fields)
+    store.accept(dome, parse_report(json.dumps(rep).encode()), mono=mono)
+
+
+def domed_state(store, mono, **kw):
+    """The state of an evaluation at `mono`, with the `domes` block the store gives then."""
+    st = state(**kw)
+    st["domes"] = store.component(mono=mono)
+    return st
+
+
+def dome_cells(row):
+    return tuple(row[c] for c in DOME_COLUMNS)
+
+
+class Site:
+    """The two domes over time: every 30 s each dome that is up reports its roof
+    (self.roof, open unless set) and what its rain sensor reads (self.wet), then the
+    daemon evaluates and the log looks."""
+
+    def __init__(self, log, store):
+        self.log, self.store, self.t = log, store, 0.0
+        self.wet = {}               # dome -> its sensor right now (not in it: silent)
+        self.roof = {}              # dome -> its roof right now (not in it: open)
+
+    def look(self, **kw):
+        self.t += 30.0
+        for dome, wet in self.wet.items():
+            report(self.store, dome, self.t - 1.0, rain_wet=wet,
+                   shutter=self.roof.get(dome, "open"))
+        self.log.observe(domed_state(self.store, self.t, **kw), NOV + self.t)
+
+
+def test_without_a_dome_the_weather_table_is_the_one_it_always_was(wl, dirs):
+    _, ram = dirs
+    assert wlmod.summary_columns(config) == SUMMARY_COLUMNS and wlmod.dome_columns(config) == ()
+    st = state()
+    # (a `domes` block cannot be there without a dome; even so it would change nothing)
+    st["domes"] = {"enabled": True, "domes": [
+        {"n": 1, "known": True, "shutter": "open", "rain_wet": True}]}
+    wl.observe(st, NOV)
+    st["domes"]["domes"][0].update(shutter="closed", rain_wet=False)
+    wl.observe(st, NOV + 30)
+    assert lines(ram / "weather_current.csv")[0] == HEADERS["weather"]
+    assert [r["event"] for r in read(ram / "weather_current.csv")] == ["start"]
+
+
+def test_each_configured_dome_has_a_roof_and_a_rain_column_before_the_reasons(domed, dirs):
+    _, ram = dirs
+    log, store = domed
+    report(store, WEST, 0.0, rain_wet=True)
+    report(store, EAST, 0.0, rain_wet=False, shutter="closed")
+    log.observe(domed_state(store, 1.0), NOV, outlook=OUTLOOK)
+    assert list(wlmod.dome_columns(config)) == DOME_COLUMNS
+    assert lines(ram / "weather_current.csv")[0].split(",") == (
+        list(SUMMARY_COLUMNS[:-2]) + DOME_COLUMNS + ["reasons0", "reasons1"])
+    row = read(ram / "weather_current.csv")[0]
+    assert dome_cells(row) == ("open", "1", "closed", "0")       # open and WET, closed and DRY
+    # every other column is where it was and says what it said
+    assert (row["event"], row["safe0"], row["safe1"], row["spread_c"]) == ("start", "1", "0", "4.44")
+    assert row["fc_cloud_pct"] == "12" and row["reasons1"] == "wind 12 mph is above 9 mph"
+    assert None not in row.values() and len(row) == len(SUMMARY_COLUMNS) + 4
+
+
+@pytest.mark.parametrize("shutter", ["open", "closed", "opening", "closing", "moving", "error"])
+def test_the_roof_is_logged_in_the_words_of_the_report(domed, dirs, shutter):
+    _, ram = dirs
+    log, store = domed
+    report(store, WEST, 0.0, shutter=shutter)
+    log.observe(domed_state(store, 1.0), NOV)
+    assert read(ram / "weather_current.csv")[0]["dome1_roof"] == shutter
+    assert shutter in wlmod.ROOF_STATES and "unknown" not in wlmod.ROOF_STATES
+
+
+def test_not_known_is_blank_never_closed_or_dry(domed, dirs):
+    _, ram = dirs
+    log, store = domed
+    nothing = (None, None)
+
+    def readings(mono):
+        return wlmod.dome_readings({"domes": store.component(mono=mono)}, (1, 3))
+
+    assert readings(0.0) == (nothing, nothing)                   # no report yet
+    report(store, WEST, 10.0, rain_wet=True)
+    report(store, EAST, 10.0, shutter="closed")                  # a sender without a rain reading
+    assert readings(11.0) == (("open", True), ("closed", None))
+    report(store, WEST, 20.0, rain_wet=None)                     # sent, but no board reading
+    assert readings(21.0) == (("open", None), ("closed", None))
+    report(store, WEST, 30.0, rain_wet=True, current=False)      # the whole report not current
+    assert readings(31.0) == (nothing, ("closed", None))
+    report(store, WEST, 40.0, rain_wet=True, shutter="unknown")  # a roof the driver cannot tell
+    assert readings(41.0) == ((None, True), ("closed", None))
+    report(store, WEST, 50.0, rain_wet=True)
+    report(store, EAST, 50.0, shutter="closed")
+    assert readings(51.0) == (("open", True), ("closed", None))
+    assert readings(50.0 + 120.5) == (nothing, nothing)          # too old: not "still WET"
+    # the store missing or broken, a state without the block, nonsense in it
+    broken = domes_mod.unavailable_component(config, "boom")
+    odd_list = [None, 3, "x", {"n": [1], "known": True, "shutter": "open", "rain_wet": True},
+                {"n": 1, "known": True, "shutter": "ajar", "rain_wet": "yes"},
+                {"n": 1, "known": True, "shutter": 5}, {"n": 1, "known": True},
+                {"n": 3, "known": False, "shutter": "open", "rain_wet": True},
+                # (True is not dome 1)
+                {"n": True, "known": True, "shutter": "open", "rain_wet": True}]
+    for st in (None, "x", {}, {"domes": None}, {"domes": "x"}, {"domes": {"domes": 5}},
+               {"domes": broken}, {"domes": {"enabled": True, "domes": odd_list}}):
+        assert wlmod.dome_readings(st, (1, 3)) == (nothing, nothing), st
+    log.observe(domed_state(store, 500.0), NOV)                  # both silent for minutes
+    assert dome_cells(read(ram / "weather_current.csv")[0]) == ("", "", "", "")
+
+
+def test_a_row_at_once_when_a_dome_s_roof_or_rain_sensor_changes(domed, dirs):
+    _, ram = dirs
+    site = Site(*domed)
+    site.look()                                 # 20:00:30 the daemon starts: no report yet
+    site.wet = {WEST: False, EAST: False}
+    site.look()                                 # 20:01:00 both domes report: open and DRY
+    site.look()
+    site.look()                                 # ...and again: nothing new, no row
+    site.wet[WEST] = True
+    site.look()                                 # 20:02:30 dew on the west dome's sensor
+    site.roof[WEST] = "closing"
+    site.look()                                 # 20:03:00 ...and its roof starts to close
+    site.roof[WEST] = "closed"
+    site.look()                                 # 20:03:30 closed
+    site.wet[EAST] = True
+    site.look(safe1=True)                       # 20:04:00 the east sensor, as device 1 turns true
+    site.look(safe1=True)                       # (its roof stays open: the sensor is ignored)
+    site.wet[WEST] = False
+    site.look(safe1=True)                       # 20:05:00 the west sensor has dried
+    del site.wet[EAST]                          # the east dome's PC falls silent...
+    for _ in range(4):
+        site.look(safe1=True)                   # ...20:07:00: 121 s without a report
+    rows = read(ram / "weather_current.csv")
+    assert [(r["utc"][11:19], r["event"]) + dome_cells(r) for r in rows] == [
+        ("20:00:30", "start", "", "", "", ""),
+        ("20:01:00", "dome1+dome3", "open", "0", "open", "0"),
+        ("20:02:30", "dome1", "open", "1", "open", "0"),
+        ("20:03:00", "dome1", "closing", "1", "open", "0"),
+        ("20:03:30", "dome1", "closed", "1", "open", "0"),
+        ("20:04:00", "device1+dome3", "closed", "1", "open", "1"),
+        ("20:05:00", "dome1", "closed", "0", "open", "1"),
+        ("20:07:00", "dome3", "closed", "0", "", "")]
+    # each row has the numbers of its moment beside the readings: what the limits are
+    # checked against. Here: the roof closed on a WET sensor while device 0 said SAFE and
+    # device 1 said "trust the rain sensor" - a closure the rain sensor caused
+    closing = rows[3]
+    assert (closing["safe0"], closing["safe1"], closing["spread_c"], closing["wind_mph"]) == (
+        "1", "0", "4.44", "4.6")
+    # the 5-minute rows go on as before, with the readings of the moment
+    for _ in range(10):
+        site.look(safe1=True)
+    rows = read(ram / "weather_current.csv")
+    assert [(r["utc"][11:19], r["event"]) + dome_cells(r) for r in rows[8:]] == [
+        ("20:12:00", "interval", "closed", "0", "", "")]
+
+
+def test_dome_reports_reach_ram_only_and_only_when_a_reading_changes(domed, dirs):
+    sd, ram = dirs
+    log, store = domed
+    report(store, WEST, 0.0, rain_wet=True)
+    log.observe(domed_state(store, 0.5), NOV)
+    for i in range(1, 250):                     # the same roof and reading, report after report
+        report(store, WEST, float(i), rain_wet=True, source="sender %d" % i,
+               switches=[{"name": "Light", "on": bool(i % 2)}])
+        log.observe(domed_state(store, i + 0.5), NOV + i)
+    assert len(read(ram / "weather_current.csv")) == 1       # (the switches are not logged)
+    report(store, WEST, 250.0, rain_wet=True, shutter="closing")
+    log.observe(domed_state(store, 250.5), NOV + 250)
+    assert [r["event"] for r in read(ram / "weather_current.csv")] == ["start", "dome1"]
+    assert not sd.exists()                                   # and nothing on the "SD card"
+    assert log.flush_due(NIGHT, NOV + 250) is None           # no archive run because of it
+
+
+def test_a_dome_added_or_removed_starts_a_table_of_its_own(dirs, monkeypatch):
+    sd, ram = dirs
+    WeatherLog(config).observe(state(), NOV)                 # before: no dome
+    monkeypatch.setattr(config, "DOMES", (WEST,))            # ttustatus.env gains a dome
+    monkeypatch.setattr(config, "DOME_STALE_SEC", 120)
+    log, store = WeatherLog(config), DomeStore(config)       # ...and the daemon restarts
+    report(store, WEST, 0.0, rain_wet=True)
+    log.observe(domed_state(store, 1.0), NOV + 300)
+    assert lines(ram / "weather_current.csv")[0].endswith(
+        ",dome1_roof,dome1_rain_wet,reasons0,reasons1")
+    assert log.status()["current"][0] == {"kind": "weather", "name": "weather_current.csv",
+                                          "rows": 1, "waiting": 1}
+    assert log.flush("test", NOV + 600) is True
+    assert lines(sd / "weather_2026-11.csv")[0] == HEADERS["weather"]     # the old table
+    assert len(read(sd / "weather_2026-11.csv")) == 1
+    with_dome = read(sd / "weather_2026-11_b.csv")
+    assert len(with_dome) == 1
+    assert (with_dome[0]["dome1_roof"], with_dome[0]["dome1_rain_wet"]) == ("open", "1")
+    monkeypatch.setattr(config, "DOMES", ())                 # the dome is taken out again
+    again = WeatherLog(config)
+    again.observe(state(), NOV + 900)
+    assert again.flush("test", NOV + 1200) is True
+    assert len(read(sd / "weather_2026-11.csv")) == 2        # back to the first file
+    assert len(read(sd / "weather_2026-11_b.csv")) == 1
+    assert not (sd / "weather_2026-11_c.csv").exists()
+
+
 # --- wiring ------------------------------------------------------------------------------------
 def test_monitor_feeds_the_log_and_publishes_its_status(tmp_path, dirs, monkeypatch):
     _, ram = dirs
@@ -724,6 +954,39 @@ def test_monitor_feeds_the_log_and_publishes_its_status(tmp_path, dirs, monkeypa
     assert len(stations) == 1 and stations[0]["temp_c"] == "10.0"
     with open(config.STATE_FILE, encoding="utf-8") as f:
         assert json.load(f)["weather_log"]["dir"] == config.WEATHER_LOG_DIR
+
+
+def test_monitor_hands_the_domes_rain_readings_to_the_log(tmp_path, dirs, monkeypatch):
+    _, ram = dirs
+    for key, name in (("INPUTS_FILE", "i.json"), ("STATE_FILE", "s.json"),
+                      ("LATCH_FILE", "l.json")):
+        monkeypatch.setattr(config, key, str(tmp_path / name))
+    monkeypatch.setattr(config, "WU_API_KEY", "")
+    monkeypatch.setattr(config, "DOMES", (WEST, EAST))
+    monkeypatch.setattr(config, "DOME_STALE_SEC", 120)
+    with open(config.INPUTS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"ts": time.time(), "sun_altitude_deg": -20.0, "humidity_pct": 40.0}, f)
+    log = EventLog(config.EVENT_LOG)
+    store = DomeStore(config)
+    monitor = SafetyMonitor(config, log, RainPoller(config, log), dew=DewMonitor(config),
+                            weatherlog=WeatherLog(config), domes=store)
+    before = monitor.evaluate()                                  # no dome has reported
+    report(store, WEST, time.monotonic(), rain_wet=True)         # the west sensor reads WET
+    after = monitor.evaluate()
+    monitor.evaluate()                                           # the same report: no row
+    rows = read(ram / "weather_current.csv")
+    assert [(r["event"],) + dome_cells(r) for r in rows] == [
+        ("start", "", "", "", ""), ("dome1", "open", "1", "", "")]
+    # a record, not an input: a WET sensor moved neither verdict
+    assert (after["is_safe"], after["dew"]["is_safe"]) == (before["is_safe"],
+                                                           before["dew"]["is_safe"])
+    assert [(r["safe0"], r["safe1"]) for r in rows] == [("1", "0"), ("1", "0")]
+    assert after["domes"]["domes"][0]["rain_wet"] is True        # what the page shows too
+    # the store broken: the domes read unknown on the page, and blank in the log
+    monitor.domes = None
+    monitor.evaluate()
+    rows = read(ram / "weather_current.csv")
+    assert (rows[-1]["event"],) + dome_cells(rows[-1]) == ("dome1", "", "", "", "")
 
 
 def test_a_broken_weather_log_never_reaches_the_safety_verdict(tmp_path, dirs, monkeypatch):
@@ -780,9 +1043,12 @@ def test_a_second_stop_signal_cannot_interrupt_the_shutdown():
             signal.signal(sig, handler)
 
 
-def test_daemon_archives_on_shutdown_and_runs_the_log_in_its_own_thread(dirs, tmp_path,
-                                                                        monkeypatch):
+@pytest.mark.parametrize("expected", [(), (WEST, EAST)])     # no dome; the TTU kind of site
+def test_daemon_archives_on_shutdown_and_runs_the_log_in_its_own_thread(
+        dirs, tmp_path, monkeypatch, caplog, expected):
     sd, _ = dirs
+    caplog.set_level(logging.INFO, logger="ttu.safety")
+    monkeypatch.setattr(config, "DOMES", expected)
     for key, name in (("LATCH_FILE", "l.json"), ("INPUTS_FILE", "i.json"),
                       ("STATE_FILE", "s.json")):
         monkeypatch.setattr(config, key, str(tmp_path / name))
@@ -811,7 +1077,15 @@ def test_daemon_archives_on_shutdown_and_runs_the_log_in_its_own_thread(dirs, tm
     server.main()
     assert "weather-log" in started and "evaluator" in started
     assert built["monitor"].dew is not None and built["monitor"].weatherlog is not None
-    assert len(read(sd / "weather_2026-11.csv")) == 3            # archived by the shutdown
+    rows = read(sd / "weather_2026-11.csv")
+    assert len(rows) == 3                                        # archived by the shutdown
     assert calls == ["ignore"]                   # ...with further stop signals shut out
+    # the daemon's log has the roof and rain-sensor columns of each dome it expects, and
+    # says so
+    assert [c for c in rows[0] if c.startswith("dome")] == (DOME_COLUMNS if expected else [])
+    said = ("weather log: with each dome's roof state and rain sensor reading (dome1_roof, "
+            "dome1_rain_wet, dome3_roof, dome3_rain_wet), and a row at once when one changes")
+    assert (said in caplog.text) is bool(expected)
+    assert ("weather log: with each dome" in caplog.text) is bool(expected)
     with open(config.EVENT_LOG, encoding="utf-8") as f:
         assert "SHUTDOWN" in f.read()

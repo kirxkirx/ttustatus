@@ -94,7 +94,7 @@ DEWPT_ABOVE_TEMP_TOLERANCE_F = 2.0
 # the station: it is not kept (kept, it would shadow every later, correct observation and
 # then count as "fresh" once its time arrived).
 FUTURE_TOLERANCE_SEC = 300.0
-# The limits are inclusive ("at most 5 degC"): 9.0 degF of spread must not miss them by
+# The limits are inclusive ("at most 4 degC"): 7.2 degF of spread must not miss them by
 # the last bit of a float conversion.
 _EPS = 1e-9
 

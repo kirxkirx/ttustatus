@@ -449,6 +449,32 @@ def test_weather_log_names_the_dew_monitor_only_while_it_is_on(monkeypatch):
     assert "dew monitor" not in msp.build_weather_log_html(st)
 
 
+def test_weather_log_names_the_domes_roofs_and_rain_sensors_only_with_a_dome(monkeypatch):
+    # the log has a roof and a rain-sensor column per configured dome, and a row when one
+    # changes; a site with no dome has neither, and must not read about domes here
+    monkeypatch.setattr(msp, "HTML_FILE", "/var/www/html/status.html")
+    domes = {"enabled": True, "stale_after_s": 120, "error": None,
+             "domes": [{"n": 1, "name": "Dome 1 (west)", "shutter": "open", "known": True,
+                        "age_s": 12, "why": None, "source": None, "switches": [],
+                        "rain_wet": True}]}
+    log = wlog()            # one block for every page below: they are compared whole
+    both = msp.build_weather_log_html(state(weather_log=log, domes=domes))
+    assert ("at every change of the safety monitor, the dew monitor or a dome's roof or rain "
+            "sensor (station medians, forecast, radar, enclosure sensor, the domes' roofs and "
+            "rain sensors, both verdicts and their reasons), and one <b>stations</b> row") in both
+    st = state(weather_log=log, domes=domes)
+    st["dew"] = {"enabled": False, "is_safe": False}
+    no_dew = msp.build_weather_log_html(st)
+    assert ("at every change of the safety monitor or a dome's roof or rain sensor (station "
+            "medians, forecast, radar, enclosure sensor, the domes' roofs and rain sensors, the "
+            "verdict and its reasons), and one <b>stations</b> row") in no_dew
+    assert "dew monitor" not in no_dew
+    plain = msp.build_weather_log_html(state(weather_log=log))
+    assert "dome" not in plain
+    for odd in (None, "junk", 5, [domes], {}, {"enabled": False, "domes": domes["domes"]}):
+        assert msp.build_weather_log_html(state(weather_log=log, domes=odd)) == plain
+
+
 def test_with_the_dew_monitor_off_only_device_0_is_listed(env):
     from safety.alpaca import create_app
     assert env["monitor"].dew is None
